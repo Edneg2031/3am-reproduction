@@ -11,7 +11,7 @@ external:
   sam2_checkpoint_url: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
   sam2_checkpoint: outputs/checkpoints/sam2.1_hiera_large.pt
   sam2_config: configs/sam2.1/sam2.1_hiera_l.yaml
-  must3r_checkpoint_url: ""
+  must3r_checkpoint_url: https://download.europe.naverlabs.com/ComputerVision/MUSt3R/MUSt3R_512.pth
   must3r_checkpoint: outputs/checkpoints/must3r.pt
 
 datasets:
