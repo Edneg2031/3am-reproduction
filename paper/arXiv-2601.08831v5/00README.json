@@ -1,0 +1,61 @@
+{
+   "sources" : [
+      {
+         "usage" : "toplevel",
+         "filename" : "main.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "ECCV_2026_Paper_Template.pdf"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "LICENSE"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "README.md"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "eijkel2.pdf"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figs/must3r-cos-sim.pdf"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figs/template.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "llncsdoc.pdf"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "lncs_history.txt"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "lncs_readme.txt"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "main.bbl"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "main.bib"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "splncs04.bst"
+      }
+   ],
+   "spec_version" : 1,
+   "texlive_version" : "2025",
+   "process" : {
+      "compiler" : "pdflatex"
+   }
+}

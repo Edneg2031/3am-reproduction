@@ -1,0 +1,10 @@
+-e .
+numpy>=1.23
+Pillow>=9.5
+PyYAML>=6.0
+tqdm>=4.65
+torch>=2.1
+pytest>=7.4
+nbformat>=5.9
+jupyter>=1.0
+matplotlib>=3.7

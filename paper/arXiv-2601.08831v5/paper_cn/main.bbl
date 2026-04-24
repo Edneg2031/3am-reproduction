@@ -1,0 +1,375 @@
+\begin{thebibliography}{100}
+\providecommand{\url}[1]{\texttt{#1}}
+\providecommand{\urlprefix}{URL }
+\providecommand{\doi}[1]{https://doi.org/#1}
+
+\bibitem{avetisyan2024scenescript}
+Avetisyan, A., Xie, C., Howard-Jenkins, H., Yang, T.Y., Aroudj, S., Patra, S., Zhang, F., Frost, D., Holland, L., Orme, C., et~al.: Scenescript: Reconstructing scenes with an autoregressive structured language model. In: European Conference on Computer Vision. pp. 247--263. Springer (2024)
+
+\bibitem{bai2024one}
+Bai, Z., He, T., Mei, H., Wang, P., Gao, Z., Chen, J., Zhang, Z., Shou, M.Z.: One token to seg them all: Language instructed reasoning segmentation in videos. Advances in Neural Information Processing Systems  \textbf{37},  6833--6859 (2024)
+
+\bibitem{bautista2022gaudi}
+Bautista, M.A., Guo, P., Abnar, S., Talbott, W., Toshev, A., Chen, Z., Dinh, L., Zhai, S., Goh, H., Ulbricht, D., et~al.: Gaudi: A neural architect for immersive 3d scene generation. Advances in Neural Information Processing Systems  \textbf{35},  25102--25116 (2022)
+
+\bibitem{bhat2020learning}
+Bhat, G., Lawin, F.J., Danelljan, M., Robinson, A., Felsberg, M., Van~Gool, L., Timofte, R.: Learning what to learn for video object segmentation. In: European Conference on Computer Vision. pp. 777--794. Springer (2020)
+
+\bibitem{boudjoghra2024open}
+Boudjoghra, M.E.A., Dai, A., Lahoud, J., Cholakkal, H., Anwer, R.M., Khan, S., Khan, F.S.: Open-yolo 3d: Towards fast and accurate open-vocabulary 3d instance segmentation. arXiv preprint arXiv:2406.02548  (2024)
+
+\bibitem{boudjoghra2025openyolo}
+Boudjoghra, M.E.A., Dai, A., Lahoud, J., Cholakkal, H., Anwer, R.M., Khan, S., Khan, F.S.: Open-{YOLO} 3d: Towards fast and accurate open-vocabulary 3d instance segmentation. In: The Thirteenth International Conference on Learning Representations (2025)
+
+\bibitem{cabon2025must3r}
+Cabon, Y., Stoffl, L., Antsfeld, L., Csurka, G., Chidlovskii, B., Revaud, J., Leroy, V.: Must3r: Multi-view network for stereo 3d reconstruction. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 1050--1060 (2025)
+
+\bibitem{caelles2017one}
+Caelles, S., Maninis, K.K., Pont-Tuset, J., Leal-Taix{\'e}, L., Cremers, D., Van~Gool, L.: One-shot video object segmentation. In: Proceedings of the IEEE conference on computer vision and pattern recognition. pp. 221--230 (2017)
+
+\bibitem{charatan2024pixelsplat}
+Charatan, D., Li, S.L., Tagliasacchi, A., Sitzmann, V.: pixelsplat: 3d gaussian splats from image pairs for scalable generalizable 3d reconstruction. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 19457--19467 (2024)
+
+\bibitem{chen2025easi3r}
+Chen, X., Chen, Y., Xiu, Y., Geiger, A., Chen, A.: Easi3r: Estimating disentangled motion from dust3r without training. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 9158--9168 (2025)
+
+\bibitem{chen2025long3r}
+Chen, Z., Qin, M., Yuan, T., Liu, Z., Zhao, H.: Long3r: Long sequence streaming 3d reconstruction. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 5273--5284 (2025)
+
+\bibitem{cheng2024putting}
+Cheng, H.K., Oh, S.W., Price, B., Lee, J.Y., Schwing, A.: Putting the object back into video object segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 3151--3161 (2024)
+
+\bibitem{cheng2022xmem}
+Cheng, H.K., Schwing, A.G.: Xmem: Long-term video object segmentation with an atkinson-shiffrin memory model. In: European conference on computer vision. pp. 640--658. Springer (2022)
+
+\bibitem{cheng2021rethinking}
+Cheng, H.K., Tai, Y.W., Tang, C.K.: Rethinking space-time networks with improved memory coverage for efficient video object segmentation. Advances in neural information processing systems  \textbf{34},  11781--11794 (2021)
+
+\bibitem{cuttano2025samwise}
+Cuttano, C., Trivigno, G., Rosi, G., Masone, C., Averta, G.: Samwise: Infusing wisdom in sam2 for text-driven video segmentation. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 3395--3405 (2025)
+
+\bibitem{MOSE}
+Ding, H., Liu, C., He, S., Jiang, X., Torr, P.H., Bai, S.: {MOSE}: A new dataset for video object segmentation in complex scenes. In: ICCV (2023)
+
+\bibitem{ding2025mosev2}
+Ding, H., Ying, K., Liu, C., He, S., Jiang, X., Jiang, Y.G., Torr, P.H., Bai, S.: Mosev2: A more challenging dataset for video object segmentation in complex scenes. arXiv preprint arXiv:2508.05630  (2025)
+
+\bibitem{ding2024sam2long}
+Ding, S., Qian, R., Dong, X., Zhang, P., Zang, Y., Cao, Y., Guo, Y., Lin, D., Wang, J.: Sam2long: Enhancing sam 2 for long video segmentation with a training-free memory tree. arXiv preprint arXiv:2410.16268  (2024)
+
+\bibitem{duisterhof2025mast3r}
+Duisterhof, B.P., Zust, L., Weinzaepfel, P., Leroy, V., Cabon, Y., Revaud, J.: Mast3r-sfm: a fully-integrated solution for unconstrained structure-from-motion. In: 2025 International Conference on 3D Vision (3DV). pp. 1--10. IEEE (2025)
+
+\bibitem{engelmann2024opennerf}
+Engelmann, F., Manhardt, F., Niemeyer, M., Tateno, K., Pollefeys, M., Tombari, F.: Opennerf: Open set 3d neural scene segmentation with pixel-wise features and rendered novel views. arXiv preprint arXiv:2404.03650  (2024)
+
+\bibitem{fan2025spectromotion}
+Fan, C.D., Chang, C.W., Liu, Y.R., Lee, J.Y., Huang, J.L., Tseng, Y.C., Liu, Y.L.: Spectromotion: Dynamic 3d reconstruction of specular scenes. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 21328--21338 (2025)
+
+\bibitem{fan2019lasot}
+Fan, H., Lin, L., Yang, F., Chu, P., Deng, G., Yu, S., Bai, H., Xu, Y., Liao, C., Ling, H.: Lasot: A high-quality benchmark for large-scale single object tracking. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 5374--5383 (2019)
+
+\bibitem{fan2024large}
+Fan, Z., Zhang, J., Cong, W., Wang, P., Li, R., Wen, K., Zhou, S., Kadambi, A., Wang, Z., Xu, D., et~al.: Large spatial model: End-to-end unposed images to semantic 3d. Advances in neural information processing systems  \textbf{37},  40212--40229 (2024)
+
+\bibitem{gu2024egolifter}
+Gu, Q., Lv, Z., Frost, D., Green, S., Straub, J., Sweeney, C.: Egolifter: Open-world 3d segmentation for egocentric perception. In: European conference on computer vision. pp. 382--400. Springer (2024)
+
+\bibitem{han2020occuseg}
+Han, L., Zheng, T., Xu, L., Fang, L.: Occuseg: Occupancy-aware 3d instance segmentation. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 2940--2949 (2020)
+
+\bibitem{hong2023lvos}
+Hong, L., Chen, W., Liu, Z., Zhang, W., Guo, P., Chen, Z., Zhang, W.: Lvos: A benchmark for long-term video object segmentation. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 13480--13492 (2023)
+
+\bibitem{hsu2025openm3d}
+Hsu, P.H., Zhang, K., Wang, F.E., Tu, T., Li, M.F., Liu, Y.L., Chen, A.Y., Sun, M., Kuo, C.H.: Openm3d: Open vocabulary multi-view indoor 3d object detection without human annotations. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 8688--8698 (2025)
+
+\bibitem{Huang_2025_seganymotion}
+Huang, N., Zheng, W., Xu, C., Keutzer, K., Zhang, S., Kanazawa, A., Wang, Q.: Segment any motion in videos. In: Proceedings of the Computer Vision and Pattern Recognition Conference (CVPR). pp. 3406--3416 (June 2025)
+
+\bibitem{jain2024odin}
+Jain, A., Katara, P., Gkanatsios, N., Harley, A.W., Sarch, G., Aggarwal, K., Chaudhary, V., Fragkiadaki, K.: Odin: A single model for 2d and 3d segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 3564--3574 (2024)
+
+\bibitem{Jayanti2025SegMASt3R}
+Jayanti, R., Agrawal, S., Garg, V., Tourani, S., Khan, M.H., Garg, S., Krishna, M.: Seg{MAS}t3r: Geometry grounded segment matching. In: The Thirty-ninth Annual Conference on Neural Information Processing Systems (2025), \url{https://openreview.net/forum?id=DI2AAFnLrc}
+
+\bibitem{jia2024sceneverse}
+Jia, B., Chen, Y., Yu, H., Wang, Y., Niu, X., Liu, T., Li, Q., Huang, S.: Sceneverse: Scaling 3d vision-language learning for grounded scene understanding. In: European Conference on Computer Vision. pp. 289--310. Springer (2024)
+
+\bibitem{jiang2025gausstr}
+Jiang, H., Liu, L., Cheng, T., Wang, X., Lin, T., Su, Z., Liu, W., Wang, X.: Gausstr: Foundation model-aligned gaussian transformer for self-supervised 3d spatial understanding. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 11960--11970 (2025)
+
+\bibitem{jiang2024open}
+Jiang, L., Shi, S., Schiele, B.: Open-vocabulary 3d semantic segmentation with foundation models. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 21284--21294 (2024)
+
+\bibitem{jiang2020pointgroup}
+Jiang, L., Zhao, H., Shi, S., Liu, S., Fu, C.W., Jia, J.: Pointgroup: Dual-set point grouping for 3d instance segmentation. In: Proceedings of the IEEE/CVF conference on computer vision and Pattern recognition. pp. 4867--4876 (2020)
+
+\bibitem{jung2025details}
+Jung, S., Zheng, J., Zhang, K., Qiao, N., Chen, A.Y., Xia, L., Liu, C., Sun, Y., Zeng, X., Huang, H.W., et~al.: Details matter for indoor open-vocabulary 3d instance segmentation. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 9627--9637 (2025)
+
+\bibitem{kerr2023lerf}
+Kerr, J., Kim, C.M., Goldberg, K., Kanazawa, A., Tancik, M.: Lerf: Language embedded radiance fields. In: Proceedings of the IEEE/CVF international conference on computer vision. pp. 19729--19739 (2023)
+
+\bibitem{kim2024garfield}
+Kim, C.M., Wu, M., Kerr, J., Goldberg, K., Tancik, M., Kanazawa, A.: Garfield: Group anything with radiance fields. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 21530--21539 (2024)
+
+\bibitem{kolodiazhnyi2024oneformer3d}
+Kolodiazhnyi, M., Vorontsova, A., Konushin, A., Rukhovich, D.: Oneformer3d: One transformer for unified point cloud segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 20943--20953 (2024)
+
+\bibitem{leroy2024grounding}
+Leroy, V., Cabon, Y., Revaud, J.: Grounding image matching in 3d with mast3r. In: European Conference on Computer Vision. pp. 71--91. Springer (2024)
+
+\bibitem{li2025ovseg3r}
+Li, H., Qu, J., Zhang, L.: Ovseg3r: Learn open-vocabulary instance segmentation from 2d via 3d reconstruction. arXiv preprint arXiv:2509.23541  (2025)
+
+\bibitem{li2024genrc}
+Li, M.F., Ku, Y.F., Yen, H.X., Liu, C., Liu, Y.L., Chen, A.Y., Kuo, C.H., Sun, M.: Genrc: Generative 3d room completion from sparse image collections. In: European Conference on Computer Vision. pp. 146--163. Springer (2024)
+
+\bibitem{li2024univs}
+Li, M., Li, S., Zhang, X., Zhang, L.: Univs: Unified and universal video segmentation with prompts as queries. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 3227--3238 (2024)
+
+\bibitem{li2024onevos}
+Li, W., Guo, P., Zhou, X., Hong, L., He, Y., Zheng, X., Zhang, W., Zhang, W.: Onevos: unifying video object segmentation with all-in-one transformer framework. In: European Conference on Computer Vision. pp. 20--40. Springer (2024)
+
+\bibitem{lin2025longsplat}
+Lin, C.Y., Sun, C., Yang, F.E., Chen, M.H., Lin, Y.Y., Liu, Y.L.: Longsplat: Robust unposed 3d gaussian splatting for casual long videos. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 27412--27422 (2025)
+
+\bibitem{lin2017featureFPN}
+Lin, T.Y., Doll{\'a}r, P., Girshick, R., He, K., Hariharan, B., Belongie, S.: Feature pyramid networks for object detection. In: Proceedings of the IEEE conference on computer vision and pattern recognition. pp. 2117--2125 (2017)
+
+\bibitem{liu2025livos}
+Liu, Q., Wang, J., Yang, Z., Li, L., Lin, K., Niethammer, M., Wang, L.: Livos: Light video object segmentation with gated linear matching. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 8668--8678 (2025)
+
+\bibitem{liu2022learning}
+Liu, Y., Yu, R., Yin, F., Zhao, X., Zhao, W., Xia, W., Yang, Y.: Learning quality-aware dynamic memory for video object segmentation. In: European Conference on Computer Vision. pp. 468--486. Springer (2022)
+
+\bibitem{liu2023robust}
+Liu, Y.L., Gao, C., Meuleman, A., Tseng, H.Y., Saraf, A., Kim, C., Chuang, Y.Y., Kopf, J., Huang, J.B.: Robust dynamic radiance fields. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 13--23 (2023)
+
+\bibitem{mahadevan2024point}
+Mahadevan, S., Zulfikar, I.E., Voigtlaender, P., Leibe, B.: Point-vos: Pointing up video object segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 22217--22226 (2024)
+
+\bibitem{man2024lexicon3d}
+Man, Y., Zheng, S., Bao, Z., Hebert, M., Gui, L., Wang, Y.X.: Lexicon3d: Probing visual foundation models for complex 3d scene understanding. Advances in Neural Information Processing Systems  \textbf{37},  76819--76847 (2024)
+
+\bibitem{maninis2018video}
+Maninis, K.K., Caelles, S., Chen, Y., Pont-Tuset, J., Leal-Taix{\'e}, L., Cremers, D., Van~Gool, L.: Video object segmentation without temporal information. IEEE transactions on pattern analysis and machine intelligence  \textbf{41}(6),  1515--1530 (2018)
+
+\bibitem{misra2021end}
+Misra, I., Girdhar, R., Joulin, A.: An end-to-end transformer model for 3d object detection. In: Proceedings of the IEEE/CVF international conference on computer vision. pp. 2906--2917 (2021)
+
+\bibitem{murai2025mast3r}
+Murai, R., Dexheimer, E., Davison, A.J.: Mast3r-slam: Real-time dense slam with 3d reconstruction priors. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 16695--16705 (2025)
+
+\bibitem{nguyen2024open3dis}
+Nguyen, P., Ngo, T.D., Kalogerakis, E., Gan, C., Tran, A., Pham, C., Nguyen, K.: Open3dis: Open-vocabulary 3d instance segmentation with 2d mask guidance. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 4018--4028 (2024)
+
+\bibitem{oh2019video}
+Oh, S.W., Lee, J.Y., Xu, N., Kim, S.J.: Video object segmentation using space-time memory networks. In: Proceedings of the IEEE/CVF international conference on computer vision. pp. 9226--9235 (2019)
+
+\bibitem{park2022per}
+Park, K., Woo, S., Oh, S.W., Kweon, I.S., Lee, J.Y.: Per-clip video object segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 1352--1361 (2022)
+
+\bibitem{peng20243d}
+Peng, Q., Planche, B., Gao, Z., Zheng, M., Choudhuri, A., Chen, T., Chen, C., Wu, Z.: 3d vision-language gaussian splatting. arXiv preprint arXiv:2410.07577  (2024)
+
+\bibitem{peng2023openscene}
+Peng, S., Genova, K., Jiang, C., Tagliasacchi, A., Pollefeys, M., Funkhouser, T., et~al.: Openscene: 3d scene understanding with open vocabularies. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 815--824 (2023)
+
+\bibitem{perazzi2016benchmark}
+Perazzi, F., Pont-Tuset, J., McWilliams, B., Van~Gool, L., Gross, M., Sorkine-Hornung, A.: A benchmark dataset and evaluation methodology for video object segmentation. In: Proceedings of the IEEE conference on computer vision and pattern recognition. pp. 724--732 (2016)
+
+\bibitem{piekenbrinck2025opensplat3d}
+Piekenbrinck, J., Schmidt, C., Hermans, A., Vaskevicius, N., Linder, T., Leibe, B.: Opensplat3d: Open-vocabulary 3d instance segmentation using gaussian splatting. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 5246--5255 (2025)
+
+\bibitem{perazzi2017davis}
+Pont-Tuset, J., Perazzi, F., Caelles, S., Arbel\'aez, P., Sorkine-Hornung, A., {Van Gool}, L.: The 2017 davis challenge on video object segmentation. arXiv:1704.00675  (2017)
+
+\bibitem{qin2024langsplat}
+Qin, M., Li, W., Zhou, J., Wang, H., Pfister, H.: Langsplat: 3d language gaussian splatting. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 20051--20060 (2024)
+
+\bibitem{ravi2024sam2}
+Ravi, N., Gabeur, V., Hu, Y.T., Hu, R., Ryali, C., Ma, T., Khedr, H., R{\"a}dle, R., Rolland, C., Gustafson, L., Mintun, E., Pan, J., Alwala, K.V., Carion, N., Wu, C.Y., Girshick, R., Doll{\'a}r, P., Feichtenhofer, C.: Sam 2: Segment anything in images and videos. arXiv preprint arXiv:2408.00714  (2024), \url{https://arxiv.org/abs/2408.00714}
+
+\bibitem{ryali2023hiera}
+Ryali, C., Hu, Y.T., Bolya, D., Wei, C., Fan, H., Huang, P.Y., Aggarwal, V., Chowdhury, A., Poursaeed, O., Hoffman, J., Malik, J., Li, Y., Feichtenhofer, C.: Hiera: A hierarchical vision transformer without the bells-and-whistles. ICML  (2023)
+
+\bibitem{schult2022mask3d}
+Schult, J., Engelmann, F., Hermans, A., Litany, O., Tang, S., Leibe, B.: Mask3d: Mask transformer for 3d semantic instance segmentation. arXiv preprint arXiv:2210.03105  (2022)
+
+\bibitem{shen2024flashsplat}
+Shen, Q., Yang, X., Wang, X.: Flashsplat: 2d to 3d gaussian splatting segmentation solved optimally. In: European Conference on Computer Vision. pp. 456--472. Springer (2024)
+
+\bibitem{shih2025prior}
+Shih, M.L., Chen, Y.H., Liu, Y.L., Curless, B.: Prior-enhanced gaussian splatting for dynamic scene reconstruction from casual video. In: Proceedings of the SIGGRAPH Asia 2025 Conference Papers. pp. 1--13 (2025)
+
+\bibitem{smart2024splatt3r}
+Smart, B., Zheng, C., Laina, I., Prisacariu, V.A.: Splatt3r: Zero-shot gaussian splatting from uncalibrated image pairs. arXiv preprint arXiv:2408.13912  (2024)
+
+\bibitem{replica19arxiv}
+Straub, J., Whelan, T., Ma, L., Chen, Y., Wijmans, E., Green, S., Engel, J.J., Mur-Artal, R., Ren, C., Verma, S., Clarkson, A., Yan, M., Budge, B., Yan, Y., Pan, X., Yon, J., Zou, Y., Leon, K., Carter, N., Briales, J., Gillingham, T., Mueggler, E., Pesqueira, L., Savva, M., Batra, D., Strasdat, H.M., Nardi, R.D., Goesele, M., Lovegrove, S., Newcombe, R.: The {R}eplica dataset: A digital replica of indoor spaces. arXiv preprint arXiv:1906.05797  (2019)
+
+\bibitem{su2024boostmvsnerfs}
+Su, C.H., Hu, C.Y., Tsai, S.R., Lee, J.Y., Lin, C.Y., Liu, Y.L.: Boostmvsnerfs: Boosting mvs-based nerfs to generalizable view synthesis in large-scale scenes. In: ACM SIGGRAPH 2024 Conference Papers. pp. 1--12 (2024)
+
+\bibitem{sun2023superpoint}
+Sun, J., Qing, C., Tan, J., Xu, X.: Superpoint transformer for 3d scene instance segmentation. In: Proceedings of the AAAI Conference on Artificial Intelligence. vol.~37, pp. 2393--2401 (2023)
+
+\bibitem{sun2025uni3r}
+Sun, X., Jiang, H., Liu, L., Nam, S., Kang, G., Wang, X., Sui, W., Su, Z., Liu, W., Wang, X., et~al.: Uni3r: Unified 3d reconstruction and semantic understanding via generalizable gaussian splatting from unposed multi-view images. arXiv preprint arXiv:2508.03643  (2025)
+
+\bibitem{takmaz2023openmask3d}
+Takmaz, A., Fedele, E., Sumner, R.W., Pollefeys, M., Tombari, F., Engelmann, F.: Openmask3d: Open-vocabulary 3d instance segmentation. arXiv preprint arXiv:2306.13631  (2023)
+
+\bibitem{tang2025mv}
+Tang, Z., Fan, Y., Wang, D., Xu, H., Ranjan, R., Schwing, A., Yan, Z.: Mv-dust3r+: Single-stage scene reconstruction from sparse views in 2 seconds. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 5283--5293 (2025)
+
+\bibitem{tokmakov2023vost}
+Tokmakov, P., Li, J., Gaidon, A.: Breaking the" object" in video object segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 22836--22845 (2023)
+
+\bibitem{tu2023imgeonet}
+Tu, T., Chuang, S.P., Liu, Y.L., Sun, C., Zhang, K., Roy, D., Kuo, C.H., Sun, M.: Imgeonet: Image-induced geometry-aware voxel representation for multi-view 3d object detection. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 6996--7007 (2023)
+
+\bibitem{videnovic2025distractor}
+Videnovic, J., Lukezic, A., Kristan, M.: A distractor-aware memory for visual object tracking with sam2. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 24255--24264 (2025)
+
+\bibitem{voigtlaender2019feelvos}
+Voigtlaender, P., Chai, Y., Schroff, F., Adam, H., Leibe, B., Chen, L.C.: Feelvos: Fast end-to-end embedding learning for video object segmentation. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 9481--9490 (2019)
+
+\bibitem{vora2021nesf}
+Vora, S., Radwan, N., Greff, K., Meyer, H., Genova, K., Sajjadi, M.S., Pot, E., Tagliasacchi, A., Duckworth, D.: Nesf: Neural semantic fields for generalizable semantic segmentation of 3d scenes. arXiv preprint arXiv:2111.13260  (2021)
+
+\bibitem{vu2022softgroup}
+Vu, T., Kim, K., Luu, T.M., Nguyen, T., Yoo, C.D.: Softgroup for 3d instance segmentation on point clouds. In: Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. pp. 2708--2717 (2022)
+
+\bibitem{wang20243d}
+Wang, H., Agapito, L.: 3d reconstruction with spatial memory. arXiv preprint arXiv:2408.16061  (2024)
+
+\bibitem{wang20253d}
+Wang, H., Agapito, L.: 3d reconstruction with spatial memory. In: 2025 International Conference on 3D Vision (3DV). pp. 78--89. IEEE (2025)
+
+\bibitem{wang2025vggt}
+Wang, J., Chen, M., Karaev, N., Vedaldi, A., Rupprecht, C., Novotny, D.: Vggt: Visual geometry grounded transformer. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 5294--5306 (2025)
+
+\bibitem{wang2024lift3d}
+Wang, P., Fan, Z., Wang, Z., Su, H., Ramamoorthi, R., et~al.: Lift3d: Zero-shot lifting of any 2d vision model to 3d. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 21367--21377 (2024)
+
+\bibitem{wang2025continuous}
+Wang, Q., Zhang, Y., Holynski, A., Efros, A.A., Kanazawa, A.: Continuous 3d perception model with persistent state. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 10510--10522 (2025)
+
+\bibitem{wang2024dust3r}
+Wang, S., Leroy, V., Cabon, Y., Chidlovskii, B., Revaud, J.: Dust3r: Geometric 3d vision made easy. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 20697--20709 (2024)
+
+\bibitem{wu2025denver}
+Wu, C.H., Chen, S.H., Hu, C.Y., Wu, H.Y., Chen, K.H., Chen, Y.Y., Su, C.H., Lee, C.K., Liu, Y.L.: Denver: Deformable neural vessel representations for unsupervised video vessel segmentation. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 15682--15692 (2025)
+
+\bibitem{wu2024opengaussian}
+Wu, Y., Meng, J., Li, H., Wu, C., Shi, Y., Cheng, X., Zhao, C., Feng, H., Ding, E., Wang, J., et~al.: Opengaussian: Towards point-level 3d gaussian-based open vocabulary understanding. Advances in Neural Information Processing Systems  \textbf{37},  19114--19138 (2024)
+
+\bibitem{wu2025point3r}
+Wu, Y., Zheng, W., Zhou, J., Lu, J.: Point3r: Streaming 3d reconstruction with explicit spatial pointer memory. arXiv preprint arXiv:2507.02863  (2025)
+
+\bibitem{xu2023neurallift}
+Xu, D., Jiang, Y., Wang, P., Fan, Z., Wang, Y., Wang, Z.: Neurallift-360: Lifting an in-the-wild 2d photo to a 3d object with 360deg views. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 4479--4489 (2023)
+
+\bibitem{xu2025sampro3d}
+Xu, M., Yin, X., Qiu, L., Liu, Y., Tong, X., Han, X.: Sampro3d: Locating sam prompts in 3d for zero-shot instance segmentation. In: 2025 International Conference on 3D Vision (3DV). pp. 1222--1232. IEEE (2025)
+
+\bibitem{xu2018youtube}
+Xu, N., Yang, L., Fan, Y., Yue, D., Liang, Y., Yang, J., Huang, T.: Youtube-vos: A large-scale video object segmentation benchmark. arXiv preprint arXiv:1809.03327  (2018)
+
+\bibitem{xu2022reliable}
+Xu, X., Wang, J., Li, X., Lu, Y.: Reliable propagation-correction modulation for video object segmentation. In: Proceedings of the AAAI Conference on Artificial Intelligence. vol.~36, pp. 2946--2954 (2022)
+
+\bibitem{xu2024embodiedsam}
+Xu, X., Chen, H., Zhao, L., Wang, Z., Zhou, J., Lu, J.: Embodiedsam: Online segment any 3d thing in real time. arXiv preprint arXiv:2408.11811  (2024)
+
+\bibitem{xu2024esam}
+Xu, X., Chen, H., Zhao, L., Wang, Z., Zhou, J., Lu, J.: Embodiedsam: Online segment any 3d thing in real time. arXiv preprint arXiv:2408.11811  (2024)
+
+\bibitem{yan2024visa}
+Yan, C., Wang, H., Yan, S., Jiang, X., Hu, Y., Kang, G., Xie, W., Gavves, E.: Visa: Reasoning video object segmentation via large language models. In: European Conference on Computer Vision. pp. 98--115. Springer (2024)
+
+\bibitem{yan2024panovos}
+Yan, S., Xu, X., Zhang, R., Hong, L., Chen, W., Zhang, W., Zhang, W.: Panovos: Bridging non-panoramic and panoramic views with transformer for video segmentation. In: European Conference on Computer Vision. pp. 346--365. Springer (2024)
+
+\bibitem{yang2024samurai}
+Yang, C.Y., Huang, H.W., Chai, W., Jiang, Z., Hwang, J.N.: Samurai: Adapting segment anything model for zero-shot visual tracking with motion-aware memory. arXiv preprint arXiv:2411.11922  (2024)
+
+\bibitem{yang2025fast3r}
+Yang, J., Sax, A., Liang, K.J., Henaff, M., Tang, H., Cao, A., Chai, J., Meier, F., Feiszli, M.: Fast3r: Towards 3d reconstruction of 1000+ images in one forward pass. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 21924--21935 (2025)
+
+\bibitem{yang2019video}
+Yang, L., Fan, Y., Xu, N.: Video instance segmentation. In: Proceedings of the IEEE/CVF international conference on computer vision. pp. 5188--5197 (2019)
+
+\bibitem{yang2025mosam}
+Yang, Q., Yao, Y., Cui, M., Bo, L.: Mosam: Motion-guided segment anything model with spatial-temporal memory selection. arXiv preprint arXiv:2505.00739  (2025)
+
+\bibitem{yang2023sam3d}
+Yang, Y., Wu, X., He, T., Zhao, H., Liu, X.: Sam3d: Segment anything in 3d scenes. arXiv preprint arXiv:2306.03908  (2023)
+
+\bibitem{yang2024scalable}
+Yang, Z., Miao, J., Wei, Y., Wang, W., Wang, X., Yang, Y.: Scalable video object segmentation with identification mechanism. IEEE Transactions on Pattern Analysis and Machine Intelligence  \textbf{46}(9),  6247--6262 (2024)
+
+\bibitem{yang2021associating}
+Yang, Z., Wei, Y., Yang, Y.: Associating objects with transformers for video object segmentation. Advances in Neural Information Processing Systems  \textbf{34},  2491--2502 (2021)
+
+\bibitem{yang2022decoupling}
+Yang, Z., Yang, Y.: Decoupling features in hierarchical propagation for video object segmentation. Advances in Neural Information Processing Systems  \textbf{35},  36324--36336 (2022)
+
+\bibitem{ye2024no}
+Ye, B., Liu, S., Xu, H., Li, X., Pollefeys, M., Yang, M.H., Peng, S.: No pose, no problem: Surprisingly simple 3d gaussian splats from sparse unposed images. arXiv preprint arXiv:2410.24207  (2024)
+
+\bibitem{ye2024gaussian}
+Ye, M., Danelljan, M., Yu, F., Ke, L.: Gaussian grouping: Segment and edit anything in 3d scenes. In: European conference on computer vision. pp. 162--179. Springer (2024)
+
+\bibitem{ye2025entitysam}
+Ye, M., Oh, S.W., Ke, L., Lee, J.Y.: Entitysam: Segment everything in video. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 24234--24243 (2025)
+
+\bibitem{yeshwanth2023scannet++}
+Yeshwanth, C., Liu, Y.C., Nie{\ss}ner, M., Dai, A.: Scannet++: A high-fidelity dataset of 3d indoor scenes. In: Proceedings of the IEEE/CVF International Conference on Computer Vision. pp. 12--22 (2023)
+
+\bibitem{yin2024sai3d}
+Yin, Y., Liu, Y., Xiao, Y., Cohen-Or, D., Huang, J., Chen, B.: Sai3d: Segment any instance in 3d scenes. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 3292--3302 (2024)
+
+\bibitem{ying2024omniseg3d}
+Ying, H., Yin, Y., Zhang, J., Wang, F., Yu, T., Huang, R., Fang, L.: Omniseg3d: Omniversal 3d segmentation via hierarchical contrastive learning. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 20612--20622 (2024)
+
+\bibitem{yuan2025sa2va}
+Yuan, H., Li, X., Zhang, T., Sun, Y., Huang, Z., Xu, S., Ji, S., Tong, Y., Qi, L., Feng, J., et~al.: Sa2va: Marrying sam2 with llava for dense grounded understanding of images and videos. arXiv preprint arXiv:2501.04001  (2025)
+
+\bibitem{zhai2025panogs}
+Zhai, H., Li, H., Li, Z., Pan, X., He, Y., Zhang, G.: Panogs: Gaussian-based panoptic segmentation for 3d open vocabulary scene understanding. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 14114--14124 (2025)
+
+\bibitem{zhang2025jointformer}
+Zhang, J., Cui, Y., Wu, G., Wang, L.: Jointformer: A unified framework with joint modeling for video object segmentation. IEEE Transactions on Pattern Analysis and Machine Intelligence  (2025)
+
+\bibitem{zhang2024monst3r}
+Zhang, J., Herrmann, C., Hur, J., Jampani, V., Darrell, T., Cole, F., Sun, D., Yang, M.H.: Monst3r: A simple approach for estimating geometry in the presence of motion. arXiv preprint arXiv:2410.03825  (2024)
+
+\bibitem{zhao2025sam2object}
+Zhao, J., Zhuo, J., Chen, J., Ma, H.: Sam2object: Consolidating view consistency via sam2 for zero-shot 3d instance segmentation. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 19325--19334 (2025)
+
+\bibitem{zhou2025edgetam}
+Zhou, C., Zhu, C., Xiong, Y., Suri, S., Xiao, F., Wu, L., Krishnamoorthi, R., Dai, B., Loy, C.C., Chandra, V., et~al.: Edgetam: On-device track anything model. In: Proceedings of the Computer Vision and Pattern Recognition Conference. pp. 13832--13842 (2025)
+
+\bibitem{zhou2024rmem}
+Zhou, J., Pang, Z., Wang, Y.X.: Rmem: Restricted memory banks improve video object segmentation. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 18602--18611 (2024)
+
+\bibitem{zhou2024feature}
+Zhou, S., Chang, H., Jiang, S., Fan, Z., Zhu, Z., Xu, D., Chari, P., You, S., Wang, Z., Kadambi, A.: Feature 3dgs: Supercharging 3d gaussian splatting to enable distilled feature fields. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 21676--21685 (2024)
+
+\bibitem{zhou2024improving}
+Zhou, Y., Zhang, T., Ji, S., Yan, S., Li, X.: Improving video segmentation via dynamic anchor queries. In: European Conference on Computer Vision. pp. 446--463. Springer (2024)
+
+\bibitem{zhou2024point}
+Zhou, Y., Gu, J., Chiang, T.Y., Xiang, F., Su, H.: Point-sam: Promptable 3d segmentation model for point clouds. arXiv preprint arXiv:2406.17741  (2024)
+
+\bibitem{zhu2025rethinking}
+Zhu, R., Qiu, S., Liu, Z., Hui, K.H., Wu, Q., Heng, P.A., Fu, C.W.: Rethinking end-to-end 2d to 3d scene segmentation in gaussian splatting. In: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition. pp. 3656--3665 (2025)
+
+\bibitem{zust2025panst3r}
+Zust, L., Cabon, Y., Marrie, J., Antsfeld, L., Chidlovskii, B., Revaud, J., Csurka, G.: Panst3r: Multi-view consistent panoptic segmentation. arXiv preprint arXiv:2506.21348  (2025)
+
+\end{thebibliography}

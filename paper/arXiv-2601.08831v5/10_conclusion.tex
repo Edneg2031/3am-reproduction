@@ -1,0 +1,14 @@
+\vspace{-1em}
+\section{Conclusion}
+\label{sec:conclusion}
+\vspace{-1em}
+We introduce 3AM, integrating 3D-aware features into SAM2 for viewpoint-robust video object segmentation. Through our Feature Merger and field-of-view aware sampling, 3AM achieves geometry-consistent tracking requiring only RGB at inference. On wide-baseline datasets, 3AM substantially outperforms state-of-the-art VOS methods, achieving gains of +15.9 and +30.4 points on the ScanNet++ Selected Subset, while automatically switching back to SAM2's capability to handle dynamic video scenarios.
+
+% We introduce 3AM, a training-time enhancement to SAM2 that integrates 3D-aware features for viewpoint-robust video object segmentation. By fusing multi-level MUSt3R features with SAM2's appearance features, our method enables geometry-consistent recognition based on spatial position. Our field-of-view aware sampling ensures effective 3D correspondence learning. 3AM requires only RGB input at inference, with no camera poses or preprocessing. On challenging datasets with wide-baseline camera motion (ScanNet++, Replica), 3AM substantially outperforms SAM2 and its extensions, achieving +15.9 and +30.4 point improvements over SAM2Long on ScanNet++'s Selected Subset. 3AM bridges 2D promptable segmentation and 3D geometric awareness for robust video object segmentation.
+
+% \paragraph{Limitations.}
+% Our method is constrained by object visibility. When objects move outside the camera's field of view, tracking fails due to missing observations.
+
+% Like most VOS-based approaches, our method is constrained by the visibility of the target object.  
+% If the object undergoes large motion outside the camera’s field of view, for example, chairs being moved behind the camera, no visual evidence is available for the model to maintain identity.  
+% In such cases, tracking is fundamentally limited by missing observations.

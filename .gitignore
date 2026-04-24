@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local data, model weights, generated outputs
+data/raw/
+data/processed/
+outputs/
+external/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets / local env
+.env
+.env.*
+*.token
+*.key

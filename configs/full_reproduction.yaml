@@ -1,0 +1,58 @@
+project_root: /Users/lanjie/Proj/3dgs/3am
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  checkpoints: outputs/checkpoints
+  outputs: outputs
+
+external:
+  sam2_repo: external/sam2
+  must3r_repo: external/must3r
+  sam2_checkpoint_url: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+  sam2_checkpoint: outputs/checkpoints/sam2.1_hiera_large.pt
+  sam2_config: configs/sam2.1/sam2.1_hiera_l.yaml
+  must3r_checkpoint_url: ""
+  must3r_checkpoint: outputs/checkpoints/must3r.pt
+
+datasets:
+  scannetpp:
+    root: data/raw/scannetpp
+    processed: data/processed/scannetpp
+    scenes: 855
+    fov_sampling_probability: 0.8
+  ase:
+    root: data/raw/ase
+    processed: data/processed/ase
+    scenes: 2612
+    estimated_size: 23TB
+    fov_sampling_probability: 0.8
+  mose:
+    root: data/raw/mose
+    processed: data/processed/mose
+    videos: 1453
+    fov_sampling_probability: 0.0
+  replica:
+    root: data/raw/replica
+    processed: data/processed/replica
+    split: eval
+
+sampling:
+  fov_threshold: 0.25
+  sequence_length: 8
+
+model:
+  sam_channels: 256
+  must3r_channels: [256, 512, 768]
+  hidden_channels: 256
+  attention_heads: 8
+
+training:
+  iterations: 1000000
+  batch_size: 1
+  optimizer: AdamW
+  learning_rates:
+    memory_attention: 5.0e-6
+    mask_decoder: 5.0e-6
+    feature_merger: 1.0e-5
+  memory_frames: 8
+  checkpoint_out: outputs/checkpoints/3am_full.pt

@@ -1,0 +1,128 @@
+\documentclass[runningheads]{llncs}
+
+% ---------------------------------------------------------------
+% Include basic ECCV package
+ 
+% TODO REVIEW: Insert your submission number below by replacing '*****'
+% TODO FINAL: Comment out the following line for the camera-ready version
+% \usepackage[review,year=2026,ID=852]{eccv}
+% TODO FINAL: Un-comment the following line for the camera-ready version
+%\usepackage{eccv}
+
+% OPTIONAL: Un-comment the following line for a version which is easier to read
+% on small portrait-orientation screens (e.g., mobile phones, or beside other windows)
+\usepackage[mobile]{eccv}
+
+
+% ---------------------------------------------------------------
+% Other packages
+
+% Commonly used abbreviations (\eg, \ie, \etc, \cf, \etal, etc.)
+\usepackage{eccvabbrv}
+
+% Include other packages here, before hyperref.
+\usepackage{graphicx}
+\usepackage{booktabs}
+
+% The "axessiblity" package can be found at: https://ctan.org/pkg/axessibility?lang=en
+\usepackage[accsupp]{axessibility}  % Improves PDF readability for those with disabilities.
+
+\usepackage{pifont}
+\usepackage[table]{xcolor}
+\usepackage{multirow} 
+
+% ---------------------------------------------------------------
+% Hyperref package
+
+% It is strongly recommended to use hyperref, especially for the review version.
+% Please disable hyperref *only* if you encounter grave issues.
+% hyperref with option pagebackref eases the reviewers' job, but should be disabled for the final version.
+%
+% If you comment hyperref and then uncomment it, you should delete
+% main.aux before re-running LaTeX.
+% (Or just hit 'q' on the first LaTeX run, let it finish, and you
+%  should be clear).
+
+% TODO FINAL: Comment out the following line for the camera-ready version
+%\usepackage[pagebackref,breaklinks,colorlinks,citecolor=eccvblue]{hyperref}
+% TODO FINAL: Un-comment the following line for the camera-ready version
+\usepackage{hyperref}
+
+% Support for ORCID icon
+\usepackage{orcidlink}
+
+\newcommand{\jay}[1]{%
+{\color{red}#1}%
+}
+
+\begin{document}
+
+% ---------------------------------------------------------------
+% TODO REVIEW: Replace with your title
+\title{3AM: 3egment Anything with Geometric Consistency in Videos}
+
+% TODO REVIEW: If the paper title is too long for the running head, you can set
+% an abbreviated paper title here. If not, comment out.
+\titlerunning{3AM}
+
+% TODO FINAL: Replace with your author list. 
+% Include the authors' OCRID for the camera-ready version, if at all possible.
+\author{Yang-Che Sun\inst{1} \and Cheng Sun\inst{2} \and Chin-Yang Lin\inst{1} \and Fu-En Yang\inst{2} \and Min-Hung Chen\inst{2} \and Yen-Yu Lin\inst{1} \and Yu-Lun Liu\inst{1}}
+
+% TODO FINAL: Replace with an abbreviated list of authors.
+\authorrunning{Y.-C.~Sun et al.}
+% First names are abbreviated in the running head.
+% If there are more than two authors, 'et al.' is used.
+
+% TODO FINAL: Replace with your institution list.
+\institute{\textsuperscript{\rm 1} National Yang Ming Chiao Tung University, \textsuperscript{\rm 2} NVIDIA Research\\
+\email{jkarly.md11@nycu.edu.tw, yulunliu@cs.nycu.edu.tw}}
+
+\maketitle
+
+\begin{center}
+\centering
+\captionsetup{type=figure}
+\vspace{-6mm}
+\resizebox{1.0\textwidth}{!} 
+{
+\includegraphics[width=\textwidth]{figs/teasers.pdf}
+}
+\vspace{-6mm}
+\caption{\textbf{Overview of 3AM.}  
+Given an input video or an unconstrained photo collection, 3AM takes a user-provided prompt, e.g., mask, point, or box, and produces a consistent object track across all views.  
+Our method maintains cross-view correspondence even under large viewpoint changes, cluttered scenes, and variations in capture conditions, enabling robust object tracking from both videos and casual multi-view image sets.
+}
+\vspace{-3mm}
+\label{teaser}
+\end{center}
+
+\input{00_abstract}
+\input{01_intro}
+\input{02_related}
+\input{03_method}
+\input{04_experiments}
+\input{10_conclusion}
+
+% \par\vfill\par
+% References should start immediately after the main text, but can continue past p.\ 14 if needed. 
+% \clearpage  % TODO FINAL: This \clearpage needs to be removed from both review and camera-ready versions.
+
+\section*{Acknowledgements}
+This work was supported by NVIDIA Taiwan AI Research \& Development Center (TRDC). This research was funded by the National Science and Technology Council, Taiwan, under Grants NSTC 112-2222-E-A49-004-MY2 and 113-2628-E-A49-023-. Yu-Lun Liu acknowledges the Yushan Young Fellow Program by the MOE in Taiwan.
+
+% ---- Bibliography ----
+%
+% BibTeX users should specify bibliography style 'splncs04'.
+% References will then be sorted and formatted in the correct style.
+%
+\bibliographystyle{splncs04}
+\bibliography{main}
+
+
+
+\clearpage
+\appendix
+\input{12_appendix}
+
+\end{document}

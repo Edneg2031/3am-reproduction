@@ -1,0 +1,393 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand*\HyPL@Entry[1]{}
+\citation{ravi2024sam2}
+\citation{ravi2024sam2}
+\citation{ravi2024sam2}
+\citation{ding2024sam2long}
+\citation{videnovic2025distractor}
+\citation{schult2022mask3d}
+\citation{kolodiazhnyi2024oneformer3d}
+\citation{nguyen2024open3dis}
+\citation{yang2023sam3d}
+\citation{zhao2025sam2object}
+\HyPL@Entry{0<</S/D>>}
+\@writefile{toc}{\contentsline {title}{3AM：在视频中以几何一致性分割任意对象}{1}{chapter.1}\protected@file@percent }
+\@writefile{toc}{\authcount {7}}
+\@writefile{toc}{\contentsline {author}{Yang-Che Sun \and Cheng Sun \and Chin-Yang Lin \and Fu-En Yang \and Min-Hung Chen \and Yen-Yu Lin \and Yu-Lun Liu}{1}{chapter.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {3AM 概览。} 给定输入视频或无约束照片集合，3AM 接收用户提供的提示（例如掩码、点或框），并在所有视角中生成一致的对象轨迹。 即使面对大幅视角变化、杂乱场景和采集条件差异，我们的方法仍能保持跨视角对应关系，从而在视频和随手拍摄的多视角图像集合中实现鲁棒的对象跟踪。 }}{1}{figure.caption.2}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{teaser}{{1}{1}{\textbf {3AM 概览。} 给定输入视频或无约束照片集合，3AM 接收用户提供的提示（例如掩码、点或框），并在所有视角中生成一致的对象轨迹。 即使面对大幅视角变化、杂乱场景和采集条件差异，我们的方法仍能保持跨视角对应关系，从而在视频和随手拍摄的多视角图像集合中实现鲁棒的对象跟踪。}{figure.caption.2}{}}
+\newlabel{teaser@cref}{{[figure][1][]1}{[1][1][]1}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {1}引言}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{引言}{section.1}{}}
+\newlabel{sec:intro@cref}{{[section][1][]1}{[1][1][]1}{}{}{}}
+\citation{ding2025mosev2}
+\citation{jia2024sceneverse,peng2023openscene,takmaz2023openmask3d,xu2024embodiedsam,zhao2025sam2object}
+\citation{zust2025panst3r}
+\citation{cabon2025must3r}
+\citation{yeshwanth2023scannet++}
+\citation{replica19arxiv}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces \textbf  {传统 VOS 与 3D 分割方法的局限，以及我们能力的概览。} (a) SAM2~\cite  {ravi2024sam2} 等传统 VOS 方法在相机发生大幅视角变化时会丢失目标，导致掩码漂移或消失。 (b) 3D 分割方法依赖精确相机位姿和显式 3D 掩码合并；当 3D 重建不完整或噪声较大时，它们常会传播错误。 (c) 我们的 \textbf  {3AM} 无需相机位姿或 3D 真值掩码，即可在剧烈视角变化下持续跟踪对象实例，展示了仅依靠几何感知 2D 跟踪实现鲁棒跨视角对应的能力。 }}{2}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:intro-comparison}{{2}{2}{\textbf {传统 VOS 与 3D 分割方法的局限，以及我们能力的概览。} (a) SAM2~\cite {ravi2024sam2} 等传统 VOS 方法在相机发生大幅视角变化时会丢失目标，导致掩码漂移或消失。 (b) 3D 分割方法依赖精确相机位姿和显式 3D 掩码合并；当 3D 重建不完整或噪声较大时，它们常会传播错误。 (c) 我们的 \textbf {3AM} 无需相机位姿或 3D 真值掩码，即可在剧烈视角变化下持续跟踪对象实例，展示了仅依靠几何感知 2D 跟踪实现鲁棒跨视角对应的能力。}{figure.caption.3}{}}
+\newlabel{fig:intro-comparison@cref}{{[figure][2][]2}{[1][1][]2}{}{}{}}
+\citation{perazzi2016benchmark,caelles2017one,voigtlaender2019feelvos,maninis2018video,wu2025denver}
+\citation{yang2019video,oh2019video,bhat2020learning}
+\citation{yang2021associating,cheng2022xmem,cheng2021rethinking,liu2022learning,park2022per,xu2022reliable,yang2024scalable,yang2022decoupling,li2024univs,cheng2024putting}
+\citation{zhou2024rmem}
+\citation{liu2025livos}
+\citation{li2024onevos,zhang2025jointformer}
+\citation{zhou2024improving}
+\citation{hong2023lvos}
+\citation{yan2024panovos}
+\citation{mahadevan2024point}
+\citation{ravi2024sam2}
+\citation{ding2024sam2long}
+\citation{videnovic2025distractor}
+\citation{zhou2025edgetam}
+\citation{cuttano2025samwise}
+\citation{yang2024samurai,yang2025mosam,ye2025entitysam}
+\citation{yuan2025sa2va,yan2024visa,bai2024one}
+\citation{ding2025mosev2,xu2018youtube,perazzi2017davis}
+\citation{schult2022mask3d,jiang2020pointgroup,han2020occuseg,vu2022softgroup,misra2021end,sun2023superpoint,kolodiazhnyi2024oneformer3d,takmaz2023openmask3d,piekenbrinck2025opensplat3d}
+\citation{zhou2024point}
+\citation{boudjoghra2025openyolo}
+\citation{yang2023sam3d,xu2024embodiedsam,nguyen2024open3dis,boudjoghra2024open,jung2025details,xu2023neurallift,kerr2023lerf,vora2021nesf,jiang2024open,bautista2022gaudi,hsu2025openm3d,tu2023imgeonet,li2024genrc}
+\citation{yin2024sai3d}
+\citation{wang2024lift3d,engelmann2024opennerf}
+\citation{ying2024omniseg3d,kim2024garfield}
+\citation{gu2024egolifter}
+\citation{qin2024langsplat,zhou2024feature,wu2024opengaussian,peng20243d}
+\citation{ye2024gaussian,zhai2025panogs}
+\citation{shen2024flashsplat}
+\citation{zhu2025rethinking}
+\citation{zhao2025sam2object,xu2024embodiedsam,peng2023openscene,takmaz2023openmask3d,jia2024sceneverse}
+\citation{cabon2025must3r,wang2024dust3r,wang2025continuous,wang2025vggt,yang2025fast3r,chen2025long3r,leroy2024grounding,wu2025point3r,charatan2024pixelsplat,ye2024no,wang20243d,lin2025longsplat,shih2025prior,fan2025spectromotion,liu2023robust,su2024boostmvsnerfs}
+\citation{zhang2024monst3r}
+\citation{wang20253d}
+\citation{smart2024splatt3r}
+\citation{tang2025mv}
+\citation{murai2025mast3r}
+\citation{duisterhof2025mast3r}
+\citation{chen2025easi3r}
+\citation{cabon2025must3r}
+\citation{ravi2024sam2}
+\citation{videnovic2025distractor}
+\citation{schult2022mask3d}
+\citation{boudjoghra2024open}
+\citation{xu2024esam}
+\@writefile{toc}{\contentsline {section}{\numberline {2}相关工作}{3}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{2}{3}{相关工作}{section.2}{}}
+\newlabel{sec:related@cref}{{[section][2][]2}{[1][3][]3}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{2D 视频对象分割。}{3}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{3D 实例分割。}{3}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{端到端 3D 感知方法。}{3}{section*.7}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces \textbf  {3AM 流水线概览。} 我们的 Feature Merger 将从多视角一致性中学习、编码隐式几何对应的多层级 MUSt3R 特征，与 SAM2 的外观特征通过交叉注意力和卷积细化进行融合。融合后的几何感知表示随后经过与历史帧的记忆注意力和掩码解码，使模型在推理时无需相机位姿，也能实现空间一致的对象识别，并在大幅视角变化下保持身份。 }}{4}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:pipline}{{3}{4}{\textbf {3AM 流水线概览。} 我们的 Feature Merger 将从多视角一致性中学习、编码隐式几何对应的多层级 MUSt3R 特征，与 SAM2 的外观特征通过交叉注意力和卷积细化进行融合。融合后的几何感知表示随后经过与历史帧的记忆注意力和掩码解码，使模型在推理时无需相机位姿，也能实现空间一致的对象识别，并在大幅视角变化下保持身份。}{figure.caption.6}{}}
+\newlabel{fig:pipline@cref}{{[figure][3][]3}{[1][3][]4}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}方法}{4}{section.3}\protected@file@percent }
+\newlabel{sec:method}{{3}{4}{方法}{section.3}{}}
+\newlabel{sec:method@cref}{{[section][3][]3}{[1][3][]4}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}问题设定}{4}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}架构}{4}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{特征融合。}{4}{figure.caption.9}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces \textbf  {用于特征融合的特征示意。} 热力图由红色查询点与目标帧之间的余弦相似度计算得到。如底行所示，原始 SAM2 在大幅视角变化下失败。相反，随着 MUSt3R 特征层级从语义对应逐渐转向点云域，我们选择中间层以同时保留语义相关性和几何结构。通过将 MUSt3R 的几何线索与 SAM2 的视觉语义结合，融合特征 $F_{{merged}}$ 能更可靠地定位目标对象。 }}{5}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:feature_merging}{{4}{5}{\textbf {用于特征融合的特征示意。} 热力图由红色查询点与目标帧之间的余弦相似度计算得到。如底行所示，原始 SAM2 在大幅视角变化下失败。相反，随着 MUSt3R 特征层级从语义对应逐渐转向点云域，我们选择中间层以同时保留语义相关性和几何结构。通过将 MUSt3R 的几何线索与 SAM2 的视觉语义结合，融合特征 $F_{{merged}}$ 能更可靠地定位目标对象。}{figure.caption.9}{}}
+\newlabel{fig:feature_merging@cref}{{[figure][4][]4}{[1][4][]5}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces \centering  原始连续采样策略}}{5}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:cont-samp}{{5}{5}{\centering 原始连续采样策略}{figure.caption.10}{}}
+\newlabel{fig:cont-samp@cref}{{[figure][5][]5}{[1][5][]5}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces \centering  不考虑视场的朴素随机采样}}{5}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:rand-samp}{{6}{5}{\centering 不考虑视场的朴素随机采样}{figure.caption.10}{}}
+\newlabel{fig:rand-samp@cref}{{[figure][6][]6}{[1][5][]5}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces \centering  视场感知采样策略（本文）}}{5}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:fov-samp}{{7}{5}{\centering 视场感知采样策略（本文）}{figure.caption.10}{}}
+\newlabel{fig:fov-samp@cref}{{[figure][7][]7}{[1][5][]5}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces \textbf  {训练阶段采样策略概览。} (a) 连续采样只能覆盖相邻视角，跨视角变化有限。 (b) 朴素随机采样会选择同一大型对象上空间上相距很远的区域。 例如，帧~0 看到沙发左侧，而帧~1 看到右侧。 由于这些区域在 3D 空间中距离很远，将它们作为相同监督信号会迫使模型匹配不一致的几何，从而导致学习歧义。 (c) 我们的视场感知采样仅保留被掩码覆盖的 3D 点有足够比例落在参考相机视锥内的帧，在保留自然姿态和遮挡变化的同时，保证一致的几何重叠。}}{5}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:pipeline}{{8}{5}{\textbf {训练阶段采样策略概览。} (a) 连续采样只能覆盖相邻视角，跨视角变化有限。 (b) 朴素随机采样会选择同一大型对象上空间上相距很远的区域。 例如，帧~0 看到沙发左侧，而帧~1 看到右侧。 由于这些区域在 3D 空间中距离很远，将它们作为相同监督信号会迫使模型匹配不一致的几何，从而导致学习歧义。 (c) 我们的视场感知采样仅保留被掩码覆盖的 3D 点有足够比例落在参考相机视锥内的帧，在保留自然姿态和遮挡变化的同时，保证一致的几何重叠。}{figure.caption.10}{}}
+\newlabel{fig:pipeline@cref}{{[figure][8][]8}{[1][5][]5}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}训练帧采样}{5}{subsection.3.3}\protected@file@percent }
+\newlabel{subsec:sampling}{{3.3}{5}{训练帧采样}{subsection.3.3}{}}
+\newlabel{subsec:sampling@cref}{{[subsection][3][3]3.3}{[1][5][]5}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{朴素随机采样。}{5}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{对象跨越问题。}{5}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{视场采样。}{5}{section*.13}\protected@file@percent }
+\citation{perazzi2017davis,xu2018youtube,fan2019lasot}
+\citation{Huang_2025_seganymotion}
+\citation{yeshwanth2023scannet++}
+\citation{avetisyan2024scenescript}
+\citation{MOSE}
+\citation{avetisyan2024scenescript}
+\citation{yeshwanth2023scannet++}
+\citation{MOSE}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}动态对象回退}{6}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}实验}{6}{section.4}\protected@file@percent }
+\newlabel{sec:exp}{{4}{6}{实验}{section.4}{}}
+\newlabel{sec:exp@cref}{{[section][4][]4}{[1][6][]6}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{训练设置。}{6}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{数据集。}{6}{table.caption.16}\protected@file@percent }
+\citation{hong2023lvos}
+\citation{tokmakov2023vost}
+\citation{perazzi2017davis}
+\citation{xu2018youtube}
+\citation{yeshwanth2023scannet++}
+\citation{replica19arxiv}
+\citation{ding2024sam2long}
+\citation{videnovic2025distractor}
+\citation{yeshwanth2023scannet++}
+\citation{yeshwanth2023scannet++}
+\citation{ravi2024sam2}
+\citation{ding2024sam2long}
+\citation{videnovic2025distractor}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \textbf  {用于训练的数据集。} 仅当真值几何可用时，我们才应用 FOV 感知采样。}}{7}{table.caption.16}\protected@file@percent }
+\newlabel{tab:datasets}{{1}{7}{\textbf {用于训练的数据集。} 仅当真值几何可用时，我们才应用 FOV 感知采样。}{table.caption.16}{}}
+\newlabel{tab:datasets@cref}{{[table][1][]1}{[1][6][]7}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces \textbf  {ScanNet++ \cite  {yeshwanth2023scannet++} 和 VOS 数据集上的视频对象分割结果。} Tracking Recall 在对象存在的帧上计算。 Accuracy 在存在真值对象且预测与 GT 的 IoU $\neq  0$ 的帧上计算。}}{7}{table.caption.20}\protected@file@percent }
+\newlabel{tab:scannetpp-2d}{{2}{7}{\textbf {ScanNet++ \cite {yeshwanth2023scannet++} 和 VOS 数据集上的视频对象分割结果。} Tracking Recall 在对象存在的帧上计算。 Accuracy 在存在真值对象且预测与 GT 的 IoU $\neq 0$ 的帧上计算。}{table.caption.20}{}}
+\newlabel{tab:scannetpp-2d@cref}{{[table][2][]2}{[1][7][]7}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}2D 评估。}{7}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{比较方法。}{7}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{指标。}{7}{section*.18}\protected@file@percent }
+\citation{perazzi2017davis,fan2019lasot,videnovic2025distractor}
+\citation{Jayanti2025SegMASt3R}
+\citation{Jayanti2025SegMASt3R}
+\citation{replica19arxiv}
+\citation{replica19arxiv}
+\citation{ravi2024sam2}
+\citation{ding2024sam2long}
+\citation{videnovic2025distractor}
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces  \textbf  {VOS 方法的视觉比较。} 最左侧帧作为条件帧，并提供参考掩码。 }}{8}{figure.caption.21}\protected@file@percent }
+\newlabel{fig:vis_comp}{{9}{8}{\textbf {VOS 方法的视觉比较。} 最左侧帧作为条件帧，并提供参考掩码。}{figure.caption.21}{}}
+\newlabel{fig:vis_comp@cref}{{[figure][9][]9}{[1][7][]8}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces {3AM 与 SegMASt3R 在 ScanNet++ Whole Set 上的两视图匹配定量比较。}}}{8}{table.caption.23}\protected@file@percent }
+\newlabel{tab:two_view_comparison}{{3}{8}{3AM 与 SegMASt3R 在 ScanNet++ Whole Set 上的两视图匹配定量比较。}{table.caption.23}{}}
+\newlabel{tab:two_view_comparison@cref}{{[table][3][]3}{[1][8][]8}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces {Replica\cite  {replica19arxiv} 数据集上的视频对象分割结果。}}}{8}{table.caption.23}\protected@file@percent }
+\newlabel{tab:replica-3d}{{4}{8}{Replica\cite {replica19arxiv} 数据集上的视频对象分割结果。}{table.caption.23}{}}
+\newlabel{tab:replica-3d@cref}{{[table][4][]4}{[1][8][]8}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{ScanNet++.}{8}{figure.caption.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{与 SegMASt3R 的两视图匹配比较。}{8}{section*.22}\protected@file@percent }
+\citation{xu2024esam}
+\citation{yang2023sam3d}
+\citation{jung2025details}
+\citation{boudjoghra2025openyolo,nguyen2024open3dis}
+\citation{zhao2025sam2object}
+\citation{zhao2025sam2object}
+\citation{xu2025sampro3d}
+\citation{nguyen2024open3dis}
+\citation{yin2024sai3d}
+\citation{zhao2025sam2object}
+\citation{yang2023sam3d}
+\citation{xu2024esam}
+\citation{videnovic2025distractor}
+\citation{ding2024sam2long}
+\citation{videnovic2025distractor}
+\citation{ding2024sam2long}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces \textbf  {不同方法在 ScanNet200 数据集上的类别无关 3D 实例分割结果。}}}{9}{table.caption.25}\protected@file@percent }
+\newlabel{tab:scannet200-class-agnostic}{{5}{9}{\textbf {不同方法在 ScanNet200 数据集上的类别无关 3D 实例分割结果。}}{table.caption.25}{}}
+\newlabel{tab:scannet200-class-agnostic@cref}{{[table][5][]5}{[1][9][]9}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Replica。}{9}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}3D 评估}{9}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}消融研究}{9}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{组件分析。}{9}{section*.26}\protected@file@percent }
+\bibstyle{splncs04}
+\bibdata{main}
+\bibcite{avetisyan2024scenescript}{1}
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces \textbf  {ScanNet++ selected subset 上的组件分析。}}}{10}{table.caption.27}\protected@file@percent }
+\newlabel{tab:component-eval}{{6}{10}{\textbf {ScanNet++ selected subset 上的组件分析。}}{table.caption.27}{}}
+\newlabel{tab:component-eval@cref}{{[table][6][]6}{[1][9][]10}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces ScanNet++ Whole Set 上不同记忆选择方法的比较。}}{10}{table.caption.29}\protected@file@percent }
+\newlabel{tab:memory-selection}{{7}{10}{ScanNet++ Whole Set 上不同记忆选择方法的比较。}{table.caption.29}{}}
+\newlabel{tab:memory-selection@cref}{{[table][7][]7}{[1][9][]10}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces 不同 3D 重建骨干网络的比较。}}{10}{table.caption.29}\protected@file@percent }
+\newlabel{tab:3D_backbone}{{8}{10}{不同 3D 重建骨干网络的比较。}{table.caption.29}{}}
+\newlabel{tab:3D_backbone@cref}{{[table][8][]8}{[1][9][]10}{}{}{}}
+\newlabel{subsubsec-memory-select}{{4.3}{10}{记忆选择。}{section*.28}{}}
+\newlabel{subsubsec-memory-select@cref}{{[subsection][3][4]4.3}{[1][9][]10}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{记忆选择。}{10}{table.caption.29}\protected@file@percent }
+\newlabel{subsubsec-3d-models}{{4.3}{10}{3D 基础模型。}{section*.30}{}}
+\newlabel{subsubsec-3d-models@cref}{{[subsection][3][4]4.3}{[1][10][]10}{}{}{}}
+\@writefile{toc}{\contentsline {subsubsection}{3D 基础模型。}{10}{figure.caption.31}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}结论}{10}{section.5}\protected@file@percent }
+\bibcite{bai2024one}{2}
+\bibcite{bautista2022gaudi}{3}
+\bibcite{bhat2020learning}{4}
+\bibcite{boudjoghra2024open}{5}
+\bibcite{boudjoghra2025openyolo}{6}
+\bibcite{cabon2025must3r}{7}
+\bibcite{caelles2017one}{8}
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces  \textbf  {不同 3D 重建骨干网络的视觉比较。}（\emph  {上}）CUT3R 的重建缺乏稳定对象对齐；同一张桌子出现在不一致的 3D 位置。这种几何不稳定性削弱了特征区分性，使可靠跟踪变得困难。（\emph  {下}）相比之下，MUSt3R 在跨视角下提供连贯且稳定的对象对齐，生成能够保持对象身份并支持鲁棒跟踪的特征 }}{11}{figure.caption.31}\protected@file@percent }
+\newlabel{fig:comp_3r}{{10}{11}{\textbf {不同 3D 重建骨干网络的视觉比较。}（\emph {上}）CUT3R 的重建缺乏稳定对象对齐；同一张桌子出现在不一致的 3D 位置。这种几何不稳定性削弱了特征区分性，使可靠跟踪变得困难。（\emph {下}）相比之下，MUSt3R 在跨视角下提供连贯且稳定的对象对齐，生成能够保持对象身份并支持鲁棒跟踪的特征}{figure.caption.31}{}}
+\newlabel{fig:comp_3r@cref}{{[figure][10][]10}{[1][10][]11}{}{}{}}
+\bibcite{charatan2024pixelsplat}{9}
+\bibcite{chen2025easi3r}{10}
+\bibcite{chen2025long3r}{11}
+\bibcite{cheng2024putting}{12}
+\bibcite{cheng2022xmem}{13}
+\bibcite{cheng2021rethinking}{14}
+\bibcite{cuttano2025samwise}{15}
+\bibcite{MOSE}{16}
+\bibcite{ding2025mosev2}{17}
+\bibcite{ding2024sam2long}{18}
+\bibcite{duisterhof2025mast3r}{19}
+\bibcite{engelmann2024opennerf}{20}
+\bibcite{fan2025spectromotion}{21}
+\bibcite{fan2019lasot}{22}
+\bibcite{fan2024large}{23}
+\bibcite{gu2024egolifter}{24}
+\bibcite{han2020occuseg}{25}
+\bibcite{hong2023lvos}{26}
+\bibcite{hsu2025openm3d}{27}
+\bibcite{Huang_2025_seganymotion}{28}
+\bibcite{jain2024odin}{29}
+\bibcite{Jayanti2025SegMASt3R}{30}
+\bibcite{jia2024sceneverse}{31}
+\bibcite{jiang2025gausstr}{32}
+\bibcite{jiang2024open}{33}
+\bibcite{jiang2020pointgroup}{34}
+\bibcite{jung2025details}{35}
+\bibcite{kerr2023lerf}{36}
+\bibcite{kim2024garfield}{37}
+\bibcite{kolodiazhnyi2024oneformer3d}{38}
+\bibcite{leroy2024grounding}{39}
+\bibcite{li2025ovseg3r}{40}
+\bibcite{li2024genrc}{41}
+\bibcite{li2024univs}{42}
+\bibcite{li2024onevos}{43}
+\bibcite{lin2025longsplat}{44}
+\bibcite{lin2017featureFPN}{45}
+\bibcite{liu2025livos}{46}
+\bibcite{liu2022learning}{47}
+\bibcite{liu2023robust}{48}
+\bibcite{mahadevan2024point}{49}
+\bibcite{man2024lexicon3d}{50}
+\bibcite{maninis2018video}{51}
+\bibcite{misra2021end}{52}
+\bibcite{murai2025mast3r}{53}
+\bibcite{nguyen2024open3dis}{54}
+\bibcite{oh2019video}{55}
+\bibcite{park2022per}{56}
+\bibcite{peng20243d}{57}
+\bibcite{peng2023openscene}{58}
+\bibcite{perazzi2016benchmark}{59}
+\bibcite{piekenbrinck2025opensplat3d}{60}
+\bibcite{perazzi2017davis}{61}
+\bibcite{qin2024langsplat}{62}
+\bibcite{ravi2024sam2}{63}
+\bibcite{ryali2023hiera}{64}
+\bibcite{schult2022mask3d}{65}
+\bibcite{shen2024flashsplat}{66}
+\bibcite{shih2025prior}{67}
+\bibcite{smart2024splatt3r}{68}
+\bibcite{replica19arxiv}{69}
+\bibcite{su2024boostmvsnerfs}{70}
+\bibcite{sun2023superpoint}{71}
+\bibcite{sun2025uni3r}{72}
+\bibcite{takmaz2023openmask3d}{73}
+\bibcite{tang2025mv}{74}
+\bibcite{tokmakov2023vost}{75}
+\bibcite{tu2023imgeonet}{76}
+\bibcite{videnovic2025distractor}{77}
+\bibcite{voigtlaender2019feelvos}{78}
+\bibcite{vora2021nesf}{79}
+\bibcite{vu2022softgroup}{80}
+\bibcite{wang20243d}{81}
+\bibcite{wang20253d}{82}
+\bibcite{wang2025vggt}{83}
+\bibcite{wang2024lift3d}{84}
+\bibcite{wang2025continuous}{85}
+\bibcite{wang2024dust3r}{86}
+\bibcite{wu2025denver}{87}
+\bibcite{wu2024opengaussian}{88}
+\bibcite{wu2025point3r}{89}
+\bibcite{xu2023neurallift}{90}
+\bibcite{xu2025sampro3d}{91}
+\bibcite{xu2018youtube}{92}
+\bibcite{xu2022reliable}{93}
+\bibcite{xu2024embodiedsam}{94}
+\bibcite{xu2024esam}{95}
+\bibcite{yan2024visa}{96}
+\bibcite{yan2024panovos}{97}
+\bibcite{yang2024samurai}{98}
+\bibcite{yang2025fast3r}{99}
+\bibcite{yang2019video}{100}
+\bibcite{yang2025mosam}{101}
+\bibcite{yang2023sam3d}{102}
+\bibcite{yang2024scalable}{103}
+\bibcite{yang2021associating}{104}
+\bibcite{yang2022decoupling}{105}
+\bibcite{ye2024no}{106}
+\bibcite{ye2024gaussian}{107}
+\bibcite{ye2025entitysam}{108}
+\bibcite{yeshwanth2023scannet++}{109}
+\bibcite{yin2024sai3d}{110}
+\bibcite{ying2024omniseg3d}{111}
+\bibcite{yuan2025sa2va}{112}
+\bibcite{zhai2025panogs}{113}
+\bibcite{zhang2025jointformer}{114}
+\bibcite{zhang2024monst3r}{115}
+\bibcite{zhao2025sam2object}{116}
+\bibcite{zhou2025edgetam}{117}
+\bibcite{zhou2024rmem}{118}
+\bibcite{zhou2024feature}{119}
+\bibcite{zhou2024improving}{120}
+\bibcite{zhou2024point}{121}
+\bibcite{zhu2025rethinking}{122}
+\bibcite{zust2025panst3r}{123}
+\citation{ryali2023hiera}
+\citation{lin2017featureFPN}
+\@writefile{toc}{\contentsline {section}{\numberline {A}概览}{20}{section.1}\protected@file@percent }
+\newlabel{sec:appendix_overview}{{A}{20}{概览}{section.1}{}}
+\newlabel{sec:appendix_overview@cref}{{[section][1][]A}{[1][20][]20}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}实现细节}{20}{section.2}\protected@file@percent }
+\newlabel{sec:details}{{B}{20}{实现细节}{section.2}{}}
+\newlabel{sec:details@cref}{{[section][2][]B}{[1][20][]20}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.1}Feature Merger}{20}{subsection.2.1}\protected@file@percent }
+\citation{avetisyan2024scenescript}
+\citation{MOSE}
+\citation{yeshwanth2023scannet++}
+\citation{yeshwanth2023scannet++}
+\@writefile{toc}{\contentsline {section}{\numberline {C}训练细节}{21}{section.3}\protected@file@percent }
+\newlabel{sec:training_details}{{C}{21}{训练细节}{section.3}{}}
+\newlabel{sec:training_details@cref}{{[section][3][]C}{[1][20][]21}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.1}Field-of-View Sampling}{21}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.2}设置}{21}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{损失}{21}{section*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{提示}{21}{section*.35}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.3}数据集}{21}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Aria Synthetic Environments (ASE)~\cite  {avetisyan2024scenescript}}{21}{section*.36}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{MOSE~\cite  {MOSE}}{21}{section*.37}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{ScanNet++~\cite  {yeshwanth2023scannet++}}{21}{section*.38}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {D}类别无关实例分割}{22}{section.4}\protected@file@percent }
+\newlabel{sec:class_agnostic}{{D}{22}{类别无关实例分割}{section.4}{}}
+\newlabel{sec:class_agnostic@cref}{{[section][4][]D}{[1][22][]22}{}{}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {E}定性比较}{22}{section.5}\protected@file@percent }
+\newlabel{sec:more_qualitative}{{E}{22}{定性比较}{section.5}{}}
+\newlabel{sec:more_qualitative@cref}{{[section][5][]E}{[1][22][]22}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{视频比较}{22}{section*.46}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{类别无关实例分割。}{22}{section*.47}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{23}{figure.caption.39}\protected@file@percent }
+\newlabel{fig:vis_comp_app}{{11}{23}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.39}{}}
+\newlabel{fig:vis_comp_app@cref}{{[figure][11][]11}{[1][22][]23}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {12}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{24}{figure.caption.40}\protected@file@percent }
+\newlabel{fig:vis_comp2}{{12}{24}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.40}{}}
+\newlabel{fig:vis_comp2@cref}{{[figure][12][]12}{[1][22][]24}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {13}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{25}{figure.caption.41}\protected@file@percent }
+\newlabel{fig:vis_comp3}{{13}{25}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.41}{}}
+\newlabel{fig:vis_comp3@cref}{{[figure][13][]13}{[1][22][]25}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {14}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{26}{figure.caption.42}\protected@file@percent }
+\newlabel{fig:vis_comp4}{{14}{26}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.42}{}}
+\newlabel{fig:vis_comp4@cref}{{[figure][14][]14}{[1][22][]26}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {15}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{27}{figure.caption.43}\protected@file@percent }
+\newlabel{fig:vis_comp5}{{15}{27}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.43}{}}
+\newlabel{fig:vis_comp5@cref}{{[figure][15][]15}{[1][22][]27}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {16}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{28}{figure.caption.44}\protected@file@percent }
+\newlabel{fig:vis_comp6}{{16}{28}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.44}{}}
+\newlabel{fig:vis_comp6@cref}{{[figure][16][]16}{[1][22][]28}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {17}{\ignorespaces  \textbf  {不同 VOS 方法的视觉比较} }}{29}{figure.caption.45}\protected@file@percent }
+\newlabel{fig:vis_comp7}{{17}{29}{\textbf {不同 VOS 方法的视觉比较}}{figure.caption.45}{}}
+\newlabel{fig:vis_comp7@cref}{{[figure][17][]17}{[1][22][]29}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {18}{\ignorespaces  \textbf  {类别无关实例分割的视觉结果。} }}{30}{figure.caption.48}\protected@file@percent }
+\newlabel{fig:visual_class}{{18}{30}{\textbf {类别无关实例分割的视觉结果。}}{figure.caption.48}{}}
+\newlabel{fig:visual_class@cref}{{[figure][18][]18}{[1][22][]30}{}{}{}}
+\gdef \@abspage@last{30}
