@@ -5,11 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import pytest
 from PIL import Image
 
 from three_am.data.io import write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
-from three_am.training.dataset import ThreeAMTrainingDataset
+from three_am.training.dataset import ThreeAMTrainingDataset, configured_manifest_path
 
 
 def _write_image(path: Path) -> None:
@@ -142,3 +143,46 @@ def test_mose_uses_continuous_sampling_even_with_overlap_cache(tmp_path: Path) -
     batch = dataset.sample()
 
     assert batch.frame_ids == ("001", "002")
+
+
+def test_configured_manifest_path_accepts_plural_train_mapping(tmp_path: Path) -> None:
+    config = {
+        "project_root": str(tmp_path),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "datasets": {"scannetpp": {"manifests": {"train": "custom/train_manifest.json"}}},
+    }
+
+    assert configured_manifest_path(config, "scannetpp") == tmp_path / "custom" / "train_manifest.json"
+
+
+def test_training_dataset_uses_absolute_manifest_and_frame_paths(tmp_path: Path) -> None:
+    outside_root = tmp_path / "outside_project"
+    scene = _scene(outside_root, "scannetpp", [np.ones((4, 4), dtype=np.uint8), np.ones((4, 4), dtype=np.uint8)])
+    manifest = outside_root / "absolute_manifest.json"
+    write_manifest(manifest, [scene])
+    config = {
+        "project_root": str(tmp_path / "project"),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "datasets": {"scannetpp": {"manifests": {"train": str(manifest)}, "fov_sampling_probability": 0.0}},
+        "sampling": {"sequence_length": 2, "fov_threshold": 0.25},
+        "features": {"cache_root": str(outside_root / "features")},
+        "model": {"must3r_channels": [2]},
+    }
+
+    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.scene_id == "scene_a"
+    assert batch.images.shape == (2, 3, 4, 4)
+
+
+def test_missing_training_data_error_lists_checked_manifests(tmp_path: Path) -> None:
+    config = {
+        "project_root": str(tmp_path),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "datasets": {},
+        "model": {"must3r_channels": [2]},
+    }
+
+    with pytest.raises(ValueError, match="Checked manifests"):
+        ThreeAMTrainingDataset.from_config(config)

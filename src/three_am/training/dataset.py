@@ -94,9 +94,14 @@ def default_manifest_path(config: dict[str, Any], dataset: str) -> Path:
     return paths.data_processed / f"{dataset}_manifest.json"
 
 
-def configured_manifest_path(config: dict[str, Any], dataset: str) -> Path:
+def configured_manifest_path(config: dict[str, Any], dataset: str, split: str = "train") -> Path:
     dataset_config = config.get("datasets", {}).get(dataset, {})
     manifest = dataset_config.get("manifest")
+    manifests = dataset_config.get("manifests")
+    if manifest is None and isinstance(manifests, dict):
+        manifest = manifests.get(split)
+    if manifest is None and isinstance(manifests, (str, Path)):
+        manifest = manifests
     return resolve_project_path(config, manifest) or default_manifest_path(config, dataset)
 
 
@@ -122,6 +127,30 @@ def load_training_scenes(config: dict[str, Any], datasets: tuple[str, ...] = ("s
             continue
         scenes.extend(scene for scene in read_manifest(manifest) if scene.split == "train")
     return scenes
+
+
+def missing_training_data_message(config: dict[str, Any]) -> str:
+    statuses = manifest_statuses(config)
+    checked = "\n".join(
+        f"  - {status.dataset}: {status.manifest} ({'exists' if status.exists else 'missing'}, train scenes={status.scenes})"
+        for status in statuses
+    )
+    commands = "\n".join(
+        [
+            "  PYTHONPATH=src python scripts/build_manifest.py --dataset scannetpp --root data/processed/scannetpp --split train --output data/processed/scannetpp_manifest.json",
+            "  PYTHONPATH=src python scripts/build_manifest.py --dataset ase --root data/processed/ase --split train --output data/processed/ase_manifest.json",
+            "  PYTHONPATH=src python scripts/build_manifest.py --dataset mose --root data/processed/mose --split train --output data/processed/mose_manifest.json",
+        ]
+    )
+    return (
+        "No training scenes found.\n"
+        "Checked manifests:\n"
+        f"{checked}\n"
+        "Point datasets.<name>.manifest or datasets.<name>.manifests.train at an existing manifest. "
+        "The frame paths inside that manifest may be absolute paths and do not need to live under data/processed.\n"
+        "If you still need to generate manifests from normalized folders, typical commands are:\n"
+        f"{commands}"
+    )
 
 
 def manifest_statuses(
@@ -312,7 +341,7 @@ class ThreeAMTrainingDataset:
         rng: RandomLike | None = None,
     ) -> None:
         if not scenes:
-            raise ValueError("No training scenes found. Build manifests under data/processed or set datasets.<name>.manifest.")
+            raise ValueError(missing_training_data_message(config))
         self.scenes = scenes
         self.config = config
         self.rng = rng or random
