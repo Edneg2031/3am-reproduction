@@ -39,6 +39,7 @@ class PrecomputeOptions:
     image_size: int
     amp: str | bool
     max_bs: int
+    decode_batch_size: int
     feature_layers: tuple[int, ...]
     write_manifest: Path | None
     limit_scenes: int | None
@@ -109,14 +110,20 @@ class OfficialMust3rExtractor:
         image_size: int,
         amp: str | bool,
         max_bs: int,
+        decode_batch_size: int,
         feature_layers: tuple[int, ...],
     ) -> None:
+        if max_bs < 1:
+            raise ValueError("max_bs must be >= 1")
+        if decode_batch_size < 1:
+            raise ValueError("decode_batch_size must be >= 1")
         self.weights = weights
         self.must3r_repo = must3r_repo
         self.device = torch.device(device)
         self.image_size = image_size
         self.amp = amp
         self.max_bs = max_bs
+        self.decode_batch_size = decode_batch_size
         self.feature_layers = feature_layers
         self.model: tuple[Any, Any] | None = None
 
@@ -138,17 +145,44 @@ class OfficialMust3rExtractor:
         if self.model is None:
             raise Must3rPrecomputeError("MUSt3R model failed to load")
         encoder, decoder = self.model
-        images, true_shape = self._load_images(scene.frames, encoder.patch_size)
-        if not images:
+        if not scene.frames:
             raise Must3rPrecomputeError(f"Scene {scene.scene_id} has no frames")
+        true_shape_chunks: list[torch.Tensor] = []
+        selected_chunks: list[list[torch.Tensor]] | None = None
+        selected_indices: tuple[int, ...] | None = None
         with torch.no_grad():
-            image_tensor = torch.stack(images, dim=0).to(self.device)
-            true_shape_tensor = torch.stack(true_shape, dim=0).to(self.device)
             dtype = _dtype_for_amp(self.amp)
             with torch.autocast(self.device.type, dtype=dtype, enabled=bool(self.amp) and self.device.type == "cuda"):
-                encoder_tokens, pos = self._encode_frames(encoder, image_tensor, true_shape_tensor)
-                raw_levels = self._decode_feature_levels(decoder, encoder_tokens, pos, true_shape_tensor)
-        selected_levels = tuple(self._tokens_to_chw(raw_levels[index], true_shape_tensor) for index in self.feature_layers)
+                for start in range(0, len(scene.frames), self.decode_batch_size):
+                    end = min(len(scene.frames), start + self.decode_batch_size)
+                    images, true_shape = self._load_images(scene.frames[start:end], encoder.patch_size)
+                    if not images:
+                        raise Must3rPrecomputeError(
+                            f"Scene {scene.scene_id} frame chunk {start}:{end} produced no loaded images"
+                        )
+                    true_shape_tensor = torch.stack(true_shape, dim=0)
+                    true_shape_chunks.append(true_shape_tensor)
+                    image_tensor = torch.stack(images, dim=0).to(self.device)
+                    chunk_true_shape = true_shape_tensor.to(self.device)
+                    encoder_tokens, pos = self._encode_frames(encoder, image_tensor, chunk_true_shape)
+                    raw_levels = self._decode_feature_levels(decoder, encoder_tokens, pos, chunk_true_shape)
+                    if selected_indices is None:
+                        selected_indices = self._normalize_feature_layers(len(raw_levels))
+                        selected_chunks = [[] for _ in selected_indices]
+                    if selected_chunks is None or selected_indices is None:
+                        raise Must3rPrecomputeError("MUSt3R decoder returned no selectable feature levels")
+                    if any(index >= len(raw_levels) for index in selected_indices):
+                        raise Must3rPrecomputeError(
+                            f"MUSt3R decoder returned {len(raw_levels)} levels, cannot select {list(self.feature_layers)}"
+                        )
+                    for output_index, raw_index in enumerate(selected_indices):
+                        selected_chunks[output_index].append(raw_levels[raw_index])
+                    del image_tensor, chunk_true_shape, encoder_tokens, pos, raw_levels
+        if selected_chunks is None:
+            raise Must3rPrecomputeError(f"Scene {scene.scene_id} produced no MUSt3R feature chunks")
+        true_shape_tensor = torch.cat(true_shape_chunks, dim=0)
+        selected_token_levels = tuple(torch.cat(chunks, dim=0) for chunks in selected_chunks)
+        selected_levels = tuple(self._tokens_to_chw(level, true_shape_tensor) for level in selected_token_levels)
         return SceneFeatures(
             levels=selected_levels,
             metadata={
@@ -157,6 +191,10 @@ class OfficialMust3rExtractor:
                 "feature_channels": [int(level.shape[1]) for level in selected_levels],
                 "feature_grid": [list(level.shape[-2:]) for level in selected_levels],
                 "image_size": self.image_size,
+                "amp": self.amp,
+                "encoder_batch_size": self.max_bs,
+                "decode_batch_size": self.decode_batch_size,
+                "decoder_memory": False,
                 "checkpoint": str(self.weights),
                 "frame_ids": [frame.frame_id for frame in scene.frames],
             },
@@ -189,18 +227,44 @@ class OfficialMust3rExtractor:
         pos: torch.Tensor,
         true_shape: torch.Tensor,
     ) -> list[torch.Tensor]:
-        batched_tokens = encoder_tokens.unsqueeze(0)
-        batched_pos = pos.unsqueeze(0)
-        batched_true_shape = true_shape.unsqueeze(0)
         if not hasattr(decoder, "forward_list"):
             raise Must3rPrecomputeError("MUSt3R decoder has no forward_list(..., return_feats=True) hook")
-        output = decoder.forward_list([batched_tokens], [batched_pos], [batched_true_shape], return_feats=True)
-        if not isinstance(output, tuple) or len(output) != 3:
-            raise Must3rPrecomputeError("MUSt3R decoder.forward_list did not return (memory, pointmaps, feats)")
-        _, _, grouped_feats = output
-        if not grouped_feats or not grouped_feats[0]:
+        level_chunks: list[list[torch.Tensor]] | None = None
+        for start in range(0, encoder_tokens.shape[0], self.decode_batch_size):
+            end = min(encoder_tokens.shape[0], start + self.decode_batch_size)
+            batched_tokens = encoder_tokens[start:end].unsqueeze(0)
+            batched_pos = pos[start:end].unsqueeze(0)
+            batched_true_shape = true_shape[start:end].unsqueeze(0)
+            output = decoder.forward_list([batched_tokens], [batched_pos], [batched_true_shape], return_feats=True)
+            if not isinstance(output, tuple) or len(output) != 3:
+                raise Must3rPrecomputeError("MUSt3R decoder.forward_list did not return (memory, pointmaps, feats)")
+            _, _, grouped_feats = output
+            if not grouped_feats or not grouped_feats[0]:
+                raise Must3rPrecomputeError("MUSt3R decoder returned no feature levels")
+            chunk_levels = [feature[0].detach().cpu() for feature in grouped_feats[0]]
+            if level_chunks is None:
+                level_chunks = [[] for _ in chunk_levels]
+            if len(chunk_levels) != len(level_chunks):
+                raise Must3rPrecomputeError(
+                    f"MUSt3R decoder returned {len(chunk_levels)} levels, expected {len(level_chunks)}"
+                )
+            for level_index, chunk in enumerate(chunk_levels):
+                level_chunks[level_index].append(chunk)
+            del output, grouped_feats, chunk_levels
+        if level_chunks is None:
             raise Must3rPrecomputeError("MUSt3R decoder returned no feature levels")
-        return [feature[0].detach().cpu() for feature in grouped_feats[0]]
+        return [torch.cat(chunks, dim=0) for chunks in level_chunks]
+
+    def _normalize_feature_layers(self, num_levels: int) -> tuple[int, ...]:
+        indices: list[int] = []
+        for layer in self.feature_layers:
+            index = layer if layer >= 0 else num_levels + layer
+            if index < 0 or index >= num_levels:
+                raise Must3rPrecomputeError(
+                    f"Requested MUSt3R feature layer {layer}, but decoder returned {num_levels} levels"
+                )
+            indices.append(index)
+        return tuple(indices)
 
     def _tokens_to_chw(self, tokens: torch.Tensor, true_shape: torch.Tensor) -> torch.Tensor:
         # tokens: T, N, C
@@ -364,6 +428,9 @@ def run_precompute(options: PrecomputeOptions, extractor: FeatureExtractor | Non
         "frames": sum(len(scene.frames) for scene in selected),
         "weights": str(options.weights) if options.weights else None,
         "must3r_repo": str(options.must3r_repo) if options.must3r_repo else None,
+        "amp": options.amp,
+        "max_bs": options.max_bs,
+        "decode_batch_size": options.decode_batch_size,
         "feature_layers": list(options.feature_layers),
     }
     if options.dry_run:
@@ -379,6 +446,7 @@ def run_precompute(options: PrecomputeOptions, extractor: FeatureExtractor | Non
             image_size=options.image_size,
             amp=options.amp,
             max_bs=options.max_bs,
+            decode_batch_size=options.decode_batch_size,
             feature_layers=options.feature_layers,
         )
     options.output_dir.mkdir(parents=True, exist_ok=True)
@@ -398,6 +466,10 @@ def run_precompute(options: PrecomputeOptions, extractor: FeatureExtractor | Non
 
 
 def options_from_args(args: argparse.Namespace) -> PrecomputeOptions:
+    if args.max_bs < 1:
+        raise ValueError("--max-bs must be >= 1")
+    if args.decode_batch_size < 1:
+        raise ValueError("--decode-batch-size must be >= 1")
     config = load_yaml(args.config) if args.config else {}
     manifest = _resolve_manifest(config, args.manifest)
     output_dir = resolve_project_path(config, args.output_dir)
@@ -416,6 +488,7 @@ def options_from_args(args: argparse.Namespace) -> PrecomputeOptions:
         image_size=args.image_size,
         amp=parse_amp(args.amp),
         max_bs=args.max_bs,
+        decode_batch_size=args.decode_batch_size,
         feature_layers=parse_feature_layers(args.feature_layers),
         write_manifest=write_manifest,
         limit_scenes=args.limit_scenes,
@@ -432,8 +505,9 @@ def main() -> None:
     parser.add_argument("--weights", default=None)
     parser.add_argument("--must3r-repo", default=None)
     parser.add_argument("--image-size", type=int, default=512)
-    parser.add_argument("--amp", default="false", choices=["false", "bf16", "fp16"])
+    parser.add_argument("--amp", default="bf16", choices=["false", "bf16", "fp16"])
     parser.add_argument("--max-bs", type=int, default=1)
+    parser.add_argument("--decode-batch-size", type=int, default=1)
     parser.add_argument("--feature-layers", default="0,-2,-1")
     parser.add_argument("--write-manifest", default=None)
     parser.add_argument("--limit-scenes", type=int, default=None)

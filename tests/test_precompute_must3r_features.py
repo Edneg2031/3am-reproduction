@@ -67,6 +67,7 @@ def test_precompute_writes_features_metadata_and_manifest(tmp_path: Path) -> Non
         image_size=512,
         amp=False,
         max_bs=1,
+        decode_batch_size=1,
         feature_layers=(0, 1, 2),
         write_manifest=feature_manifest,
         limit_scenes=None,
@@ -101,6 +102,7 @@ def test_precompute_dry_run_does_not_create_output(tmp_path: Path, capsys) -> No
         image_size=512,
         amp=False,
         max_bs=1,
+        decode_batch_size=1,
         feature_layers=(0, 1, 2),
         write_manifest=None,
         limit_scenes=None,
@@ -123,6 +125,7 @@ def test_official_extractor_passes_true_shape_as_list_to_decoder(tmp_path: Path)
         image_size=512,
         amp=False,
         max_bs=1,
+        decode_batch_size=2,
         feature_layers=(0, 1),
     )
 
@@ -144,6 +147,41 @@ def test_official_extractor_passes_true_shape_as_list_to_decoder(tmp_path: Path)
     levels = extractor._decode_feature_levels(FakeDecoder(), encoder_tokens, pos, true_shape)
 
     assert [tuple(level.shape) for level in levels] == [(2, 6, 2), (2, 6, 3)]
+
+
+def test_official_extractor_chunks_decoder_by_decode_batch_size(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        decode_batch_size=2,
+        feature_layers=(0, 1),
+    )
+    calls: list[int] = []
+
+    class FakeDecoder:
+        def forward_list(self, x, pos, true_shape, return_feats):
+            frames = x[0].shape[1]
+            calls.append(frames)
+            assert frames <= 2
+            assert pos[0].shape[1] == frames
+            assert true_shape[0].shape == (1, frames, 2)
+            assert return_feats is True
+            feats = [[torch.ones(1, frames, 6, 2), torch.ones(1, frames, 6, 3)]]
+            return object(), object(), feats
+
+    encoder_tokens = torch.ones(5, 6, 4)
+    pos = torch.zeros(5, 6, 2)
+    true_shape = torch.tensor([[2, 3]] * 5)
+
+    levels = extractor._decode_feature_levels(FakeDecoder(), encoder_tokens, pos, true_shape)
+
+    assert calls == [2, 2, 1]
+    assert [tuple(level.shape) for level in levels] == [(5, 6, 2), (5, 6, 3)]
 
 
 def test_compute_fov_overlap_skips_when_geometry_missing(tmp_path: Path) -> None:
