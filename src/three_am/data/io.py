@@ -6,6 +6,17 @@ from pathlib import Path
 from .schema import FrameRecord, SceneRecord
 
 
+def _feature_paths(frame: dict[str, object]) -> tuple[Path, ...]:
+    value = frame.get("must3r_feature_paths", frame.get("must3r_features", ()))
+    if value is None:
+        return ()
+    if isinstance(value, dict):
+        return tuple(Path(str(value[key])) for key in sorted(value))
+    if isinstance(value, (list, tuple)):
+        return tuple(Path(str(path)) for path in value)
+    raise ValueError("must3r_feature_paths must be a list or mapping")
+
+
 def read_manifest(path: str | Path) -> list[SceneRecord]:
     manifest_path = Path(path)
     with manifest_path.open("r", encoding="utf-8") as handle:
@@ -20,6 +31,7 @@ def read_manifest(path: str | Path) -> list[SceneRecord]:
                 depth_path=Path(frame["depth_path"]) if frame.get("depth_path") else None,
                 pose_path=Path(frame["pose_path"]) if frame.get("pose_path") else None,
                 intrinsics_path=Path(frame["intrinsics_path"]) if frame.get("intrinsics_path") else None,
+                must3r_feature_paths=_feature_paths(frame),
             )
             for frame in scene.get("frames", [])
         )
@@ -54,6 +66,7 @@ def write_manifest(path: str | Path, scenes: list[SceneRecord]) -> None:
                         "depth_path": str(frame.depth_path) if frame.depth_path else None,
                         "pose_path": str(frame.pose_path) if frame.pose_path else None,
                         "intrinsics_path": str(frame.intrinsics_path) if frame.intrinsics_path else None,
+                        "must3r_feature_paths": [str(path) for path in frame.must3r_feature_paths],
                     }
                     for frame in scene.frames
                 ],

@@ -263,10 +263,21 @@ def _load_missing_must3r_features(
                 load()
         features = adapter.extract_features(batch.images)
     except (ExternalDependencyError, NotImplementedError) as error:
+        cache_root = configured_feature_cache_root(config)
+        num_levels = len(tuple(config.get("model", {}).get("must3r_channels", (256, 512, 768))))
+        expected = [
+            cache_root / batch.dataset / batch.scene_id / f"{frame_id}_level{level}.pt"
+            for frame_id in batch.frame_ids
+            for level in range(num_levels)
+        ]
+        preview = ", ".join(str(path) for path in expected[: min(3, len(expected))])
+        suffix = "" if len(expected) <= 3 else f", ... ({len(expected)} expected files)"
         raise FeatureCacheRuntimeError(
             "MUSt3R feature cache is missing for "
             f"{batch.dataset}/{batch.scene_id} frames {list(batch.frame_ids)} and online MUSt3R extraction is unavailable. "
-            "Run scripts/precompute_must3r_features.py after wiring MUSt3R, or provide --feature-cache."
+            f"Expected cache files like: {preview}{suffix}. "
+            "Either generate these cache files under features.cache_root/--feature-cache, or put absolute per-frame "
+            "feature paths in the manifest as must3r_feature_paths."
         ) from error
     return tuple(feature.to(device) for feature in features)
 

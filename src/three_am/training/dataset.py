@@ -21,6 +21,14 @@ class FeatureCacheError(RuntimeError):
     pass
 
 
+class FeatureCacheMissingError(FeatureCacheError):
+    pass
+
+
+class FeatureCacheCompatibilityError(FeatureCacheError):
+    pass
+
+
 class RandomLike(Protocol):
     def choice(self, sequence: Any) -> Any: ...
 
@@ -291,18 +299,19 @@ def _load_tensor(path: Path) -> torch.Tensor:
     except TypeError:  # pragma: no cover - older torch
         tensor = torch.load(path, map_location="cpu")
     if not isinstance(tensor, torch.Tensor):
-        raise FeatureCacheError(f"{path} did not contain a tensor")
+        raise FeatureCacheCompatibilityError(f"{path} did not contain a tensor")
     if tensor.ndim == 4 and tensor.shape[0] == 1:
         tensor = tensor[0]
     if tensor.ndim != 3:
-        raise FeatureCacheError(f"{path} must contain a CHW tensor, got shape {tuple(tensor.shape)}")
+        raise FeatureCacheCompatibilityError(f"{path} must contain a CHW tensor, got shape {tuple(tensor.shape)}")
     return tensor.float()
 
 
 class Must3rFeatureCache:
-    def __init__(self, root: Path, num_levels: int) -> None:
+    def __init__(self, root: Path, expected_channels: tuple[int, ...]) -> None:
         self.root = root
-        self.num_levels = num_levels
+        self.expected_channels = expected_channels
+        self.num_levels = len(expected_channels)
 
     def scene_dir(self, scene: SceneRecord) -> Path:
         return self.root / scene.dataset / scene.scene_id
@@ -314,6 +323,8 @@ class Must3rFeatureCache:
         return np.load(path)
 
     def load(self, scene: SceneRecord, frames: list[FrameRecord]) -> tuple[torch.Tensor, ...]:
+        if all(frame.must3r_feature_paths for frame in frames):
+            return self._load_from_manifest_paths(frames)
         scene_dir = self.scene_dir(scene)
         levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
         missing: list[Path] = []
@@ -327,8 +338,43 @@ class Must3rFeatureCache:
         if missing:
             preview = ", ".join(str(path) for path in missing[:3])
             suffix = "" if len(missing) <= 3 else f", ... ({len(missing)} total)"
-            raise FeatureCacheError(f"Missing MUSt3R feature cache files: {preview}{suffix}")
-        return tuple(torch.stack(level_tensors, dim=0) for level_tensors in levels)
+            raise FeatureCacheMissingError(f"Missing MUSt3R feature cache files: {preview}{suffix}")
+        return self._stack_and_validate(levels)
+
+    def expected_paths(self, dataset: str, scene_id: str, frame_ids: tuple[str, ...]) -> list[Path]:
+        scene_dir = self.root / dataset / scene_id
+        return [scene_dir / f"{frame_id}_level{level}.pt" for frame_id in frame_ids for level in range(self.num_levels)]
+
+    def _load_from_manifest_paths(self, frames: list[FrameRecord]) -> tuple[torch.Tensor, ...]:
+        levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
+        missing: list[Path] = []
+        for frame in frames:
+            if len(frame.must3r_feature_paths) != self.num_levels:
+                raise FeatureCacheCompatibilityError(
+                    f"Frame {frame.frame_id} has {len(frame.must3r_feature_paths)} MUSt3R feature paths, "
+                    f"expected {self.num_levels}"
+                )
+            for level, path in enumerate(frame.must3r_feature_paths):
+                if not path.exists():
+                    missing.append(path)
+                    continue
+                levels[level].append(_load_tensor(path))
+        if missing:
+            preview = ", ".join(str(path) for path in missing[:3])
+            suffix = "" if len(missing) <= 3 else f", ... ({len(missing)} total)"
+            raise FeatureCacheMissingError(f"Missing manifest MUSt3R feature files: {preview}{suffix}")
+        return self._stack_and_validate(levels)
+
+    def _stack_and_validate(self, levels: list[list[torch.Tensor]]) -> tuple[torch.Tensor, ...]:
+        stacked = tuple(torch.stack(level_tensors, dim=0) for level_tensors in levels)
+        actual_channels = tuple(int(level.shape[1]) for level in stacked)
+        if actual_channels != self.expected_channels:
+            raise FeatureCacheCompatibilityError(
+                "MUSt3R feature channel mismatch: "
+                f"cache has {list(actual_channels)}, but model.must3r_channels is {list(self.expected_channels)}. "
+                f"Set model.must3r_channels to {list(actual_channels)} or regenerate features with matching channels."
+            )
+        return stacked
 
 
 class ThreeAMTrainingDataset:
@@ -347,7 +393,7 @@ class ThreeAMTrainingDataset:
         self.rng = rng or random
         model_config = config.get("model", {})
         must3r_channels = tuple(model_config.get("must3r_channels", (256, 512, 768)))
-        self.feature_cache = Must3rFeatureCache(feature_cache_root, num_levels=len(must3r_channels))
+        self.feature_cache = Must3rFeatureCache(feature_cache_root, expected_channels=tuple(int(c) for c in must3r_channels))
 
     @classmethod
     def from_config(
@@ -382,7 +428,7 @@ class ThreeAMTrainingDataset:
         has_object = target_masks.flatten(1).any(dim=1)
         try:
             must3r_features = self.feature_cache.load(scene, selected_frames)
-        except FeatureCacheError:
+        except FeatureCacheMissingError:
             must3r_features = None
         return TrainingBatch(
             images=torch.stack(images, dim=0),

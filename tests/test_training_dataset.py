@@ -8,9 +8,9 @@ import torch
 import pytest
 from PIL import Image
 
-from three_am.data.io import write_manifest
+from three_am.data.io import read_manifest, write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
-from three_am.training.dataset import ThreeAMTrainingDataset, configured_manifest_path
+from three_am.training.dataset import FeatureCacheCompatibilityError, ThreeAMTrainingDataset, configured_manifest_path
 
 
 def _write_image(path: Path) -> None:
@@ -174,6 +174,69 @@ def test_training_dataset_uses_absolute_manifest_and_frame_paths(tmp_path: Path)
 
     assert batch.scene_id == "scene_a"
     assert batch.images.shape == (2, 3, 4, 4)
+
+
+def test_manifest_without_feature_paths_reads_as_empty_tuple(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        '{"schema":"three_am_manifest_v1","scenes":[{"dataset":"scannetpp","scene_id":"scene_a","split":"train",'
+        '"frames":[{"frame_id":"000","image_path":"/abs/image.png","mask_path":"/abs/mask.png"}]}]}',
+        encoding="utf-8",
+    )
+
+    scenes = read_manifest(manifest)
+
+    assert scenes[0].frames[0].must3r_feature_paths == ()
+
+
+def test_training_dataset_uses_manifest_feature_paths(tmp_path: Path) -> None:
+    scene_dir = tmp_path / "absolute_scene"
+    feature_dir = tmp_path / "absolute_features"
+    frames: list[FrameRecord] = []
+    for index in range(2):
+        frame_id = f"{index:03d}"
+        image_path = scene_dir / "images" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        feature_path = feature_dir / f"{frame_id}_must3r_level0.pt"
+        _write_image(image_path)
+        _write_mask(mask_path, np.ones((4, 4), dtype=np.uint8))
+        feature_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(torch.full((2, 2, 2), float(index)), feature_path)
+        frames.append(
+            FrameRecord(
+                frame_id=frame_id,
+                image_path=image_path,
+                mask_path=mask_path,
+                must3r_feature_paths=(feature_path,),
+            )
+        )
+    manifest = tmp_path / "manifest_with_features.json"
+    write_manifest(manifest, [SceneRecord("scannetpp", "scene_a", "train", tuple(frames))])
+    config = {
+        "project_root": str(tmp_path / "project"),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "datasets": {"scannetpp": {"manifest": str(manifest), "fov_sampling_probability": 0.0}},
+        "sampling": {"sequence_length": 2, "fov_threshold": 0.25},
+        "features": {"cache_root": str(tmp_path / "unused_cache")},
+        "model": {"must3r_channels": [2]},
+    }
+
+    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.must3r_features is not None
+    assert batch.must3r_features[0].shape == (2, 2, 2, 2)
+
+
+def test_training_dataset_reports_feature_channel_mismatch(tmp_path: Path) -> None:
+    scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
+    scene_cache.mkdir(parents=True)
+    for frame_id in ("000", "001"):
+        torch.save(torch.ones(3, 2, 2), scene_cache / f"{frame_id}_level0.pt")
+    dataset = _dataset(tmp_path, "scannetpp", [np.ones((4, 4), dtype=np.uint8), np.ones((4, 4), dtype=np.uint8)])
+
+    with pytest.raises(FeatureCacheCompatibilityError, match="model.must3r_channels"):
+        dataset.sample()
 
 
 def test_missing_training_data_error_lists_checked_manifests(tmp_path: Path) -> None:

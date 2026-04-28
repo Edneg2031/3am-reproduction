@@ -15,6 +15,7 @@ class FrameRecord:
     depth_path: Path | None = None
     pose_path: Path | None = None
     intrinsics_path: Path | None = None
+    must3r_feature_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,12 @@ class SceneRecord:
         for frame in self.frames:
             if not frame.image_path.exists():
                 raise FileNotFoundError(frame.image_path)
-            for optional_path in (frame.mask_path, frame.depth_path, frame.pose_path, frame.intrinsics_path):
+            for optional_path in (
+                frame.mask_path,
+                frame.depth_path,
+                frame.pose_path,
+                frame.intrinsics_path,
+                *frame.must3r_feature_paths,
+            ):
                 if optional_path is not None and not optional_path.exists():
                     raise FileNotFoundError(optional_path)
