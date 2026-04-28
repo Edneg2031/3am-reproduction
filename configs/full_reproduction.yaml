@@ -18,17 +18,20 @@ datasets:
   scannetpp:
     root: data/raw/scannetpp
     processed: data/processed/scannetpp
+    manifest: data/processed/scannetpp_manifest.json
     scenes: 855
     fov_sampling_probability: 0.8
   ase:
     root: data/raw/ase
     processed: data/processed/ase
+    manifest: data/processed/ase_manifest.json
     scenes: 2612
     estimated_size: 23TB
     fov_sampling_probability: 0.8
   mose:
     root: data/raw/mose
     processed: data/processed/mose
+    manifest: data/processed/mose_manifest.json
     videos: 1453
     fov_sampling_probability: 0.0
   replica:
@@ -39,6 +42,9 @@ datasets:
 sampling:
   fov_threshold: 0.25
   sequence_length: 8
+
+features:
+  cache_root: outputs/must3r_features
 
 model:
   sam_channels: 256
@@ -55,4 +61,7 @@ training:
     mask_decoder: 5.0e-6
     feature_merger: 1.0e-5
   memory_frames: 8
+  log_every: 50
+  checkpoint_every: 5000
+  amp: true
   checkpoint_out: outputs/checkpoints/3am_full.pt
