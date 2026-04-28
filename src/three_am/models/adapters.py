@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,12 +12,32 @@ from torch import nn
 @dataclass(frozen=True)
 class ExternalBackboneConfig:
     sam2_checkpoint: Path | None = None
-    sam2_config: Path | None = None
+    sam2_config: str | Path | None = None
+    sam2_repo: Path | None = None
     must3r_checkpoint: Path | None = None
+    must3r_repo: Path | None = None
 
 
 class ExternalDependencyError(RuntimeError):
     pass
+
+
+def _prepend_repo_to_sys_path(repo: Path | None) -> None:
+    if repo is None:
+        return
+    repo = repo.expanduser().resolve()
+    if repo.exists() and str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+
+
+def _sam2_config_name(config: str | Path) -> str:
+    text = str(config)
+    path = Path(text)
+    if path.is_absolute():
+        parts = path.parts
+        if "configs" in parts:
+            return "/".join(parts[parts.index("configs") :])
+    return text
 
 
 class Sam2TrainingAdapter(nn.Module):
@@ -32,13 +53,25 @@ class Sam2TrainingAdapter(nn.Module):
         self.model: nn.Module | None = None
 
     def load(self) -> None:
+        _prepend_repo_to_sys_path(self.config.sam2_repo)
         try:
             from sam2.build_sam import build_sam2_video_predictor  # type: ignore
         except Exception as error:  # pragma: no cover - depends on external repo
-            raise ExternalDependencyError("Install facebookresearch/sam2 before loading SAM2") from error
+            raise ExternalDependencyError(
+                "Install facebookresearch/sam2 before loading SAM2, or set external.sam2_repo to the cloned repo root."
+            ) from error
         if self.config.sam2_config is None or self.config.sam2_checkpoint is None:
             raise ValueError("sam2_config and sam2_checkpoint are required")
-        self.model = build_sam2_video_predictor(str(self.config.sam2_config), str(self.config.sam2_checkpoint))
+        config_name = _sam2_config_name(self.config.sam2_config)
+        try:
+            self.model = build_sam2_video_predictor(config_name, str(self.config.sam2_checkpoint))
+        except Exception as error:  # pragma: no cover - depends on external repo
+            raise ExternalDependencyError(
+                "Failed to load SAM2 config "
+                f"{config_name!r}. Run `pip install -e .` in the SAM2 repo or set external.sam2_repo so the "
+                "repo root is on PYTHONPATH; official SAM2 expects Hydra config names like "
+                "`configs/sam2.1/sam2.1_hiera_l.yaml`."
+            ) from error
 
     def freeze_image_encoder(self) -> None:
         if self.model is None:
@@ -98,6 +131,7 @@ class Must3rFeatureAdapter(nn.Module):
         self.model: nn.Module | None = None
 
     def load(self) -> None:
+        _prepend_repo_to_sys_path(self.config.must3r_repo)
         try:
             import mast3r  # noqa: F401  # type: ignore
         except Exception as error:  # pragma: no cover - depends on external repo

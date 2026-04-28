@@ -62,12 +62,18 @@ def build_core(config: dict[str, Any]) -> ThreeAMCore:
 def external_config(config: dict[str, Any]) -> ExternalBackboneConfig:
     external = config.get("external", {})
     sam2_checkpoint = resolve_project_path(config, external.get("sam2_checkpoint"))
-    sam2_config = resolve_project_path(config, external.get("sam2_config"))
+    sam2_config = external.get("sam2_config")
+    if sam2_config is not None:
+        sam2_config = str(sam2_config)
+    sam2_repo = resolve_project_path(config, external.get("sam2_repo"))
     must3r_checkpoint = resolve_project_path(config, external.get("must3r_checkpoint"))
+    must3r_repo = resolve_project_path(config, external.get("must3r_repo"))
     return ExternalBackboneConfig(
         sam2_checkpoint=sam2_checkpoint,
         sam2_config=sam2_config,
+        sam2_repo=sam2_repo,
         must3r_checkpoint=must3r_checkpoint,
+        must3r_repo=must3r_repo,
     )
 
 
@@ -97,6 +103,23 @@ def _availability(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _sam2_config_exists(config: ExternalBackboneConfig) -> bool:
+    if config.sam2_config is None:
+        return False
+    config_text = str(config.sam2_config)
+    candidates = [Path(config_text).expanduser()]
+    if config.sam2_repo is not None:
+        repo = config.sam2_repo.expanduser()
+        candidates.extend(
+            [
+                repo / config_text,
+                repo / "sam2" / config_text,
+                repo / "sam2_configs" / config_text,
+            ]
+        )
+    return any(candidate.exists() for candidate in candidates)
+
+
 def dry_run(config: dict[str, Any], feature_cache: str | Path | None = None) -> dict[str, Any]:
     cache_root = configured_feature_cache_root(config, feature_cache)
     statuses = manifest_statuses(config, cache_root)
@@ -117,10 +140,14 @@ def dry_run(config: dict[str, Any], feature_cache: str | Path | None = None) -> 
         "external": {
             "sam2_importable": _availability("sam2"),
             "mast3r_importable": _availability("mast3r"),
+            "sam2_repo": str(external.sam2_repo) if external.sam2_repo else None,
+            "sam2_repo_exists": bool(external.sam2_repo and external.sam2_repo.exists()),
             "sam2_checkpoint": str(external.sam2_checkpoint) if external.sam2_checkpoint else None,
             "sam2_checkpoint_exists": bool(external.sam2_checkpoint and external.sam2_checkpoint.exists()),
             "sam2_config": str(external.sam2_config) if external.sam2_config else None,
-            "sam2_config_exists": bool(external.sam2_config and external.sam2_config.exists()),
+            "sam2_config_exists": _sam2_config_exists(external),
+            "must3r_repo": str(external.must3r_repo) if external.must3r_repo else None,
+            "must3r_repo_exists": bool(external.must3r_repo and external.must3r_repo.exists()),
             "must3r_checkpoint": str(external.must3r_checkpoint) if external.must3r_checkpoint else None,
             "must3r_checkpoint_exists": bool(external.must3r_checkpoint and external.must3r_checkpoint.exists()),
         },
