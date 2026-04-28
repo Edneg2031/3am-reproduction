@@ -114,6 +114,38 @@ def test_precompute_dry_run_does_not_create_output(tmp_path: Path, capsys) -> No
     assert not output_dir.exists()
 
 
+def test_official_extractor_passes_true_shape_as_list_to_decoder(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        feature_layers=(0, 1),
+    )
+
+    class FakeDecoder:
+        def forward_list(self, x, pos, true_shape, return_feats):
+            assert isinstance(x, list)
+            assert isinstance(pos, list)
+            copied = true_shape.copy()
+            assert isinstance(copied, list)
+            assert copied[0].shape == (1, 2, 2)
+            assert return_feats is True
+            feats = [[torch.ones(1, 2, 6, 2), torch.ones(1, 2, 6, 3)]]
+            return object(), object(), feats
+
+    encoder_tokens = torch.ones(2, 6, 4)
+    pos = torch.zeros(2, 6, 2)
+    true_shape = torch.tensor([[2, 3], [2, 3]])
+
+    levels = extractor._decode_feature_levels(FakeDecoder(), encoder_tokens, pos, true_shape)
+
+    assert [tuple(level.shape) for level in levels] == [(2, 6, 2), (2, 6, 3)]
+
+
 def test_compute_fov_overlap_skips_when_geometry_missing(tmp_path: Path) -> None:
     module = _load_precompute_module()
     manifest = _manifest(tmp_path)

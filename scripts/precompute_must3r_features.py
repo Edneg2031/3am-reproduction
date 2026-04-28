@@ -194,7 +194,7 @@ class OfficialMust3rExtractor:
         batched_true_shape = true_shape.unsqueeze(0)
         if not hasattr(decoder, "forward_list"):
             raise Must3rPrecomputeError("MUSt3R decoder has no forward_list(..., return_feats=True) hook")
-        output = decoder.forward_list([batched_tokens], [batched_pos], batched_true_shape, return_feats=True)
+        output = decoder.forward_list([batched_tokens], [batched_pos], [batched_true_shape], return_feats=True)
         if not isinstance(output, tuple) or len(output) != 3:
             raise Must3rPrecomputeError("MUSt3R decoder.forward_list did not return (memory, pointmaps, feats)")
         _, _, grouped_feats = output
