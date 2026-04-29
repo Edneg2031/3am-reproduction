@@ -89,6 +89,18 @@ def test_precompute_writes_features_metadata_and_manifest(tmp_path: Path) -> Non
     assert all(path.is_absolute() for path in feature_paths)
 
 
+def test_compacts_frame_views_before_saving(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    backing = torch.zeros(8, 2, 3, 4, dtype=torch.float16)
+    frame_view = backing[3]
+
+    compact = module._compact_tensor_for_save(frame_view)
+
+    assert tuple(compact.shape) == (2, 3, 4)
+    assert compact.storage_offset() == 0
+    assert compact.untyped_storage().nbytes() == compact.numel() * compact.element_size()
+
+
 def test_precompute_dry_run_does_not_create_output(tmp_path: Path, capsys) -> None:
     module = _load_precompute_module()
     manifest = _manifest(tmp_path)

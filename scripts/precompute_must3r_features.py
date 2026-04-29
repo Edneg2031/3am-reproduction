@@ -467,7 +467,7 @@ def save_scene_features(
             )
         for frame_index, frame in enumerate(scene.frames):
             path = scene_dir / f"{frame.frame_id}_level{level_index}.pt"
-            torch.save(level_tensor[frame_index].detach().cpu(), path)
+            torch.save(_compact_tensor_for_save(level_tensor[frame_index]), path)
             level_paths_by_frame[frame_index].append(path.resolve())
     metadata = {
         **features.metadata,
@@ -502,6 +502,11 @@ def save_scene_features(
         frames=updated_frames,
         instances_path=scene.instances_path,
     )
+
+
+def _compact_tensor_for_save(tensor: torch.Tensor) -> torch.Tensor:
+    """Clone views so torch.save does not serialize their larger backing storage."""
+    return tensor.detach().to(device="cpu").clone(memory_format=torch.contiguous_format)
 
 
 def run_precompute(options: PrecomputeOptions, extractor: FeatureExtractor | None = None) -> dict[str, Any]:
