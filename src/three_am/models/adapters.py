@@ -533,7 +533,8 @@ class Must3rFeatureAdapter(nn.Module):
         except Exception as error:  # pragma: no cover - depends on external repo
             raise ExternalDependencyError(
                 "Could not import must3r.model.load_model. Install naver/must3r and its MASt3R dependencies, "
-                "or set external.must3r_repo to the cloned repo root."
+                "or set external.must3r_repo to the cloned repo root. "
+                f"Underlying import error: {type(error).__name__}: {error}"
             ) from error
         if self.config.must3r_checkpoint is None or not self.config.must3r_checkpoint.exists():
             raise ExternalDependencyError(f"MUSt3R checkpoint does not exist: {self.config.must3r_checkpoint}")

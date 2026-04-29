@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import yaml
 from PIL import Image
@@ -215,6 +216,32 @@ def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: P
     assert [path.name for path in must3r.seen_paths] == ["000.png", "001.png"]
 
 
+def test_online_must3r_dependency_failure_reports_underlying_error(tmp_path: Path) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path, write_feature_cache=False)
+
+    class FailingMust3rAdapter(nn.Module):
+        model = None
+
+        def load(self) -> None:
+            raise train_3am.ExternalDependencyError("No module named 'mast3r'")
+
+    with pytest.raises(train_3am.FeatureCacheRuntimeError) as excinfo:
+        train_3am.run_training(
+            str(config_path),
+            iterations=1,
+            device_name="cpu",
+            online_must3r=True,
+            sam2_adapter=FakeSam2Adapter(),
+            must3r_adapter=FailingMust3rAdapter(),
+        )
+
+    message = str(excinfo.value)
+    assert "online MUSt3R extraction is unavailable" in message
+    assert "No module named 'mast3r'" in message
+    assert "mast3r_importable" in message
+
+
 def test_strict_training_script_runs_with_bundle_and_validation(tmp_path: Path, capsys) -> None:
     train_3am = _load_train_module()
     config_path = _write_strict_training_fixture(tmp_path)
@@ -316,3 +343,6 @@ def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
 
     assert "scannetpp_manifest.json" in captured.out
     assert "feature_cache_root" in captured.out
+    assert "must3r_importable" in captured.out
+    assert "mast3r_importable" in captured.out
+    assert "dust3r_importable" in captured.out

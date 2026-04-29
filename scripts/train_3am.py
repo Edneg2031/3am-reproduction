@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import random
+import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -129,8 +130,31 @@ def smoke_train(config_path: str, iterations: int) -> None:
     print(f"Wrote smoke checkpoint to {output}")
 
 
-def _availability(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
+def _find_spec(name: str, repo: Path | None = None) -> importlib.machinery.ModuleSpec | None:
+    added_repo = False
+    repo_text: str | None = None
+    if repo is not None:
+        resolved = repo.expanduser().resolve()
+        if resolved.exists():
+            repo_text = str(resolved)
+            if repo_text not in sys.path:
+                sys.path.insert(0, repo_text)
+                added_repo = True
+    try:
+        importlib.invalidate_caches()
+        return importlib.util.find_spec(name)
+    except Exception:
+        return None
+    finally:
+        if added_repo and repo_text is not None:
+            try:
+                sys.path.remove(repo_text)
+            except ValueError:
+                pass
+
+
+def _availability(name: str, repo: Path | None = None) -> bool:
+    return _find_spec(name, repo) is not None
 
 
 def _sam2_config_exists(config: ExternalBackboneConfig) -> bool:
@@ -222,16 +246,18 @@ def dry_run(
             "validate_every": int(training.get("validate_every", 0)),
         },
         "external": {
-            "sam2_importable": _availability("sam2"),
-            "mast3r_importable": _availability("mast3r"),
             "sam2_repo": str(external.sam2_repo) if external.sam2_repo else None,
             "sam2_repo_exists": bool(external.sam2_repo and external.sam2_repo.exists()),
+            "sam2_importable": _availability("sam2", external.sam2_repo),
             "sam2_checkpoint": str(external.sam2_checkpoint) if external.sam2_checkpoint else None,
             "sam2_checkpoint_exists": bool(external.sam2_checkpoint and external.sam2_checkpoint.exists()),
             "sam2_config": str(external.sam2_config) if external.sam2_config else None,
             "sam2_config_exists": _sam2_config_exists(external),
             "must3r_repo": str(external.must3r_repo) if external.must3r_repo else None,
             "must3r_repo_exists": bool(external.must3r_repo and external.must3r_repo.exists()),
+            "must3r_importable": _availability("must3r", external.must3r_repo),
+            "mast3r_importable": _availability("mast3r", external.must3r_repo),
+            "dust3r_importable": _availability("dust3r", external.must3r_repo),
             "must3r_checkpoint": str(external.must3r_checkpoint) if external.must3r_checkpoint else None,
             "must3r_checkpoint_exists": bool(external.must3r_checkpoint and external.must3r_checkpoint.exists()),
         },
@@ -447,9 +473,12 @@ def _load_missing_must3r_features(
         raise FeatureCacheRuntimeError(
             "MUSt3R feature cache is missing for "
             f"{batch.dataset}/{batch.scene_id} frames {list(batch.frame_ids)} and online MUSt3R extraction is unavailable. "
+            f"Online extraction failed with {type(error).__name__}: {error}. "
             f"Expected cache files like: {preview}{suffix}. "
             "Either generate these cache files under features.cache_root/--feature-cache, or put absolute per-frame "
-            "feature paths in the manifest as must3r_feature_paths."
+            "feature paths in the manifest as must3r_feature_paths. If you intended to use --online-must3r, run "
+            "`--dry-run --online-must3r` and make sure must3r_importable, mast3r_importable, and "
+            "dust3r_importable are all true."
         ) from error
     if isinstance(features, Must3rFeatureBundle):
         return features.to(device)
