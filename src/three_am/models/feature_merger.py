@@ -38,6 +38,8 @@ class FeatureMerger(nn.Module):
         self.gate = nn.Sequential(nn.Conv2d(sam_channels * 2, sam_channels, kernel_size=1), nn.Sigmoid())
 
     def forward(self, sam_feature: torch.Tensor, must3r_features: Sequence[torch.Tensor]) -> torch.Tensor:
+        if sam_feature.ndim != 4:
+            raise ValueError(f"SAM2 feature must have shape TCHW, got {tuple(sam_feature.shape)}")
         if len(must3r_features) != len(self.must3r_projections):
             raise ValueError(
                 f"Expected {len(self.must3r_projections)} MUSt3R levels, got {len(must3r_features)}"
@@ -46,6 +48,17 @@ class FeatureMerger(nn.Module):
         sam_hidden = self.sam_projection(sam_feature)
         geometry_hidden = torch.zeros_like(sam_hidden)
         for feature, projection in zip(must3r_features, self.must3r_projections, strict=True):
+            if feature.ndim != 4:
+                raise ValueError(f"MUSt3R feature must have shape TCHW, got {tuple(feature.shape)}")
+            if feature.shape[0] != batch_size:
+                raise ValueError(
+                    f"MUSt3R feature batch/time dimension {feature.shape[0]} does not match SAM2 {batch_size}"
+                )
+            if feature.shape[1] != projection.in_channels:
+                raise ValueError(
+                    f"MUSt3R feature channel mismatch: got {feature.shape[1]}, expected {projection.in_channels}"
+                )
+            feature = feature.to(device=sam_feature.device, dtype=sam_feature.dtype)
             projected = projection(feature)
             if projected.shape[-2:] != (height, width):
                 projected = F.interpolate(projected, size=(height, width), mode="bilinear", align_corners=False)
