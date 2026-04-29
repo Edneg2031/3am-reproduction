@@ -70,5 +70,12 @@ training:
   memory_frames: 8
   log_every: 50
   checkpoint_every: 5000
+  save_model_every: 5000
+  auto_resume: false
+  model_out: outputs/checkpoints/3am_model.pt
+  visualize_every: 0
+  visualization_dir: outputs/visualizations/train
+  visualization_max_frames: 4
+  visualization_max_side: 384
   amp: true
   checkpoint_out: outputs/checkpoints/3am_full.pt

@@ -134,7 +134,17 @@ def test_training_script_runs_with_fake_adapter_and_resumes(tmp_path: Path) -> N
     )
     assert first_step == 1
     latest = tmp_path / "outputs" / "checkpoints" / "latest.pt"
+    model_latest = tmp_path / "outputs" / "checkpoints" / "model_latest.pt"
     assert latest.exists()
+    assert model_latest.exists()
+    checkpoint_payload = torch.load(latest, weights_only=False)
+    model_payload = torch.load(model_latest, weights_only=False)
+    assert checkpoint_payload["type"] == "three_am_training_checkpoint"
+    assert checkpoint_payload["model_state_type"] == "trainable"
+    assert "optimizer" in checkpoint_payload
+    assert model_payload["type"] == "three_am_model_weights"
+    assert "optimizer" not in model_payload
+    assert any(key.startswith("core.feature_merger") for key in model_payload["model"])
 
     second_step = train_3am.run_training(
         str(config_path),
@@ -144,8 +154,19 @@ def test_training_script_runs_with_fake_adapter_and_resumes(tmp_path: Path) -> N
         sam2_adapter=FakeSam2Adapter(),
     )
     assert second_step == 2
+
+    third_step = train_3am.run_training(
+        str(config_path),
+        iterations=3,
+        auto_resume=True,
+        device_name="cpu",
+        sam2_adapter=FakeSam2Adapter(),
+    )
+    assert third_step == 3
     payload = torch.load(tmp_path / "outputs" / "checkpoints" / "final.pt", weights_only=False)
-    assert payload["step"] == 2
+    assert payload["step"] == 3
+    exported = torch.load(tmp_path / "outputs" / "checkpoints" / "3am_model.pt", weights_only=False)
+    assert exported["step"] == 3
 
 
 def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: Path) -> None:
@@ -165,6 +186,28 @@ def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: P
     assert step == 1
     assert must3r.seen_paths is not None
     assert [path.name for path in must3r.seen_paths] == ["000.png", "001.png"]
+
+
+def test_training_script_writes_visualization_png(tmp_path: Path) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path)
+    visualization_dir = tmp_path / "outputs" / "visualizations" / "train"
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        visualize_every=1,
+        visualization_dir=visualization_dir,
+        sam2_adapter=FakeSam2Adapter(),
+    )
+
+    files = sorted(visualization_dir.glob("step_*.png"))
+    assert step == 1
+    assert len(files) == 1
+    with Image.open(files[0]) as image:
+        assert image.size[0] > 0
+        assert image.size[1] > 0
 
 
 def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
