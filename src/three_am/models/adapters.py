@@ -136,6 +136,7 @@ class Sam2TrainingAdapter(nn.Module):
     def encode_sam_features(self, images: torch.Tensor) -> torch.Tensor:
         if self.model is None:
             raise ExternalDependencyError("SAM2 model is not loaded")
+        self._validate_image_tensor(images)
         if hasattr(self.model, "encode_sam_features"):
             features = self.model.encode_sam_features(images)  # type: ignore[attr-defined]
             sam_feature, selector = self._select_sam_feature(features)
@@ -155,6 +156,17 @@ class Sam2TrainingAdapter(nn.Module):
             "SAM2 adapter could not obtain trainable image features. Install official SAM2 training internals "
             "or subclass Sam2TrainingAdapter.encode_sam_features for the selected SAM2 release."
         )
+
+    def _validate_image_tensor(self, images: torch.Tensor) -> None:
+        if images.ndim != 4:
+            raise ExternalDependencyError(f"SAM2 images must have shape BCHW/TCHW, got {tuple(images.shape)}")
+        height, width = int(images.shape[-2]), int(images.shape[-1])
+        if height % 32 != 0 or width % 32 != 0:
+            raise ExternalDependencyError(
+                "SAM2 Hiera input size must be divisible by 32 so its 8x8 patch-window positional embedding "
+                f"tiles exactly; got image size {(height, width)}. Set model.sam_image_size to 1024 "
+                "or another multiple of 32."
+            )
 
     def forward_train_sequence(self, batch: Any, merged_features: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.model is None:

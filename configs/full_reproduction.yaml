@@ -53,6 +53,7 @@ features:
   feature_layers: encoder,4,7,11
 
 model:
+  sam_image_size: 1024
   sam_channels: 256
   must3r_channels: [1024, 768, 768, 768]
   hidden_channels: 256

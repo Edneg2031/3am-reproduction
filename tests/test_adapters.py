@@ -88,6 +88,14 @@ def test_sam2_adapter_rejects_merged_feature_shape_mismatch() -> None:
         adapter.forward_train_sequence(batch=object(), merged_features=wrong)
 
 
+def test_sam2_adapter_rejects_non_window_aligned_image_size() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
+    adapter.model = FakeSam2BackboneAware()
+
+    with pytest.raises(ExternalDependencyError, match="divisible by 32"):
+        adapter.encode_sam_features(torch.randn(1, 3, 844, 1024))
+
+
 def test_must3r_adapter_maps_paper_layers_to_decoder_indices() -> None:
     adapter = Must3rFeatureAdapter(
         ExternalBackboneConfig(must3r_feature_layers=_parse_must3r_feature_layers("encoder,4,7,11"))

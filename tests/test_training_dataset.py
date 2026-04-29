@@ -76,6 +76,21 @@ def test_training_dataset_builds_binary_mask_prompt(tmp_path: Path) -> None:
     assert batch.has_object.tolist() == [True, True]
 
 
+def test_training_dataset_resizes_sam_inputs_and_masks(tmp_path: Path) -> None:
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1:3, 1:3] = 255
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", [mask, mask])])
+    config = _config(tmp_path, "scannetpp", manifest)
+    config["model"] = {"must3r_channels": [2], "sam_image_size": 32}
+
+    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.images.shape == (2, 3, 32, 32)
+    assert batch.target_masks.shape == (2, 32, 32)
+
+
 def test_training_dataset_keeps_integer_instance_identity(tmp_path: Path) -> None:
     first = np.zeros((4, 4), dtype=np.uint8)
     first[1:3, 1:3] = 5

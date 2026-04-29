@@ -189,9 +189,20 @@ def manifest_statuses(
     return statuses
 
 
-def load_image_tensor(path: Path) -> torch.Tensor:
+def _configured_sam_image_size(config: dict[str, Any]) -> int | None:
+    value = config.get("model", {}).get("sam_image_size", config.get("training", {}).get("sam_image_size"))
+    if value is None:
+        return None
+    size = int(value)
+    return size if size > 0 else None
+
+
+def load_image_tensor(path: Path, image_size: int | None = None) -> torch.Tensor:
     with Image.open(path) as image:
-        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        image = image.convert("RGB")
+        if image_size is not None:
+            image = image.resize((image_size, image_size), resample=Image.Resampling.BILINEAR)
+        array = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
@@ -397,6 +408,7 @@ class ThreeAMTrainingDataset:
         model_config = config.get("model", {})
         must3r_channels = tuple(model_config.get("must3r_channels", (256, 512, 768)))
         self.feature_cache = Must3rFeatureCache(feature_cache_root, expected_channels=tuple(int(c) for c in must3r_channels))
+        self.sam_image_size = _configured_sam_image_size(config)
 
     @classmethod
     def from_config(
@@ -422,7 +434,7 @@ class ThreeAMTrainingDataset:
         overlap = self.feature_cache.overlap_matrix(scene) if sampling_config.fov_sampling_probability > 0 else None
         selected_indices = choose_indices(len(frames), sampling_config, overlap)
         selected_frames = [frames[index] for index in selected_indices]
-        images = [load_image_tensor(frame.image_path) for frame in selected_frames]
+        images = [load_image_tensor(frame.image_path, self.sam_image_size) for frame in selected_frames]
         image_shape = tuple(images[0].shape[-2:])
         if any(tuple(image.shape[-2:]) != image_shape for image in images):
             raise ValueError(f"Scene {scene.scene_id} produced variable image sizes in one training sample")

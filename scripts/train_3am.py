@@ -150,6 +150,7 @@ def dry_run(
     statuses = manifest_statuses(config, cache_root)
     external = external_config(config)
     features = config.get("features", {})
+    model = config.get("model", {})
     online_enabled = _online_must3r_enabled(config, online_must3r)
     payload = {
         "manifests": [
@@ -164,6 +165,11 @@ def dry_run(
             for status in statuses
         ],
         "feature_cache_root": str(cache_root),
+        "model": {
+            "sam_image_size": model.get("sam_image_size", config.get("training", {}).get("sam_image_size")),
+            "sam_channels": model.get("sam_channels"),
+            "must3r_channels": model.get("must3r_channels"),
+        },
         "features": {
             "online_must3r": online_enabled,
             "cache_enabled": not online_enabled,
