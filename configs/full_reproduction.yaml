@@ -45,6 +45,12 @@ sampling:
 
 features:
   cache_root: outputs/must3r_features
+  online: false
+  image_size: 512
+  amp: bf16
+  max_bs: 1
+  decode_batch_size: 1
+  feature_layers: encoder,4,7,11
 
 model:
   sam_channels: 256

@@ -63,6 +63,7 @@ class TrainingBatch:
     dataset: str
     scene_id: str
     frame_ids: tuple[str, ...]
+    image_paths: tuple[Path, ...]
     has_object: torch.Tensor
 
     def to(self, device: torch.device | str) -> "TrainingBatch":
@@ -384,12 +385,14 @@ class ThreeAMTrainingDataset:
         config: dict[str, Any],
         *,
         feature_cache_root: Path,
+        load_feature_cache: bool = True,
         rng: RandomLike | None = None,
     ) -> None:
         if not scenes:
             raise ValueError(missing_training_data_message(config))
         self.scenes = scenes
         self.config = config
+        self.load_feature_cache = load_feature_cache
         self.rng = rng or random
         model_config = config.get("model", {})
         must3r_channels = tuple(model_config.get("must3r_channels", (256, 512, 768)))
@@ -401,12 +404,14 @@ class ThreeAMTrainingDataset:
         config: dict[str, Any],
         *,
         feature_cache_root: str | Path | None = None,
+        load_feature_cache: bool = True,
         rng: RandomLike | None = None,
     ) -> "ThreeAMTrainingDataset":
         return cls(
             load_training_scenes(config),
             config,
             feature_cache_root=configured_feature_cache_root(config, feature_cache_root),
+            load_feature_cache=load_feature_cache,
             rng=rng,
         )
 
@@ -426,10 +431,12 @@ class ThreeAMTrainingDataset:
         target_masks = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
         prompt = build_prompt(scene.dataset, target_masks[reference_index], reference_index, self.rng)
         has_object = target_masks.flatten(1).any(dim=1)
-        try:
-            must3r_features = self.feature_cache.load(scene, selected_frames)
-        except FeatureCacheMissingError:
-            must3r_features = None
+        must3r_features = None
+        if self.load_feature_cache:
+            try:
+                must3r_features = self.feature_cache.load(scene, selected_frames)
+            except FeatureCacheMissingError:
+                must3r_features = None
         return TrainingBatch(
             images=torch.stack(images, dim=0),
             target_masks=target_masks,
@@ -438,6 +445,7 @@ class ThreeAMTrainingDataset:
             dataset=scene.dataset,
             scene_id=scene.scene_id,
             frame_ids=tuple(frame.frame_id for frame in selected_frames),
+            image_paths=tuple(frame.image_path for frame in selected_frames),
             has_object=has_object,
         )
 

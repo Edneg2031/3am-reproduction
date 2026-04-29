@@ -6,7 +6,15 @@ import pytest
 import torch
 from torch import nn
 
-from three_am.models.adapters import ExternalBackboneConfig, ExternalDependencyError, Sam2TrainingAdapter, _sam2_config_name
+from three_am.models.adapters import (
+    ExternalBackboneConfig,
+    ExternalDependencyError,
+    Must3rFeatureAdapter,
+    Sam2TrainingAdapter,
+    _normalize_must3r_amp,
+    _parse_must3r_feature_layers,
+    _sam2_config_name,
+)
 
 
 def test_sam2_config_name_keeps_hydra_config_name() -> None:
@@ -17,6 +25,13 @@ def test_sam2_config_name_converts_absolute_config_path_to_hydra_name() -> None:
     path = Path("/tmp/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml")
 
     assert _sam2_config_name(path) == "configs/sam2.1/sam2.1_hiera_l.yaml"
+
+
+def test_must3r_feature_layer_and_amp_parsers() -> None:
+    assert _parse_must3r_feature_layers("encoder,4,7,11") == ("encoder", 4, 7, 11)
+    assert _parse_must3r_feature_layers(["encoder", 4, "7"]) == ("encoder", 4, 7)
+    assert _normalize_must3r_amp("false") is False
+    assert _normalize_must3r_amp("bf16") == "bf16"
 
 
 class FakeSam2BackboneAware(nn.Module):
@@ -71,3 +86,14 @@ def test_sam2_adapter_rejects_merged_feature_shape_mismatch() -> None:
 
     with pytest.raises(ExternalDependencyError, match="Merged 3AM feature shape"):
         adapter.forward_train_sequence(batch=object(), merged_features=wrong)
+
+
+def test_must3r_adapter_maps_paper_layers_to_decoder_indices() -> None:
+    adapter = Must3rFeatureAdapter(
+        ExternalBackboneConfig(must3r_feature_layers=_parse_must3r_feature_layers("encoder,4,7,11"))
+    )
+
+    specs, indices = adapter._normalize_feature_layers(13)
+
+    assert specs == ("encoder", 4, 7, 11)
+    assert indices == (0, 5, 8, 12)

@@ -19,6 +19,8 @@ from three_am.models.adapters import (
     ExternalDependencyError,
     Must3rFeatureAdapter,
     Sam2TrainingAdapter,
+    _normalize_must3r_amp,
+    _parse_must3r_feature_layers,
 )
 from three_am.models.three_am import ThreeAMConfig, ThreeAMCore
 from three_am.training.dataset import (
@@ -59,8 +61,10 @@ def build_core(config: dict[str, Any]) -> ThreeAMCore:
     )
 
 
-def external_config(config: dict[str, Any]) -> ExternalBackboneConfig:
+def external_config(config: dict[str, Any], *, must3r_device: str | None = None) -> ExternalBackboneConfig:
     external = config.get("external", {})
+    features = config.get("features", {})
+    model = config.get("model", {})
     sam2_checkpoint = resolve_project_path(config, external.get("sam2_checkpoint"))
     sam2_config = external.get("sam2_config")
     if sam2_config is not None:
@@ -68,12 +72,22 @@ def external_config(config: dict[str, Any]) -> ExternalBackboneConfig:
     sam2_repo = resolve_project_path(config, external.get("sam2_repo"))
     must3r_checkpoint = resolve_project_path(config, external.get("must3r_checkpoint"))
     must3r_repo = resolve_project_path(config, external.get("must3r_repo"))
+    must3r_channels = model.get("must3r_channels")
     return ExternalBackboneConfig(
         sam2_checkpoint=sam2_checkpoint,
         sam2_config=sam2_config,
         sam2_repo=sam2_repo,
         must3r_checkpoint=must3r_checkpoint,
         must3r_repo=must3r_repo,
+        must3r_device=must3r_device,
+        must3r_image_size=int(features.get("image_size", 512)),
+        must3r_amp=_normalize_must3r_amp(features.get("amp", "bf16")),
+        must3r_max_bs=int(features.get("max_bs", 1)),
+        must3r_decode_batch_size=int(features.get("decode_batch_size", 1)),
+        must3r_feature_layers=_parse_must3r_feature_layers(features.get("feature_layers", "encoder,4,7,11")),
+        must3r_expected_channels=tuple(int(channels) for channels in must3r_channels)
+        if must3r_channels is not None
+        else None,
     )
 
 
@@ -120,10 +134,23 @@ def _sam2_config_exists(config: ExternalBackboneConfig) -> bool:
     return any(candidate.exists() for candidate in candidates)
 
 
-def dry_run(config: dict[str, Any], feature_cache: str | Path | None = None) -> dict[str, Any]:
+def _online_must3r_enabled(config: dict[str, Any], override: bool | None = None) -> bool:
+    if override is not None:
+        return override
+    return bool(config.get("features", {}).get("online", False))
+
+
+def dry_run(
+    config: dict[str, Any],
+    feature_cache: str | Path | None = None,
+    *,
+    online_must3r: bool | None = None,
+) -> dict[str, Any]:
     cache_root = configured_feature_cache_root(config, feature_cache)
     statuses = manifest_statuses(config, cache_root)
     external = external_config(config)
+    features = config.get("features", {})
+    online_enabled = _online_must3r_enabled(config, online_must3r)
     payload = {
         "manifests": [
             {
@@ -137,6 +164,15 @@ def dry_run(config: dict[str, Any], feature_cache: str | Path | None = None) -> 
             for status in statuses
         ],
         "feature_cache_root": str(cache_root),
+        "features": {
+            "online_must3r": online_enabled,
+            "cache_enabled": not online_enabled,
+            "image_size": int(features.get("image_size", 512)),
+            "amp": features.get("amp", "bf16"),
+            "max_bs": int(features.get("max_bs", 1)),
+            "decode_batch_size": int(features.get("decode_batch_size", 1)),
+            "feature_layers": list(_parse_must3r_feature_layers(features.get("feature_layers", "encoder,4,7,11"))),
+        },
         "external": {
             "sam2_importable": _availability("sam2"),
             "mast3r_importable": _availability("mast3r"),
@@ -252,16 +288,35 @@ def _load_missing_must3r_features(
     adapter: Must3rFeatureAdapter | None,
     config: dict[str, Any],
     device: torch.device,
+    *,
+    online_must3r: bool,
 ) -> tuple[torch.Tensor, ...]:
     if batch.must3r_features is not None:
         return batch.must3r_features
-    adapter = adapter or Must3rFeatureAdapter(external_config(config))
+    if not online_must3r:
+        cache_root = configured_feature_cache_root(config)
+        num_levels = len(tuple(config.get("model", {}).get("must3r_channels", (256, 512, 768))))
+        expected = [
+            cache_root / batch.dataset / batch.scene_id / f"{frame_id}_level{level}.pt"
+            for frame_id in batch.frame_ids
+            for level in range(num_levels)
+        ]
+        preview = ", ".join(str(path) for path in expected[: min(3, len(expected))])
+        suffix = "" if len(expected) <= 3 else f", ... ({len(expected)} expected files)"
+        raise FeatureCacheRuntimeError(
+            "MUSt3R feature cache is missing for "
+            f"{batch.dataset}/{batch.scene_id} frames {list(batch.frame_ids)}. "
+            f"Expected cache files like: {preview}{suffix}. "
+            "Generate cache with scripts/precompute_must3r_features.py, add absolute must3r_feature_paths "
+            "to the manifest, or run training with --online-must3r / features.online=true."
+        )
+    adapter = adapter or Must3rFeatureAdapter(external_config(config, must3r_device=str(device)))
     try:
         if getattr(adapter, "model", object()) is None:
             load = getattr(adapter, "load", None)
             if callable(load):
                 load()
-        features = adapter.extract_features(batch.images)
+        features = _extract_online_must3r_features(adapter, batch)
     except (ExternalDependencyError, NotImplementedError) as error:
         cache_root = configured_feature_cache_root(config)
         num_levels = len(tuple(config.get("model", {}).get("must3r_channels", (256, 512, 768))))
@@ -282,6 +337,18 @@ def _load_missing_must3r_features(
     return tuple(feature.to(device) for feature in features)
 
 
+def _extract_online_must3r_features(
+    adapter: Must3rFeatureAdapter,
+    batch: TrainingBatch,
+) -> tuple[torch.Tensor, ...]:
+    try:
+        return adapter.extract_features(batch.images, image_paths=batch.image_paths)
+    except TypeError as error:
+        if "image_paths" not in str(error):
+            raise
+        return adapter.extract_features(batch.images)  # type: ignore[call-arg]
+
+
 class FeatureCacheRuntimeError(RuntimeError):
     pass
 
@@ -296,12 +363,14 @@ def run_training(
     log_every: int | None = None,
     checkpoint_every: int | None = None,
     dry_run_only: bool = False,
+    online_must3r: bool | None = None,
     sam2_adapter: Sam2TrainingAdapter | None = None,
     must3r_adapter: Must3rFeatureAdapter | None = None,
 ) -> int:
     config = load_yaml(config_path)
+    online_enabled = _online_must3r_enabled(config, online_must3r)
     if dry_run_only:
-        dry_run(config, feature_cache)
+        dry_run(config, feature_cache, online_must3r=online_must3r)
         return 0
 
     training_config = config.get("training", {})
@@ -311,11 +380,15 @@ def run_training(
         checkpoint_every if checkpoint_every is not None else training_config.get("checkpoint_every", 5000)
     )
     device = _device(device_name)
-    dataset = ThreeAMTrainingDataset.from_config(config, feature_cache_root=feature_cache)
+    dataset = ThreeAMTrainingDataset.from_config(
+        config,
+        feature_cache_root=feature_cache,
+        load_feature_cache=not online_enabled,
+    )
 
     core = build_core(config)
     sam2_adapter = sam2_adapter or Sam2TrainingAdapter(external_config(config))
-    must3r_adapter = must3r_adapter or Must3rFeatureAdapter(external_config(config))
+    must3r_adapter = must3r_adapter or Must3rFeatureAdapter(external_config(config, must3r_device=str(device)))
     if getattr(sam2_adapter, "model", object()) is None:
         sam2_adapter.load()
     wrapper = ThreeAMTrainingWrapper(core, sam2_adapter).to(device)
@@ -350,7 +423,13 @@ def run_training(
     for step_index in range(start_step, total_iterations):
         step = step_index + 1
         batch = dataset.sample().to(device)
-        must3r_features = _load_missing_must3r_features(batch, must3r_adapter, config, device)
+        must3r_features = _load_missing_must3r_features(
+            batch,
+            must3r_adapter,
+            config,
+            device,
+            online_must3r=online_enabled,
+        )
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device, amp_enabled):
             outputs = wrapper(batch, must3r_features)
@@ -421,6 +500,12 @@ def main() -> None:
     parser.add_argument("--feature-cache", default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
+    parser.add_argument(
+        "--online-must3r",
+        action="store_true",
+        default=None,
+        help="compute MUSt3R features inside the training loop instead of loading feature cache files",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.smoke:
@@ -435,6 +520,7 @@ def main() -> None:
         log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
         dry_run_only=args.dry_run,
+        online_must3r=args.online_must3r,
     )
 
 

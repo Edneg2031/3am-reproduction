@@ -72,6 +72,7 @@ def test_training_dataset_builds_binary_mask_prompt(tmp_path: Path) -> None:
     assert batch.target_masks.shape == (2, 4, 4)
     assert batch.prompt.type == "mask"
     assert batch.prompt.mask is not None
+    assert [path.name for path in batch.image_paths] == ["000.png", "001.png"]
     assert batch.has_object.tolist() == [True, True]
 
 

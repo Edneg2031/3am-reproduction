@@ -4,10 +4,12 @@ import inspect
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from torch import nn
+
+FeatureLayerSpec = str | int
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,13 @@ class ExternalBackboneConfig:
     sam2_repo: Path | None = None
     must3r_checkpoint: Path | None = None
     must3r_repo: Path | None = None
+    must3r_device: str | None = None
+    must3r_image_size: int = 512
+    must3r_amp: str | bool = "bf16"
+    must3r_max_bs: int = 1
+    must3r_decode_batch_size: int = 1
+    must3r_feature_layers: tuple[FeatureLayerSpec, ...] = ("encoder", 4, 7, 11)
+    must3r_expected_channels: tuple[int, ...] | None = None
 
 
 class ExternalDependencyError(RuntimeError):
@@ -29,6 +38,43 @@ def _prepend_repo_to_sys_path(repo: Path | None) -> None:
     repo = repo.expanduser().resolve()
     if repo.exists() and str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
+
+
+def _parse_must3r_feature_layers(value: str | Sequence[FeatureLayerSpec] | None) -> tuple[FeatureLayerSpec, ...]:
+    if value is None:
+        return ("encoder", 4, 7, 11)
+    if isinstance(value, str):
+        parts: Sequence[Any] = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        parts = value
+    layers: list[FeatureLayerSpec] = []
+    for part in parts:
+        if isinstance(part, str) and part.lower() == "encoder":
+            layers.append("encoder")
+        else:
+            layers.append(int(part))
+    if not layers:
+        raise ValueError("MUSt3R feature layers must contain at least one layer")
+    return tuple(layers)
+
+
+def _dtype_for_must3r_amp(amp: str | bool) -> torch.dtype:
+    if amp == "fp16":
+        return torch.float16
+    if amp == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
+def _normalize_must3r_amp(value: str | bool) -> str | bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in {"false", "none", "off", "0"}:
+        return False
+    if lowered in {"bf16", "fp16"}:
+        return lowered
+    raise ValueError("MUSt3R amp must be false, bf16, or fp16")
 
 
 def _sam2_config_name(config: str | Path) -> str:
@@ -257,21 +303,39 @@ class Must3rFeatureAdapter(nn.Module):
     def __init__(self, config: ExternalBackboneConfig) -> None:
         super().__init__()
         self.config = config
-        self.model: nn.Module | None = None
+        self.model: Any | None = None
 
     def load(self) -> None:
         _prepend_repo_to_sys_path(self.config.must3r_repo)
         try:
-            import mast3r  # noqa: F401  # type: ignore
+            from must3r.model import load_model  # type: ignore
         except Exception as error:  # pragma: no cover - depends on external repo
-            raise ExternalDependencyError("Install naver/must3r and its MASt3R dependencies first") from error
-        raise NotImplementedError(
-            "MUSt3R public APIs vary by release; wire checkpoint loading here after installing naver/must3r."
+            raise ExternalDependencyError(
+                "Could not import must3r.model.load_model. Install naver/must3r and its MASt3R dependencies, "
+                "or set external.must3r_repo to the cloned repo root."
+            ) from error
+        if self.config.must3r_checkpoint is None or not self.config.must3r_checkpoint.exists():
+            raise ExternalDependencyError(f"MUSt3R checkpoint does not exist: {self.config.must3r_checkpoint}")
+        self.model = load_model(
+            str(self.config.must3r_checkpoint),
+            device=str(self._device()),
+            img_size=int(self.config.must3r_image_size),
+            verbose=False,
         )
+        self._freeze_loaded_model()
 
-    def extract_features(self, images: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def extract_features(
+        self,
+        images: torch.Tensor,
+        *,
+        image_paths: Sequence[Path] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         if self.model is None:
             raise ExternalDependencyError("MUSt3R model is not loaded")
+        if self._is_official_model(self.model):
+            if image_paths is None:
+                raise ExternalDependencyError("Online MUSt3R extraction requires image paths from the training manifest")
+            return self.extract_features_from_paths(image_paths)
         for method_name in ("extract_features", "forward_features", "encode"):
             method = getattr(self.model, method_name, None)
             if callable(method):
@@ -285,6 +349,238 @@ class Must3rFeatureAdapter(nn.Module):
             "MUSt3R feature extraction API is not available. Precompute cache files or subclass "
             "Must3rFeatureAdapter.extract_features for the selected MUSt3R release."
         )
+
+    def extract_features_from_paths(self, image_paths: Sequence[Path]) -> tuple[torch.Tensor, ...]:
+        if self.model is None:
+            self.load()
+        if not self._is_official_model(self.model):
+            raise ExternalDependencyError("MUSt3R official encoder/decoder pair is not loaded")
+        encoder, decoder = self.model
+        patch_size = self._patch_size(encoder)
+        if not image_paths:
+            raise ExternalDependencyError("Online MUSt3R extraction received no image paths")
+        true_shape_chunks: list[torch.Tensor] = []
+        pos_chunks: list[torch.Tensor] = []
+        selected_chunks: list[list[torch.Tensor]] | None = None
+        selected_specs: tuple[FeatureLayerSpec, ...] | None = None
+        selected_indices: tuple[int, ...] | None = None
+        device = self._device()
+        with torch.no_grad():
+            dtype = _dtype_for_must3r_amp(self.config.must3r_amp)
+            with torch.autocast(device.type, dtype=dtype, enabled=self.config.must3r_amp is not False and device.type == "cuda"):
+                for start in range(0, len(image_paths), max(1, int(self.config.must3r_decode_batch_size))):
+                    end = min(len(image_paths), start + max(1, int(self.config.must3r_decode_batch_size)))
+                    images, true_shape = self._load_official_images(image_paths[start:end], patch_size)
+                    true_shape_tensor = torch.stack(true_shape, dim=0)
+                    true_shape_chunks.append(true_shape_tensor)
+                    image_tensor = torch.stack(images, dim=0).to(device)
+                    chunk_true_shape = true_shape_tensor.to(device)
+                    encoder_tokens, pos = self._encode_frames(encoder, image_tensor, chunk_true_shape)
+                    pos_chunks.append(pos.detach().cpu())
+                    raw_levels = self._decode_feature_levels(decoder, encoder_tokens, pos, chunk_true_shape)
+                    if selected_indices is None:
+                        selected_specs, selected_indices = self._normalize_feature_layers(len(raw_levels))
+                        selected_chunks = [[] for _ in selected_indices]
+                    if selected_chunks is None or selected_specs is None or selected_indices is None:
+                        raise ExternalDependencyError("MUSt3R decoder returned no selectable feature levels")
+                    if any(index >= len(raw_levels) for index in selected_indices):
+                        raise ExternalDependencyError(
+                            f"MUSt3R decoder returned {len(raw_levels)} levels, cannot select "
+                            f"{list(self.config.must3r_feature_layers)}"
+                        )
+                    for output_index, raw_index in enumerate(selected_indices):
+                        selected_chunks[output_index].append(raw_levels[raw_index])
+                    del image_tensor, chunk_true_shape, encoder_tokens, pos, raw_levels
+        if selected_chunks is None or selected_specs is None:
+            raise ExternalDependencyError("MUSt3R online extraction produced no feature chunks")
+        true_shape_tensor = torch.cat(true_shape_chunks, dim=0)
+        pos_tensor = torch.cat(pos_chunks, dim=0)
+        selected_token_levels = tuple(torch.cat(chunks, dim=0) for chunks in selected_chunks)
+        features = tuple(
+            self._tokens_to_chw(level, pos_tensor, true_shape_tensor, patch_size, spec)
+            for level, spec in zip(selected_token_levels, selected_specs, strict=True)
+        )
+        self._validate_expected_channels(features)
+        return tuple(feature.detach().cpu() for feature in features)
+
+    def _device(self) -> torch.device:
+        if self.config.must3r_device is not None:
+            return torch.device(self.config.must3r_device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _freeze_loaded_model(self) -> None:
+        if not self._is_official_model(self.model):
+            return
+        for module in self.model:
+            if hasattr(module, "eval"):
+                module.eval()
+            if hasattr(module, "parameters"):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+
+    def _is_official_model(self, model: Any) -> bool:
+        return isinstance(model, (list, tuple)) and len(model) == 2
+
+    def _patch_size(self, encoder: Any) -> int:
+        patch_size = getattr(encoder, "patch_size", 16)
+        if isinstance(patch_size, (list, tuple)):
+            patch_size = patch_size[0]
+        return int(patch_size)
+
+    def _load_official_images(
+        self,
+        image_paths: Sequence[Path],
+        patch_size: int,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        try:
+            from must3r.demo.inference import load_images  # type: ignore
+        except Exception as error:  # pragma: no cover - depends on external repo
+            raise ExternalDependencyError("Could not import must3r.demo.inference.load_images") from error
+        views = load_images(
+            [str(path) for path in image_paths],
+            size=int(self.config.must3r_image_size),
+            patch_size=patch_size,
+            verbose=False,
+        )
+        images = [view["img"].to("cpu") for view in views]
+        true_shape = [torch.as_tensor(view["true_shape"], dtype=torch.int64) for view in views]
+        return images, true_shape
+
+    def _encode_frames(self, encoder: Any, images: torch.Tensor, true_shape: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens: list[torch.Tensor] = []
+        positions: list[torch.Tensor] = []
+        max_bs = max(1, int(self.config.must3r_max_bs))
+        for start in range(0, images.shape[0], max_bs):
+            end = min(images.shape[0], start + max_bs)
+            encoded, pos = encoder(images[start:end], true_shape[start:end])
+            tokens.append(encoded)
+            positions.append(pos)
+        return torch.cat(tokens, dim=0), torch.cat(positions, dim=0)
+
+    def _decode_feature_levels(
+        self,
+        decoder: Any,
+        encoder_tokens: torch.Tensor,
+        pos: torch.Tensor,
+        true_shape: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        if not hasattr(decoder, "forward_list"):
+            raise ExternalDependencyError("MUSt3R decoder has no forward_list(..., return_feats=True) hook")
+        level_chunks: list[list[torch.Tensor]] | None = None
+        decode_bs = max(1, int(self.config.must3r_decode_batch_size))
+        for start in range(0, encoder_tokens.shape[0], decode_bs):
+            end = min(encoder_tokens.shape[0], start + decode_bs)
+            output = decoder.forward_list(
+                [encoder_tokens[start:end].unsqueeze(0)],
+                [pos[start:end].unsqueeze(0)],
+                [true_shape[start:end].unsqueeze(0)],
+                return_feats=True,
+            )
+            if not isinstance(output, tuple) or len(output) != 3:
+                raise ExternalDependencyError("MUSt3R decoder.forward_list did not return (memory, pointmaps, feats)")
+            _, _, grouped_feats = output
+            if not grouped_feats or not grouped_feats[0]:
+                raise ExternalDependencyError("MUSt3R decoder returned no feature levels")
+            chunk_levels = [feature[0].detach().cpu() for feature in grouped_feats[0]]
+            if level_chunks is None:
+                level_chunks = [[] for _ in chunk_levels]
+            if len(chunk_levels) != len(level_chunks):
+                raise ExternalDependencyError(
+                    f"MUSt3R decoder returned {len(chunk_levels)} levels, expected {len(level_chunks)}"
+                )
+            for level_index, chunk in enumerate(chunk_levels):
+                level_chunks[level_index].append(chunk)
+            del output, grouped_feats, chunk_levels
+        if level_chunks is None:
+            raise ExternalDependencyError("MUSt3R decoder returned no feature levels")
+        return [torch.cat(chunks, dim=0) for chunks in level_chunks]
+
+    def _normalize_feature_layers(self, num_levels: int) -> tuple[tuple[FeatureLayerSpec, ...], tuple[int, ...]]:
+        specs: list[FeatureLayerSpec] = []
+        indices: list[int] = []
+        for layer in self.config.must3r_feature_layers:
+            if layer == "encoder":
+                index = 0
+            elif isinstance(layer, int) and layer >= 0:
+                index = layer + 1
+            elif isinstance(layer, int):
+                index = num_levels + layer
+            else:
+                raise ExternalDependencyError(f"Unsupported MUSt3R feature layer spec: {layer!r}")
+            if index < 0 or index >= num_levels:
+                raise ExternalDependencyError(
+                    f"Requested MUSt3R feature layer {layer}, but decoder returned {num_levels} levels"
+                )
+            specs.append(layer)
+            indices.append(index)
+        return tuple(specs), tuple(indices)
+
+    def _tokens_to_chw(
+        self,
+        tokens: torch.Tensor,
+        pos: torch.Tensor,
+        true_shape: torch.Tensor,
+        patch_size: int,
+        spec: FeatureLayerSpec,
+    ) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ExternalDependencyError(f"Expected MUSt3R token features with shape TNC, got {tuple(tokens.shape)}")
+        expected_channels = self._expected_channels(spec)
+        if tokens.shape[2] != expected_channels:
+            raise ExternalDependencyError(
+                "MUSt3R feature channel mismatch for "
+                f"{self._feature_layer_label(spec)}: got {tokens.shape[2]}, expected {expected_channels}. "
+                "The 3AM paper uses encoder=1024 channels and decoder layers=768 channels."
+            )
+        if pos.shape[:2] != tokens.shape[:2]:
+            raise ExternalDependencyError(
+                f"MUSt3R token/position mismatch: tokens {tuple(tokens.shape)}, pos {tuple(pos.shape)}"
+            )
+        if not torch.equal(true_shape, true_shape[:1].expand_as(true_shape)):
+            raise ExternalDependencyError(
+                "All frames in one training sample must resize to the same true_shape for MUSt3R token-grid export"
+            )
+        height = int(true_shape[0, 0].item())
+        width = int(true_shape[0, 1].item())
+        grid_h = height // patch_size
+        grid_w = width // patch_size
+        if grid_h * grid_w != tokens.shape[1]:
+            raise ExternalDependencyError(
+                f"Could not reshape {tokens.shape[1]} MUSt3R tokens into token grid {(grid_h, grid_w)} "
+                f"for true_shape {(height, width)} and patch_size {patch_size}."
+            )
+        self._validate_pos_grid(pos, grid_h, grid_w)
+        return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], grid_h, grid_w).contiguous()
+
+    def _validate_pos_grid(self, pos: torch.Tensor, grid_h: int, grid_w: int) -> None:
+        for frame_index, frame_pos in enumerate(pos.detach().cpu()):
+            if frame_pos.ndim != 2 or frame_pos.shape[1] != 2:
+                raise ExternalDependencyError(f"Expected MUSt3R positions with shape N2, got {tuple(frame_pos.shape)}")
+            first = torch.unique(frame_pos[:, 0]).numel()
+            second = torch.unique(frame_pos[:, 1]).numel()
+            if sorted((int(first), int(second))) != sorted((grid_h, grid_w)):
+                raise ExternalDependencyError(
+                    f"MUSt3R position grid mismatch for frame {frame_index}: "
+                    f"pos unique counts {(int(first), int(second))}, expected {(grid_h, grid_w)}."
+                )
+
+    def _validate_expected_channels(self, features: tuple[torch.Tensor, ...]) -> None:
+        expected = self.config.must3r_expected_channels
+        if expected is None:
+            return
+        actual = tuple(int(feature.shape[1]) for feature in features)
+        if actual != expected:
+            raise ExternalDependencyError(
+                "Online MUSt3R feature channel mismatch: "
+                f"extracted {list(actual)}, but model.must3r_channels is {list(expected)}. "
+                f"Set model.must3r_channels to {list(actual)} or choose matching feature layers."
+            )
+
+    def _expected_channels(self, spec: FeatureLayerSpec) -> int:
+        return 1024 if spec == "encoder" else 768
+
+    def _feature_layer_label(self, spec: FeatureLayerSpec) -> str:
+        return "encoder" if spec == "encoder" else f"decoder_{spec}"
 
 
 Sam2Adapter = Sam2TrainingAdapter

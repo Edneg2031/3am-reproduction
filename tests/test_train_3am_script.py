@@ -37,6 +37,19 @@ class FakeSam2Adapter(nn.Module):
         }
 
 
+class FakeMust3rAdapter(nn.Module):
+    model = object()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_paths = None
+
+    def extract_features(self, images: torch.Tensor, *, image_paths=None) -> tuple[torch.Tensor, ...]:
+        self.seen_paths = image_paths
+        assert image_paths is not None
+        return (torch.ones(images.shape[0], 2, images.shape[-2], images.shape[-1], device=images.device),)
+
+
 def _load_train_module():
     repo = Path(__file__).resolve().parents[1]
     script = repo / "scripts" / "train_3am.py"
@@ -59,7 +72,7 @@ def _write_mask(path: Path) -> None:
     Image.fromarray(mask).save(path)
 
 
-def _write_tiny_training_fixture(tmp_path: Path) -> Path:
+def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = True) -> Path:
     scene_dir = tmp_path / "data" / "processed" / "scannetpp" / "scene_a"
     frames: list[FrameRecord] = []
     for index in range(2):
@@ -72,9 +85,10 @@ def _write_tiny_training_fixture(tmp_path: Path) -> Path:
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
     write_manifest(manifest, [SceneRecord("scannetpp", "scene_a", "train", tuple(frames))])
     feature_dir = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
-    feature_dir.mkdir(parents=True)
-    for frame in frames:
-        torch.save(torch.randn(2, 4, 4), feature_dir / f"{frame.frame_id}_level0.pt")
+    if write_feature_cache:
+        feature_dir.mkdir(parents=True)
+        for frame in frames:
+            torch.save(torch.randn(2, 4, 4), feature_dir / f"{frame.frame_id}_level0.pt")
     config = {
         "project_root": str(tmp_path),
         "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
@@ -132,6 +146,25 @@ def test_training_script_runs_with_fake_adapter_and_resumes(tmp_path: Path) -> N
     assert second_step == 2
     payload = torch.load(tmp_path / "outputs" / "checkpoints" / "final.pt", weights_only=False)
     assert payload["step"] == 2
+
+
+def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: Path) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path, write_feature_cache=False)
+    must3r = FakeMust3rAdapter()
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        online_must3r=True,
+        sam2_adapter=FakeSam2Adapter(),
+        must3r_adapter=must3r,
+    )
+
+    assert step == 1
+    assert must3r.seen_paths is not None
+    assert [path.name for path in must3r.seen_paths] == ["000.png", "001.png"]
 
 
 def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
