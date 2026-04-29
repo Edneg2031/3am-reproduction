@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 FeatureLayerSpec = str | int
 
@@ -194,6 +195,9 @@ class Sam2TrainingAdapter(nn.Module):
                 if outputs is None:
                     continue
                 return self._validate_training_outputs(outputs, method_name)
+        outputs = self._forward_with_official_sam2_modules(batch, merged_features, backbone_out)
+        if outputs is not None:
+            return outputs
         raise ExternalDependencyError(
             "SAM2 training forward API is not available for merged 3AM features. Provide a SAM2 training wrapper "
             "with one of forward_train_sequence_with_backbone(...), forward_train_sequence_from_backbone(...), "
@@ -254,6 +258,188 @@ class Sam2TrainingAdapter(nn.Module):
             values[int(key)] = merged_features
             return values
         return None
+
+    def _forward_with_official_sam2_modules(
+        self,
+        batch: Any,
+        merged_features: torch.Tensor,
+        backbone_out: Any | None,
+    ) -> dict[str, torch.Tensor] | None:
+        if backbone_out is None:
+            return self._forward_sam_heads_per_frame(batch, merged_features, backbone_out=None)
+        if hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step"):
+            return self._forward_track_steps(batch, backbone_out)
+        return self._forward_sam_heads_per_frame(batch, merged_features, backbone_out=backbone_out)
+
+    def _forward_track_steps(self, batch: Any, backbone_out: Any) -> dict[str, torch.Tensor] | None:
+        if self.model is None or not hasattr(self.model, "_prepare_backbone_features"):
+            return None
+        try:
+            _, vision_feats, vision_pos_embeds, feat_sizes = self.model._prepare_backbone_features(backbone_out)
+        except Exception as error:
+            raise ExternalDependencyError("SAM2 could not prepare merged backbone features for tracking") from error
+        num_frames = int(getattr(batch, "target_masks").shape[0])
+        reference_index = int(getattr(batch.prompt, "frame_index", 0))
+        output_dict: dict[str, dict[int, dict[str, Any]]] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        ordered = [reference_index]
+        ordered.extend(index for index in range(reference_index + 1, num_frames))
+        ordered.extend(index for index in range(reference_index - 1, -1, -1))
+        frame_outputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        for frame_index in ordered:
+            current_feats = [feature[:, frame_index : frame_index + 1, :] for feature in vision_feats]
+            current_pos = [pos[:, frame_index : frame_index + 1, :] for pos in vision_pos_embeds]
+            point_inputs, mask_inputs = self._prompt_inputs_for_frame(batch, frame_index, current_feats[-1].device)
+            is_cond_frame = frame_index == reference_index
+            try:
+                current_out, sam_outputs, _, _ = self.model._track_step(
+                    frame_idx=frame_index,
+                    is_init_cond_frame=is_cond_frame,
+                    current_vision_feats=current_feats,
+                    current_vision_pos_embeds=current_pos,
+                    feat_sizes=feat_sizes,
+                    point_inputs=point_inputs,
+                    mask_inputs=mask_inputs,
+                    output_dict=output_dict,
+                    num_frames=num_frames,
+                    track_in_reverse=frame_index < reference_index,
+                    prev_sam_mask_logits=None,
+                )
+            except Exception as error:
+                raise ExternalDependencyError("SAM2 _track_step failed on merged 3AM features") from error
+            low_res_masks, high_res_masks, iou_scores, object_score_logits = self._unpack_sam_outputs(sam_outputs)
+            current_out["pred_masks"] = low_res_masks
+            current_out["pred_masks_high_res"] = high_res_masks
+            current_out["obj_ptr"] = sam_outputs[5]
+            current_out["object_score_logits"] = object_score_logits
+            if hasattr(self.model, "_encode_memory_in_output"):
+                self.model._encode_memory_in_output(
+                    current_feats,
+                    feat_sizes,
+                    point_inputs,
+                    True,
+                    high_res_masks,
+                    object_score_logits,
+                    current_out,
+                )
+            output_group = "cond_frame_outputs" if is_cond_frame else "non_cond_frame_outputs"
+            output_dict[output_group][frame_index] = current_out
+            frame_outputs[frame_index] = (high_res_masks[:, 0], iou_scores, object_score_logits)
+        return self._format_sam_training_outputs(batch, frame_outputs)
+
+    def _forward_sam_heads_per_frame(
+        self,
+        batch: Any,
+        merged_features: torch.Tensor,
+        *,
+        backbone_out: Any | None,
+    ) -> dict[str, torch.Tensor] | None:
+        if self.model is None or not hasattr(self.model, "_forward_sam_heads"):
+            return None
+        num_frames = int(getattr(batch, "target_masks").shape[0])
+        high_res_features_all = self._high_res_features_from_backbone(backbone_out)
+        frame_outputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        for frame_index in range(num_frames):
+            feature = merged_features[frame_index : frame_index + 1]
+            point_inputs, mask_inputs = self._prompt_inputs_for_frame(batch, frame_index, feature.device)
+            high_res_features = None
+            if high_res_features_all is not None:
+                high_res_features = [level[frame_index : frame_index + 1] for level in high_res_features_all]
+            try:
+                sam_outputs = self.model._forward_sam_heads(
+                    backbone_features=feature,
+                    point_inputs=point_inputs,
+                    mask_inputs=mask_inputs,
+                    high_res_features=high_res_features,
+                    multimask_output=False,
+                )
+            except Exception as error:
+                raise ExternalDependencyError("SAM2 _forward_sam_heads failed on merged 3AM features") from error
+            _, high_res_masks, iou_scores, object_score_logits = self._unpack_sam_outputs(sam_outputs)
+            frame_outputs[frame_index] = (high_res_masks[:, 0], iou_scores, object_score_logits)
+        return self._format_sam_training_outputs(batch, frame_outputs)
+
+    def _prompt_inputs_for_frame(
+        self,
+        batch: Any,
+        frame_index: int,
+        device: torch.device,
+    ) -> tuple[dict[str, torch.Tensor] | None, torch.Tensor | None]:
+        prompt = getattr(batch, "prompt", None)
+        if prompt is None or int(prompt.frame_index) != frame_index:
+            return None, None
+        if prompt.type == "mask" and prompt.mask is not None:
+            return None, prompt.mask.to(device=device, dtype=torch.float32)[None, None]
+        if prompt.type == "point" and prompt.points is not None and prompt.point_labels is not None:
+            return {
+                "point_coords": prompt.points.to(device=device, dtype=torch.float32)[None],
+                "point_labels": prompt.point_labels.to(device=device, dtype=torch.int32)[None],
+            }, None
+        if prompt.type == "box" and prompt.box is not None:
+            box = prompt.box.to(device=device, dtype=torch.float32)
+            coords = torch.stack([box[:2], box[2:]], dim=0)[None]
+            labels = torch.tensor([[2, 3]], dtype=torch.int32, device=device)
+            return {"point_coords": coords, "point_labels": labels}, None
+        return None, None
+
+    def _high_res_features_from_backbone(self, backbone_out: Any | None) -> list[torch.Tensor] | None:
+        if not isinstance(backbone_out, dict):
+            return None
+        feature_maps = backbone_out.get("backbone_fpn")
+        if not isinstance(feature_maps, (list, tuple)) or len(feature_maps) < 2:
+            return None
+        num_levels = int(getattr(self.model, "num_feature_levels", min(3, len(feature_maps))))
+        selected = list(feature_maps[-num_levels:])
+        return [feature for feature in selected[:-1] if isinstance(feature, torch.Tensor)] or None
+
+    def _unpack_sam_outputs(self, sam_outputs: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not isinstance(sam_outputs, (list, tuple)) or len(sam_outputs) < 7:
+            raise ExternalDependencyError("SAM2 SAM heads returned an unsupported output payload")
+        low_res_masks = sam_outputs[3]
+        high_res_masks = sam_outputs[4]
+        iou_scores = sam_outputs[2]
+        object_score_logits = sam_outputs[6]
+        if iou_scores.ndim == 2 and iou_scores.shape[1] > 1:
+            iou_scores = iou_scores.max(dim=1).values
+        else:
+            iou_scores = iou_scores.flatten()
+        if object_score_logits.ndim == 1:
+            object_score_logits = object_score_logits[:, None]
+        if object_score_logits.shape[1] != 1:
+            object_score_logits = object_score_logits[:, :1]
+        return low_res_masks, high_res_masks, iou_scores, object_score_logits
+
+    def _format_sam_training_outputs(
+        self,
+        batch: Any,
+        frame_outputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> dict[str, torch.Tensor]:
+        target_masks = getattr(batch, "target_masks")
+        masks: list[torch.Tensor] = []
+        ious: list[torch.Tensor] = []
+        object_scores: list[torch.Tensor] = []
+        for frame_index in range(int(target_masks.shape[0])):
+            if frame_index not in frame_outputs:
+                raise ExternalDependencyError(f"SAM2 did not produce output for frame index {frame_index}")
+            mask_logits, iou_score, object_score = frame_outputs[frame_index]
+            if mask_logits.shape[-2:] != target_masks.shape[-2:]:
+                mask_logits = F.interpolate(
+                    mask_logits[:, None].float(),
+                    size=tuple(target_masks.shape[-2:]),
+                    mode="bilinear",
+                    align_corners=False,
+                )[:, 0]
+            masks.append(mask_logits[0])
+            ious.append(iou_score.reshape(-1)[0])
+            object_scores.append(object_score.reshape(-1)[0])
+        object_scores_tensor = torch.stack(object_scores)
+        return {
+            "mask_logits": torch.stack(masks, dim=0),
+            "iou_scores": torch.stack(ious, dim=0),
+            "occlusion_logits": torch.stack([-object_scores_tensor, object_scores_tensor], dim=1),
+        }
 
     def _call_training_method(
         self,

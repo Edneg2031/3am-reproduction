@@ -15,6 +15,7 @@ from three_am.models.adapters import (
     _parse_must3r_feature_layers,
     _sam2_config_name,
 )
+from three_am.training.dataset import Prompt, TrainingBatch
 
 
 def test_sam2_config_name_keeps_hydra_config_name() -> None:
@@ -94,6 +95,100 @@ def test_sam2_adapter_rejects_non_window_aligned_image_size() -> None:
 
     with pytest.raises(ExternalDependencyError, match="divisible by 32"):
         adapter.encode_sam_features(torch.randn(1, 3, 844, 1024))
+
+
+class FakeOfficialSam2Modules(nn.Module):
+    num_feature_levels = 2
+    hidden_dim = 4
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.steps: list[tuple[int, bool]] = []
+
+    def forward_image(self, images: torch.Tensor) -> dict[str, list[torch.Tensor]]:
+        frames = images.shape[0]
+        return {
+            "backbone_fpn": [
+                torch.zeros(frames, 4, 16, 16, device=images.device),
+                torch.ones(frames, 4, 8, 8, device=images.device),
+            ],
+            "vision_pos_enc": [
+                torch.zeros(frames, 4, 16, 16, device=images.device),
+                torch.zeros(frames, 4, 8, 8, device=images.device),
+            ],
+        }
+
+    def _prepare_backbone_features(self, backbone_out):
+        feature_maps = backbone_out["backbone_fpn"][-self.num_feature_levels :]
+        pos_maps = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
+        feat_sizes = [(feature.shape[-2], feature.shape[-1]) for feature in pos_maps]
+        vision_feats = [feature.flatten(2).permute(2, 0, 1) for feature in feature_maps]
+        vision_pos = [pos.flatten(2).permute(2, 0, 1) for pos in pos_maps]
+        return backbone_out, vision_feats, vision_pos, feat_sizes
+
+    def _track_step(
+        self,
+        frame_idx,
+        is_init_cond_frame,
+        current_vision_feats,
+        current_vision_pos_embeds,
+        feat_sizes,
+        point_inputs,
+        mask_inputs,
+        output_dict,
+        num_frames,
+        track_in_reverse,
+        prev_sam_mask_logits,
+    ):
+        self.steps.append((frame_idx, is_init_cond_frame))
+        value = current_vision_feats[-1].mean().reshape(1, 1, 1, 1)
+        high_res = value.expand(1, 1, 64, 64).clone()
+        low_res = value.expand(1, 1, 16, 16).clone()
+        ious = torch.full((1, 1), 0.75, device=high_res.device)
+        obj_ptr = torch.zeros(1, self.hidden_dim, device=high_res.device)
+        object_score_logits = torch.ones(1, 1, device=high_res.device)
+        sam_outputs = (low_res, high_res, ious, low_res, high_res, obj_ptr, object_score_logits)
+        return {"point_inputs": point_inputs, "mask_inputs": mask_inputs}, sam_outputs, None, current_vision_feats[-1]
+
+    def _encode_memory_in_output(
+        self,
+        current_vision_feats,
+        feat_sizes,
+        point_inputs,
+        run_mem_encoder,
+        high_res_masks,
+        object_score_logits,
+        current_out,
+    ):
+        current_out["maskmem_features"] = high_res_masks
+        current_out["maskmem_pos_enc"] = [torch.zeros_like(high_res_masks)]
+
+
+def test_sam2_adapter_falls_back_to_official_track_step_modules() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
+    model = FakeOfficialSam2Modules()
+    adapter.model = model
+    images = torch.randn(3, 3, 64, 64)
+    target_masks = torch.zeros(3, 64, 64)
+    batch = TrainingBatch(
+        images=images,
+        target_masks=target_masks,
+        prompt=Prompt(type="mask", frame_index=1, mask=target_masks[1]),
+        must3r_features=None,
+        dataset="scannetpp",
+        scene_id="scene_a",
+        frame_ids=("000", "001", "002"),
+        image_paths=(),
+        has_object=torch.tensor([False, False, False]),
+    )
+
+    sam_features = adapter.encode_sam_features(images)
+    outputs = adapter.forward_train_sequence(batch, sam_features)
+
+    assert outputs["mask_logits"].shape == (3, 64, 64)
+    assert outputs["iou_scores"].shape == (3,)
+    assert outputs["occlusion_logits"].shape == (3, 2)
+    assert model.steps[0] == (1, True)
 
 
 def test_must3r_adapter_maps_paper_layers_to_decoder_indices() -> None:
