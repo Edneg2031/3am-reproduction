@@ -11,6 +11,7 @@ from torch import nn
 
 from three_am.data.io import write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
+from three_am.models.feature_merger import Must3rFeatureBundle
 
 
 class FakeSam2Adapter(nn.Module):
@@ -48,6 +49,20 @@ class FakeMust3rAdapter(nn.Module):
         self.seen_paths = image_paths
         assert image_paths is not None
         return (torch.ones(images.shape[0], 2, images.shape[-2], images.shape[-1], device=images.device),)
+
+
+class FakeMust3rBundleAdapter(FakeMust3rAdapter):
+    def extract_features(self, images: torch.Tensor, *, image_paths=None) -> Must3rFeatureBundle:
+        self.seen_paths = image_paths
+        assert image_paths is not None
+        levels = (torch.ones(images.shape[0], 2, images.shape[-2], images.shape[-1], device=images.device),)
+        return Must3rFeatureBundle(
+            levels=levels,
+            pe2d=torch.zeros(images.shape[0], 2, images.shape[-2], images.shape[-1], device=images.device),
+            point_map=torch.zeros(images.shape[0], 3, images.shape[-2], images.shape[-1], device=images.device),
+            ray_map=torch.ones(images.shape[0], 3, images.shape[-2], images.shape[-1], device=images.device),
+            metadata={"decoder_memory": True},
+        )
 
 
 def _load_train_module():
@@ -122,6 +137,18 @@ def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = 
     return config_path
 
 
+def _write_strict_training_fixture(tmp_path: Path) -> Path:
+    config_path = _write_tiny_training_fixture(tmp_path, write_feature_cache=False)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["strict_paper"] = True
+    config["training"]["validate_every"] = 1
+    config["features"]["online"] = True
+    config["features"]["require_decoder_memory"] = False
+    config["model"]["geometry_channels"] = 4
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return config_path
+
+
 def test_training_script_runs_with_fake_adapter_and_resumes(tmp_path: Path) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path)
@@ -186,6 +213,26 @@ def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: P
     assert step == 1
     assert must3r.seen_paths is not None
     assert [path.name for path in must3r.seen_paths] == ["000.png", "001.png"]
+
+
+def test_strict_training_script_runs_with_bundle_and_validation(tmp_path: Path, capsys) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_strict_training_fixture(tmp_path)
+    must3r = FakeMust3rBundleAdapter()
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        online_must3r=True,
+        sam2_adapter=FakeSam2Adapter(),
+        must3r_adapter=must3r,
+        strict_paper=True,
+    )
+    captured = capsys.readouterr()
+
+    assert step == 1
+    assert "validation_step=1" in captured.out
 
 
 def test_training_script_writes_visualization_png(tmp_path: Path) -> None:

@@ -10,6 +10,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .feature_merger import Must3rFeatureBundle
+
 FeatureLayerSpec = str | int
 
 
@@ -25,8 +27,11 @@ class ExternalBackboneConfig:
     must3r_amp: str | bool = "bf16"
     must3r_max_bs: int = 1
     must3r_decode_batch_size: int = 1
+    must3r_memory_window: int | None = None
+    must3r_full_scene_memory: bool = False
     must3r_feature_layers: tuple[FeatureLayerSpec, ...] = ("encoder", 4, 7, 11)
     must3r_expected_channels: tuple[int, ...] | None = None
+    strict_paper: bool = False
 
 
 class ExternalDependencyError(RuntimeError):
@@ -173,6 +178,14 @@ class Sam2TrainingAdapter(nn.Module):
         if self.model is None:
             raise ExternalDependencyError("SAM2 model is not loaded")
         backbone_out = self._inject_merged_features(merged_features)
+        if self.config.strict_paper:
+            outputs = self._forward_with_official_sam2_modules(batch, merged_features, backbone_out, require_tracking=True)
+            if outputs is None:
+                raise ExternalDependencyError(
+                    "Strict paper training requires official SAM2 tracking modules: _prepare_backbone_features, "
+                    "_track_step, and _encode_memory_in_output. The per-frame SAM head fallback is disabled."
+                )
+            return outputs
         for method_name in (
             "forward_train_sequence_with_backbone",
             "forward_train_sequence_from_backbone",
@@ -264,11 +277,21 @@ class Sam2TrainingAdapter(nn.Module):
         batch: Any,
         merged_features: torch.Tensor,
         backbone_out: Any | None,
+        *,
+        require_tracking: bool = False,
     ) -> dict[str, torch.Tensor] | None:
         if backbone_out is None:
+            if require_tracking:
+                return None
             return self._forward_sam_heads_per_frame(batch, merged_features, backbone_out=None)
-        if hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step"):
+        if (
+            hasattr(self.model, "_prepare_backbone_features")
+            and hasattr(self.model, "_track_step")
+            and hasattr(self.model, "_encode_memory_in_output")
+        ):
             return self._forward_track_steps(batch, backbone_out)
+        if require_tracking:
+            return None
         return self._forward_sam_heads_per_frame(batch, merged_features, backbone_out=backbone_out)
 
     def _forward_track_steps(self, batch: Any, backbone_out: Any) -> dict[str, torch.Tensor] | None:
@@ -527,7 +550,7 @@ class Must3rFeatureAdapter(nn.Module):
         images: torch.Tensor,
         *,
         image_paths: Sequence[Path] | None = None,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
         if self.model is None:
             raise ExternalDependencyError("MUSt3R model is not loaded")
         if self._is_official_model(self.model):
@@ -548,7 +571,7 @@ class Must3rFeatureAdapter(nn.Module):
             "Must3rFeatureAdapter.extract_features for the selected MUSt3R release."
         )
 
-    def extract_features_from_paths(self, image_paths: Sequence[Path]) -> tuple[torch.Tensor, ...]:
+    def extract_features_from_paths(self, image_paths: Sequence[Path]) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
         if self.model is None:
             self.load()
         if not self._is_official_model(self.model):
@@ -566,8 +589,10 @@ class Must3rFeatureAdapter(nn.Module):
         with torch.no_grad():
             dtype = _dtype_for_must3r_amp(self.config.must3r_amp)
             with torch.autocast(device.type, dtype=dtype, enabled=self.config.must3r_amp is not False and device.type == "cuda"):
-                for start in range(0, len(image_paths), max(1, int(self.config.must3r_decode_batch_size))):
-                    end = min(len(image_paths), start + max(1, int(self.config.must3r_decode_batch_size)))
+                chunk_size = self._decode_chunk_size(len(image_paths))
+                point_chunks: list[torch.Tensor] = []
+                for start in range(0, len(image_paths), chunk_size):
+                    end = min(len(image_paths), start + chunk_size)
                     images, true_shape = self._load_official_images(image_paths[start:end], patch_size)
                     true_shape_tensor = torch.stack(true_shape, dim=0)
                     true_shape_chunks.append(true_shape_tensor)
@@ -575,7 +600,15 @@ class Must3rFeatureAdapter(nn.Module):
                     chunk_true_shape = true_shape_tensor.to(device)
                     encoder_tokens, pos = self._encode_frames(encoder, image_tensor, chunk_true_shape)
                     pos_chunks.append(pos.detach().cpu())
-                    raw_levels = self._decode_feature_levels(decoder, encoder_tokens, pos, chunk_true_shape)
+                    raw_levels, point_map = self._decode_feature_levels(
+                        decoder,
+                        encoder_tokens,
+                        pos,
+                        chunk_true_shape,
+                        return_point_map=True,
+                    )
+                    if point_map is not None:
+                        point_chunks.append(point_map)
                     if selected_indices is None:
                         selected_specs, selected_indices = self._normalize_feature_layers(len(raw_levels))
                         selected_chunks = [[] for _ in selected_indices]
@@ -599,7 +632,32 @@ class Must3rFeatureAdapter(nn.Module):
             for level, spec in zip(selected_token_levels, selected_specs, strict=True)
         )
         self._validate_expected_channels(features)
-        return tuple(feature.detach().cpu() for feature in features)
+        features = tuple(feature.detach().cpu() for feature in features)
+        if self.config.strict_paper:
+            point_map = torch.cat(point_chunks, dim=0) if point_chunks else None
+            if point_map is None:
+                raise ExternalDependencyError("Strict paper online MUSt3R extraction requires decoder point maps for PE3D")
+            pe2d = self._positions_to_chw(pos_tensor, true_shape_tensor, patch_size)
+            ray_map = self._ray_map_from_pe2d(pe2d)
+            metadata = {
+                "feature_specs": [self._feature_layer_label(spec) for spec in selected_specs],
+                "feature_channels": [int(feature.shape[1]) for feature in features],
+                "decoder_memory": self._decoder_memory_enabled(len(image_paths)),
+                "memory_window": self.config.must3r_memory_window,
+                "full_scene_memory": self.config.must3r_full_scene_memory,
+            }
+            return Must3rFeatureBundle(levels=features, pe2d=pe2d, point_map=point_map, ray_map=ray_map, metadata=metadata)
+        return features
+
+    def _decode_chunk_size(self, num_frames: int) -> int:
+        if self.config.must3r_full_scene_memory:
+            return max(1, num_frames)
+        if self.config.must3r_memory_window is not None:
+            return max(1, int(self.config.must3r_memory_window))
+        return max(1, int(self.config.must3r_decode_batch_size))
+
+    def _decoder_memory_enabled(self, num_frames: int) -> bool:
+        return self.config.must3r_full_scene_memory or self._decode_chunk_size(num_frames) > 1
 
     def _device(self) -> torch.device:
         if self.config.must3r_device is not None:
@@ -661,11 +719,18 @@ class Must3rFeatureAdapter(nn.Module):
         encoder_tokens: torch.Tensor,
         pos: torch.Tensor,
         true_shape: torch.Tensor,
-    ) -> list[torch.Tensor]:
+        *,
+        return_point_map: bool = False,
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], torch.Tensor | None]:
         if not hasattr(decoder, "forward_list"):
             raise ExternalDependencyError("MUSt3R decoder has no forward_list(..., return_feats=True) hook")
         level_chunks: list[list[torch.Tensor]] | None = None
-        decode_bs = max(1, int(self.config.must3r_decode_batch_size))
+        decode_bs = (
+            max(1, int(encoder_tokens.shape[0]))
+            if self.config.must3r_full_scene_memory or self.config.must3r_memory_window is not None
+            else max(1, int(self.config.must3r_decode_batch_size))
+        )
+        point_chunks: list[torch.Tensor] = []
         for start in range(0, encoder_tokens.shape[0], decode_bs):
             end = min(encoder_tokens.shape[0], start + decode_bs)
             output = decoder.forward_list(
@@ -676,7 +741,7 @@ class Must3rFeatureAdapter(nn.Module):
             )
             if not isinstance(output, tuple) or len(output) != 3:
                 raise ExternalDependencyError("MUSt3R decoder.forward_list did not return (memory, pointmaps, feats)")
-            _, _, grouped_feats = output
+            _, pointmaps, grouped_feats = output
             if not grouped_feats or not grouped_feats[0]:
                 raise ExternalDependencyError("MUSt3R decoder returned no feature levels")
             chunk_levels = [feature[0].detach().cpu() for feature in grouped_feats[0]]
@@ -688,10 +753,47 @@ class Must3rFeatureAdapter(nn.Module):
                 )
             for level_index, chunk in enumerate(chunk_levels):
                 level_chunks[level_index].append(chunk)
+            point_map = self._pointmaps_to_chw(pointmaps, pos[start:end], true_shape[start:end])
+            if point_map is not None:
+                point_chunks.append(point_map)
             del output, grouped_feats, chunk_levels
         if level_chunks is None:
             raise ExternalDependencyError("MUSt3R decoder returned no feature levels")
-        return [torch.cat(chunks, dim=0) for chunks in level_chunks]
+        levels = [torch.cat(chunks, dim=0) for chunks in level_chunks]
+        if return_point_map:
+            return levels, torch.cat(point_chunks, dim=0) if point_chunks else None
+        return levels
+
+    def _pointmaps_to_chw(
+        self,
+        pointmaps: Any,
+        pos: torch.Tensor,
+        true_shape: torch.Tensor,
+    ) -> torch.Tensor | None:
+        tensors: list[torch.Tensor] = []
+        self._collect_tensors(pointmaps, tensors)
+        for tensor in reversed(tensors):
+            candidate = tensor.detach().cpu()
+            if candidate.ndim == 4 and candidate.shape[0] == 1:
+                candidate = candidate[0]
+            if candidate.ndim == 3 and candidate.shape[0] == pos.shape[0] and candidate.shape[-1] >= 3:
+                return self._tokens_to_chw(candidate[..., :3], pos.detach().cpu(), true_shape.detach().cpu(), self._patch_size_from_pos(pos), "point_map")
+            if candidate.ndim == 4 and candidate.shape[0] == pos.shape[0] and candidate.shape[1] >= 3:
+                return candidate[:, :3].contiguous()
+        return None
+
+    def _collect_tensors(self, value: Any, out: list[torch.Tensor]) -> None:
+        if isinstance(value, torch.Tensor):
+            out.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                self._collect_tensors(item, out)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self._collect_tensors(item, out)
+
+    def _patch_size_from_pos(self, pos: torch.Tensor) -> int:
+        return 16
 
     def _normalize_feature_layers(self, num_levels: int) -> tuple[tuple[FeatureLayerSpec, ...], tuple[int, ...]]:
         specs: list[FeatureLayerSpec] = []
@@ -775,10 +877,31 @@ class Must3rFeatureAdapter(nn.Module):
             )
 
     def _expected_channels(self, spec: FeatureLayerSpec) -> int:
+        if spec == "point_map":
+            return 3
         return 1024 if spec == "encoder" else 768
 
     def _feature_layer_label(self, spec: FeatureLayerSpec) -> str:
         return "encoder" if spec == "encoder" else f"decoder_{spec}"
+
+    def _positions_to_chw(self, pos: torch.Tensor, true_shape: torch.Tensor, patch_size: int) -> torch.Tensor:
+        if not torch.equal(true_shape, true_shape[:1].expand_as(true_shape)):
+            raise ExternalDependencyError("All frames in one training sample must resize to the same true_shape")
+        height = int(true_shape[0, 0].item())
+        width = int(true_shape[0, 1].item())
+        grid_h = height // patch_size
+        grid_w = width // patch_size
+        if grid_h * grid_w != pos.shape[1]:
+            raise ExternalDependencyError("Could not reshape MUSt3R PE2D positions into token grid")
+        return pos.detach().cpu().transpose(1, 2).reshape(pos.shape[0], 2, grid_h, grid_w).contiguous().float()
+
+    def _ray_map_from_pe2d(self, pe2d: torch.Tensor) -> torch.Tensor:
+        pe = pe2d.float()
+        if pe.numel() > 0:
+            denom = pe.flatten(2).abs().amax(dim=2).clamp_min(1.0)[..., None, None]
+            pe = pe / denom
+        ones = torch.ones(pe.shape[0], 1, *pe.shape[-2:], dtype=pe.dtype)
+        return F.normalize(torch.cat([pe, ones], dim=1), dim=1)
 
 
 Sam2Adapter = Sam2TrainingAdapter

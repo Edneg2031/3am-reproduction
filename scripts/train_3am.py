@@ -24,6 +24,7 @@ from three_am.models.adapters import (
     _normalize_must3r_amp,
     _parse_must3r_feature_layers,
 )
+from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.models.three_am import ThreeAMConfig, ThreeAMCore
 from three_am.training.dataset import (
     TrainingBatch,
@@ -38,12 +39,19 @@ from three_am.utils.config import ProjectPaths, load_yaml
 
 
 class ThreeAMTrainingWrapper(nn.Module):
-    def __init__(self, core: ThreeAMCore, sam2_adapter: Sam2TrainingAdapter) -> None:
+    def __init__(self, core: ThreeAMCore, sam2_adapter: Sam2TrainingAdapter, *, strict_paper: bool = False) -> None:
         super().__init__()
         self.core = core
         self.sam2_adapter = sam2_adapter
+        self.strict_paper = strict_paper
 
-    def forward(self, batch: TrainingBatch, must3r_features: tuple[torch.Tensor, ...]) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        batch: TrainingBatch,
+        must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle,
+    ) -> dict[str, torch.Tensor]:
+        if self.strict_paper and not isinstance(must3r_features, Must3rFeatureBundle):
+            raise ValueError("Strict paper training requires MUSt3R features as Must3rFeatureBundle with PE2D/point/ray maps")
         sam_features = self.sam2_adapter.encode_sam_features(batch.images)
         if sam_features.ndim != 4:
             raise ValueError(f"SAM2 features must have shape TCHW, got {tuple(sam_features.shape)}")
@@ -53,12 +61,15 @@ class ThreeAMTrainingWrapper(nn.Module):
 
 def build_core(config: dict[str, Any]) -> ThreeAMCore:
     model_config = config["model"]
+    training_config = config.get("training", {})
     return ThreeAMCore(
         ThreeAMConfig(
             sam_channels=int(model_config["sam_channels"]),
             must3r_channels=tuple(int(channels) for channels in model_config["must3r_channels"]),
             hidden_channels=int(model_config["hidden_channels"]),
             attention_heads=int(model_config["attention_heads"]),
+            geometry_channels=int(model_config["geometry_channels"]) if model_config.get("geometry_channels") else None,
+            strict_paper=bool(training_config.get("strict_paper", False)),
         )
     )
 
@@ -86,10 +97,13 @@ def external_config(config: dict[str, Any], *, must3r_device: str | None = None)
         must3r_amp=_normalize_must3r_amp(features.get("amp", "bf16")),
         must3r_max_bs=int(features.get("max_bs", 1)),
         must3r_decode_batch_size=int(features.get("decode_batch_size", 1)),
+        must3r_memory_window=int(features["memory_window"]) if features.get("memory_window") else None,
+        must3r_full_scene_memory=bool(features.get("full_scene_memory", False)),
         must3r_feature_layers=_parse_must3r_feature_layers(features.get("feature_layers", "encoder,4,7,11")),
         must3r_expected_channels=tuple(int(channels) for channels in must3r_channels)
         if must3r_channels is not None
         else None,
+        strict_paper=bool(config.get("training", {}).get("strict_paper", False)),
     )
 
 
@@ -154,6 +168,7 @@ def dry_run(
     features = config.get("features", {})
     model = config.get("model", {})
     online_enabled = _online_must3r_enabled(config, online_must3r)
+    strict_paper = bool(config.get("training", {}).get("strict_paper", False))
     paths = ProjectPaths.from_config(config)
     training = config.get("training", {})
     payload = {
@@ -173,10 +188,14 @@ def dry_run(
             "sam_image_size": model.get("sam_image_size", config.get("training", {}).get("sam_image_size")),
             "sam_channels": model.get("sam_channels"),
             "must3r_channels": model.get("must3r_channels"),
+            "geometry_channels": model.get("geometry_channels"),
         },
         "features": {
             "online_must3r": online_enabled,
             "cache_enabled": not online_enabled,
+            "require_decoder_memory": bool(features.get("require_decoder_memory", False)),
+            "memory_window": features.get("memory_window"),
+            "full_scene_memory": bool(features.get("full_scene_memory", False)),
             "image_size": int(features.get("image_size", 512)),
             "amp": features.get("amp", "bf16"),
             "max_bs": int(features.get("max_bs", 1)),
@@ -199,6 +218,8 @@ def dry_run(
             "checkpoint_every": int(training.get("checkpoint_every", 5000)),
             "save_model_every": int(training.get("save_model_every", training.get("checkpoint_every", 5000))),
             "auto_resume": bool(training.get("auto_resume", False)),
+            "strict_paper": bool(training.get("strict_paper", False)),
+            "validate_every": int(training.get("validate_every", 0)),
         },
         "external": {
             "sam2_importable": _availability("sam2"),
@@ -318,6 +339,7 @@ def save_checkpoint(
         {
             "type": "three_am_training_checkpoint",
             "model_state_type": "trainable",
+            "strict_paper": bool(config.get("training", {}).get("strict_paper", False)),
             "model": _trainable_state_dict(wrapper),
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
@@ -342,6 +364,7 @@ def save_model_weights(
         {
             "type": "three_am_model_weights",
             "model_state_type": "trainable",
+            "strict_paper": bool(config.get("training", {}).get("strict_paper", False)),
             "model": state,
             "trainable_keys": sorted(state),
             "step": step,
@@ -358,10 +381,17 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: Any,
     device: torch.device,
+    expected_strict_paper: bool | None = None,
 ) -> int:
     payload = _load_torch(path, map_location=device)
     if "optimizer" not in payload:
         raise ValueError(f"{path} is a model-weights file, not a training checkpoint; resume from latest.pt or step_*.pt")
+    if expected_strict_paper is True and payload.get("strict_paper") is not True:
+        raise ValueError(
+            f"{path} is not a strict-paper training checkpoint. Start a new run or resume from a strict-paper checkpoint."
+        )
+    if expected_strict_paper is False and payload.get("strict_paper") is True:
+        raise ValueError(f"{path} is a strict-paper checkpoint; resume with training.strict_paper=true or --strict-paper.")
     _load_model_state(wrapper, payload)
     optimizer.load_state_dict(payload["optimizer"])
     if "scaler" in payload:
@@ -377,7 +407,7 @@ def _load_missing_must3r_features(
     device: torch.device,
     *,
     online_must3r: bool,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
     if batch.must3r_features is not None:
         return batch.must3r_features
     if not online_must3r:
@@ -421,19 +451,67 @@ def _load_missing_must3r_features(
             "Either generate these cache files under features.cache_root/--feature-cache, or put absolute per-frame "
             "feature paths in the manifest as must3r_feature_paths."
         ) from error
+    if isinstance(features, Must3rFeatureBundle):
+        return features.to(device)
     return tuple(feature.to(device) for feature in features)
 
 
 def _extract_online_must3r_features(
     adapter: Must3rFeatureAdapter,
     batch: TrainingBatch,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
     try:
         return adapter.extract_features(batch.images, image_paths=batch.image_paths)
     except TypeError as error:
         if "image_paths" not in str(error):
             raise
         return adapter.extract_features(batch.images)  # type: ignore[call-arg]
+
+
+def _tracking_metrics(outputs: dict[str, torch.Tensor], batch: TrainingBatch) -> dict[str, float]:
+    logits = _mask_logits_for_visualization(outputs["mask_logits"].detach(), tuple(batch.target_masks.shape[-2:]))
+    predictions = logits.sigmoid() >= 0.5
+    targets = batch.target_masks.detach() > 0.5
+    intersection = (predictions & targets).flatten(1).sum(dim=1).float()
+    union = (predictions | targets).flatten(1).sum(dim=1).float()
+    iou = torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
+    visible = batch.has_object.detach().cpu().bool()
+    visible_count = max(int(visible.sum().item()), 1)
+    tracking_recall = float(((iou.cpu() > 0.0) & visible).float().sum().item() / visible_count)
+    successful = (iou.cpu() > 0.0) & visible
+    accuracy = float(iou.cpu()[successful].mean().item()) if bool(successful.any()) else 0.0
+    return {
+        "val_iou": float(iou.mean().item()),
+        "val_tracking_recall": tracking_recall,
+        "val_accuracy": accuracy,
+    }
+
+
+def run_validation_step(
+    *,
+    wrapper: ThreeAMTrainingWrapper,
+    dataset: ThreeAMTrainingDataset,
+    must3r_adapter: Must3rFeatureAdapter | None,
+    config: dict[str, Any],
+    device: torch.device,
+    online_must3r: bool,
+) -> dict[str, float]:
+    was_training = wrapper.training
+    wrapper.eval()
+    with torch.no_grad():
+        batch = dataset.sample().to(device)
+        must3r_features = _load_missing_must3r_features(
+            batch,
+            must3r_adapter,
+            config,
+            device,
+            online_must3r=online_must3r,
+        )
+        outputs = wrapper(batch, must3r_features)
+        metrics = _tracking_metrics(outputs, batch)
+    if was_training:
+        wrapper.train()
+    return metrics
 
 
 class FeatureCacheRuntimeError(RuntimeError):
@@ -526,10 +604,11 @@ def _training_visualization_header_lines(
     mean_iou: float | None,
     visible_iou: float | None,
     tracking_recall: float | None,
+    sampling_mode: str = "unknown",
 ) -> list[str]:
     joined_frame_ids = ", ".join(frame_ids)
     return [
-        f"3AM tracking batch | step={step} dataset={dataset} scene={scene_id}",
+        f"3AM tracking batch | step={step} dataset={dataset} scene={scene_id} sampling={sampling_mode}",
         (
             f"prompt={prompt_type} ref={reference_frame} frames=[{joined_frame_ids}] "
             f"mean_iou={_format_metric(mean_iou)} visible_iou={_format_metric(visible_iou)} "
@@ -640,6 +719,7 @@ def save_training_visualization(
         mean_iou=mean_iou,
         visible_iou=visible_iou,
         tracking_recall=tracking_recall,
+        sampling_mode=batch.sampling_mode,
     )
     for line_index, line in enumerate(header_lines):
         draw.text((8, 6 + line_index * 16), line[:180], fill=(235, 235, 235))
@@ -669,11 +749,15 @@ def run_training(
     auto_resume: bool = False,
     dry_run_only: bool = False,
     online_must3r: bool | None = None,
+    strict_paper: bool | None = None,
     sam2_adapter: Sam2TrainingAdapter | None = None,
     must3r_adapter: Must3rFeatureAdapter | None = None,
 ) -> int:
     config = load_yaml(config_path)
+    if strict_paper is not None:
+        config.setdefault("training", {})["strict_paper"] = bool(strict_paper)
     online_enabled = _online_must3r_enabled(config, online_must3r)
+    strict_paper_enabled = bool(config.get("training", {}).get("strict_paper", False))
     if dry_run_only:
         dry_run(config, feature_cache, online_must3r=online_must3r)
         return 0
@@ -692,6 +776,7 @@ def run_training(
     visualize_every = int(
         visualize_every if visualize_every is not None else training_config.get("visualize_every", 0)
     )
+    validate_every = int(training_config.get("validate_every", 0))
     resolved_visualization_dir = _resolve_visualization_dir(config, visualization_dir)
     visualization_max_frames = int(training_config.get("visualization_max_frames", 4))
     visualization_max_side = int(training_config.get("visualization_max_side", 384))
@@ -701,13 +786,22 @@ def run_training(
         feature_cache_root=feature_cache,
         load_feature_cache=not online_enabled,
     )
+    validation_dataset = (
+        ThreeAMTrainingDataset.from_config(
+            config,
+            feature_cache_root=feature_cache,
+            load_feature_cache=not online_enabled,
+        )
+        if validate_every > 0
+        else None
+    )
 
     core = build_core(config)
     sam2_adapter = sam2_adapter or Sam2TrainingAdapter(external_config(config))
     must3r_adapter = must3r_adapter or Must3rFeatureAdapter(external_config(config, must3r_device=str(device)))
     if getattr(sam2_adapter, "model", object()) is None:
         sam2_adapter.load()
-    wrapper = ThreeAMTrainingWrapper(core, sam2_adapter).to(device)
+    wrapper = ThreeAMTrainingWrapper(core, sam2_adapter, strict_paper=strict_paper_enabled).to(device)
     mark_trainable_3am_modules(wrapper)
     freeze_image_encoder = getattr(wrapper.sam2_adapter, "freeze_image_encoder", None)
     if callable(freeze_image_encoder):
@@ -738,7 +832,14 @@ def run_training(
         resume_path = resolve_project_path(config, resume)
         if resume_path is None:
             raise ValueError("resume path resolved to None")
-        start_step = load_checkpoint(resume_path, wrapper=wrapper, optimizer=optimizer, scaler=scaler, device=device)
+        start_step = load_checkpoint(
+            resume_path,
+            wrapper=wrapper,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            expected_strict_paper=strict_paper_enabled,
+        )
         print(f"Resumed training from {resume_path} at step {start_step}")
 
     weights = Sam2LossWeights()
@@ -787,6 +888,16 @@ def run_training(
                     ]
                 )
             )
+        if validation_dataset is not None and validate_every > 0 and step % validate_every == 0:
+            metrics = run_validation_step(
+                wrapper=wrapper,
+                dataset=validation_dataset,
+                must3r_adapter=must3r_adapter,
+                config=config,
+                device=device,
+                online_must3r=online_enabled,
+            )
+            print(" ".join([f"validation_step={step}", *(f"{key}={value:.6f}" for key, value in metrics.items())]))
         if checkpoint_every > 0 and step % checkpoint_every == 0:
             save_checkpoint(
                 paths.checkpoints / f"step_{step}.pt",
@@ -866,6 +977,9 @@ def main() -> None:
     parser.add_argument("--auto-resume", action="store_true")
     parser.add_argument("--visualize-every", type=int, default=None)
     parser.add_argument("--visualization-dir", default=None)
+    strict_group = parser.add_mutually_exclusive_group()
+    strict_group.add_argument("--strict-paper", action="store_true", dest="strict_paper", default=None)
+    strict_group.add_argument("--no-strict-paper", action="store_false", dest="strict_paper")
     parser.add_argument(
         "--online-must3r",
         action="store_true",
@@ -892,6 +1006,7 @@ def main() -> None:
         visualization_dir=args.visualization_dir,
         dry_run_only=args.dry_run,
         online_must3r=args.online_must3r,
+        strict_paper=args.strict_paper,
     )
 
 

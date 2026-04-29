@@ -191,6 +191,41 @@ def test_sam2_adapter_falls_back_to_official_track_step_modules() -> None:
     assert model.steps[0] == (1, True)
 
 
+class FakePerFrameSam2(nn.Module):
+    def forward_image(self, images: torch.Tensor) -> torch.Tensor:
+        return torch.ones(images.shape[0], 4, 8, 8)
+
+    def _forward_sam_heads(self, **kwargs):
+        low_res = torch.zeros(1, 1, 16, 16)
+        high_res = torch.zeros(1, 1, 64, 64)
+        ious = torch.zeros(1, 1)
+        obj_ptr = torch.zeros(1, 4)
+        object_score_logits = torch.zeros(1, 1)
+        return low_res, high_res, ious, low_res, high_res, obj_ptr, object_score_logits
+
+
+def test_strict_sam2_adapter_rejects_per_frame_head_fallback() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig(strict_paper=True))
+    adapter.model = FakePerFrameSam2()
+    images = torch.randn(1, 3, 64, 64)
+    target_masks = torch.zeros(1, 64, 64)
+    batch = TrainingBatch(
+        images=images,
+        target_masks=target_masks,
+        prompt=Prompt(type="mask", frame_index=0, mask=target_masks[0]),
+        must3r_features=None,
+        dataset="scannetpp",
+        scene_id="scene_a",
+        frame_ids=("000",),
+        image_paths=(),
+        has_object=torch.tensor([False]),
+    )
+    sam_features = adapter.encode_sam_features(images)
+
+    with pytest.raises(ExternalDependencyError, match="Strict paper training requires official SAM2 tracking"):
+        adapter.forward_train_sequence(batch, sam_features)
+
+
 def test_must3r_adapter_maps_paper_layers_to_decoder_indices() -> None:
     adapter = Must3rFeatureAdapter(
         ExternalBackboneConfig(must3r_feature_layers=_parse_must3r_feature_layers("encoder,4,7,11"))

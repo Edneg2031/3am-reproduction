@@ -68,6 +68,8 @@ def test_precompute_writes_features_metadata_and_manifest(tmp_path: Path) -> Non
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=(0, 1, 2),
         write_manifest=feature_manifest,
@@ -116,6 +118,8 @@ def test_precompute_dry_run_does_not_create_output(tmp_path: Path, capsys) -> No
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=(0, 1, 2),
         write_manifest=None,
@@ -140,6 +144,8 @@ def test_official_extractor_passes_true_shape_as_list_to_decoder(tmp_path: Path)
         amp=False,
         max_bs=1,
         decode_batch_size=2,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=(0, 1),
     )
@@ -174,6 +180,8 @@ def test_official_extractor_chunks_decoder_by_decode_batch_size(tmp_path: Path) 
         amp=False,
         max_bs=1,
         decode_batch_size=2,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=(0, 1),
     )
@@ -210,6 +218,8 @@ def test_feature_layer_parser_maps_paper_specs_to_return_feats_indices(tmp_path:
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=module.parse_feature_layers("encoder,4,7,11"),
     )
@@ -234,6 +244,8 @@ def test_official_extractor_exports_paper_token_grid_features(tmp_path: Path) ->
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=module.parse_feature_layers("encoder,4,7,11"),
     )
@@ -294,6 +306,8 @@ def test_official_extractor_rejects_non_paper_channels(tmp_path: Path) -> None:
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=("encoder",),
     )
@@ -317,6 +331,8 @@ def test_official_extractor_rejects_dense_grid_features(tmp_path: Path) -> None:
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
         cache_dtype="fp16",
         feature_layers=(4,),
     )

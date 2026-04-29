@@ -52,6 +52,13 @@ def _config(tmp_path: Path, dataset: str, manifest: Path, *, fov_probability: fl
     }
 
 
+def _strict_config(tmp_path: Path, dataset: str, manifest: Path, *, fov_probability: float = 1.0) -> dict[str, object]:
+    config = _config(tmp_path, dataset, manifest, fov_probability=fov_probability)
+    config["training"] = {"strict_paper": True}
+    config["features"] = {"cache_root": "outputs/must3r_features", "require_decoder_memory": False}
+    return config
+
+
 def _dataset(tmp_path: Path, dataset: str, masks: list[np.ndarray], *, fov_probability: float = 0.0) -> ThreeAMTrainingDataset:
     manifest = tmp_path / "data" / "processed" / f"{dataset}_manifest.json"
     write_manifest(manifest, [_scene(tmp_path, dataset, masks)])
@@ -252,6 +259,59 @@ def test_training_dataset_reports_feature_channel_mismatch(tmp_path: Path) -> No
     dataset = _dataset(tmp_path, "scannetpp", [np.ones((4, 4), dtype=np.uint8), np.ones((4, 4), dtype=np.uint8)])
 
     with pytest.raises(FeatureCacheCompatibilityError, match="model.must3r_channels"):
+        dataset.sample()
+
+
+def test_strict_training_dataset_keeps_reference_as_prompt_frame_zero(tmp_path: Path) -> None:
+    masks = [np.ones((4, 4), dtype=np.uint8) for _ in range(4)]
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
+    scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
+    scene_cache.mkdir(parents=True)
+    np.save(scene_cache / "overlap.npy", np.ones((4, 4), dtype=np.float32))
+
+    dataset = ThreeAMTrainingDataset.from_config(
+        _strict_config(tmp_path, "scannetpp", manifest),
+        load_feature_cache=False,
+        rng=random.Random(0),
+    )
+    batch = dataset.sample()
+
+    assert batch.sampling_mode == "fov"
+    assert batch.prompt.frame_index == 0
+    assert batch.reference_frame_id == batch.frame_ids[0]
+
+
+def test_strict_training_dataset_applies_mask_ignore_values(tmp_path: Path) -> None:
+    mask = np.full((4, 4), 255, dtype=np.uint8)
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", [mask, mask])])
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+    config["datasets"]["scannetpp"]["mask_ignore_values"] = [255]  # type: ignore[index]
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.target_masks.sum().item() == 0
+    assert batch.has_object.tolist() == [False, False]
+
+
+def test_strict_training_dataset_rejects_cache_without_decoder_memory(tmp_path: Path) -> None:
+    masks = [np.ones((4, 4), dtype=np.uint8) for _ in range(2)]
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
+    scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
+    scene_cache.mkdir(parents=True)
+    (scene_cache / "metadata.json").write_text(
+        '{"decoder_memory": false, "feature_specs": ["decoder_0"], "feature_channels": [2]}',
+        encoding="utf-8",
+    )
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+    config["features"]["require_decoder_memory"] = True  # type: ignore[index]
+
+    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+
+    with pytest.raises(FeatureCacheCompatibilityError, match="decoder_memory=true"):
         dataset.sample()
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -12,9 +13,11 @@ from PIL import Image
 from three_am.data.io import read_manifest
 from three_am.data.sampling import SamplingConfig, choose_indices
 from three_am.data.schema import FrameRecord, SceneRecord
+from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.utils.config import ProjectPaths
 
 PromptType = Literal["mask", "point", "box"]
+SamplingMode = Literal["continuous", "fov"]
 
 
 class FeatureCacheError(RuntimeError):
@@ -26,6 +29,10 @@ class FeatureCacheMissingError(FeatureCacheError):
 
 
 class FeatureCacheCompatibilityError(FeatureCacheError):
+    pass
+
+
+class MaskCompatibilityError(RuntimeError):
     pass
 
 
@@ -59,23 +66,36 @@ class TrainingBatch:
     images: torch.Tensor
     target_masks: torch.Tensor
     prompt: Prompt
-    must3r_features: tuple[torch.Tensor, ...] | None
+    must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle | None
     dataset: str
     scene_id: str
     frame_ids: tuple[str, ...]
     image_paths: tuple[Path, ...]
     has_object: torch.Tensor
+    sampling_mode: SamplingMode = "continuous"
+    reference_frame_id: str = ""
+    instance_id: int | None = None
+    object_visibility: torch.Tensor | None = None
+    must3r_geometry: Must3rFeatureBundle | None = None
 
     def to(self, device: torch.device | str) -> "TrainingBatch":
+        must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle | None
+        if isinstance(self.must3r_features, Must3rFeatureBundle):
+            must3r_features = self.must3r_features.to(device)
+        elif self.must3r_features is not None:
+            must3r_features = tuple(feature.to(device) for feature in self.must3r_features)
+        else:
+            must3r_features = None
+        must3r_geometry = self.must3r_geometry.to(device) if self.must3r_geometry is not None else None
         return replace(
             self,
             images=self.images.to(device),
             target_masks=self.target_masks.to(device),
             prompt=self.prompt.to(device),
-            must3r_features=tuple(feature.to(device) for feature in self.must3r_features)
-            if self.must3r_features is not None
-            else None,
+            must3r_features=must3r_features,
             has_object=self.has_object.to(device),
+            object_visibility=self.object_visibility.to(device) if self.object_visibility is not None else None,
+            must3r_geometry=must3r_geometry,
         )
 
 
@@ -206,20 +226,30 @@ def load_image_tensor(path: Path, image_size: int | None = None) -> torch.Tensor
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
-def load_mask_array(path: Path | None, shape: tuple[int, int]) -> np.ndarray:
+def load_mask_array(
+    path: Path | None,
+    shape: tuple[int, int] | None = None,
+    *,
+    ignore_values: tuple[int, ...] = (),
+) -> np.ndarray:
     if path is None:
+        if shape is None:
+            raise ValueError("shape is required when mask path is None")
         return np.zeros(shape, dtype=np.int64)
     with Image.open(path) as image:
         array = np.asarray(image)
     if array.ndim == 3:
         array = array[..., 0]
-    if array.shape != shape:
+    if shape is not None and array.shape != shape:
         with Image.open(path) as image:
             resized = image.resize((shape[1], shape[0]), resample=Image.Resampling.NEAREST)
             array = np.asarray(resized)
             if array.ndim == 3:
                 array = array[..., 0]
-    return array.astype(np.int64, copy=False)
+    array = array.astype(np.int64, copy=True)
+    for value in ignore_values:
+        array[array == int(value)] = 0
+    return array
 
 
 def _mask_is_binary(mask: np.ndarray) -> bool:
@@ -261,6 +291,66 @@ def _target_mask(mask: np.ndarray, instance_id: int | None, binary_mode: bool) -
     else:
         target = (mask == instance_id).astype(np.float32)
     return torch.from_numpy(target)
+
+
+def _mask_ignore_values(config: dict[str, Any], dataset: str) -> tuple[int, ...]:
+    values = config.get("datasets", {}).get(dataset, {}).get("mask_ignore_values", ())
+    if values is None:
+        return ()
+    if isinstance(values, int):
+        return (int(values),)
+    return tuple(int(value) for value in values)
+
+
+def _strict_paper_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("training", {}).get("strict_paper", False))
+
+
+def _mask_max_foreground_ratio(config: dict[str, Any], dataset: str) -> float | None:
+    dataset_config = config.get("datasets", {}).get(dataset, {})
+    value = dataset_config.get("mask_max_foreground_ratio", config.get("training", {}).get("mask_max_foreground_ratio"))
+    if value is None:
+        return None
+    ratio = float(value)
+    return ratio if ratio > 0 else None
+
+
+def _validate_mask_foreground_ratio(mask: torch.Tensor, *, dataset: str, scene_id: str, frame_id: str, max_ratio: float | None) -> None:
+    if max_ratio is None:
+        return
+    ratio = float(mask.float().mean().item())
+    if ratio > max_ratio:
+        raise MaskCompatibilityError(
+            f"Target mask for {dataset}/{scene_id}/{frame_id} covers {ratio:.3f} of the image, "
+            f"above mask_max_foreground_ratio={max_ratio:.3f}. Check mask_path, RGB label images, "
+            "or datasets.<name>.mask_ignore_values."
+        )
+
+
+def _load_depth_array(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        depth = np.asarray(image).astype(np.float32)
+    if np.nanmax(depth) > 100:
+        depth = depth / 1000.0
+    return depth
+
+
+def _load_matrix(path: Path) -> np.ndarray:
+    return np.loadtxt(path, dtype=np.float64)
+
+
+def _backproject_masked_points(depth: np.ndarray, mask: np.ndarray, intrinsics: np.ndarray, pose: np.ndarray) -> np.ndarray:
+    valid = mask & np.isfinite(depth) & (depth > 0)
+    if not valid.any():
+        return np.empty((0, 4), dtype=np.float64)
+    ys, xs = np.nonzero(valid)
+    z = depth[ys, xs].astype(np.float64)
+    fx, fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
+    cx, cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
+    x = (xs.astype(np.float64) - cx) * z / fx
+    y = (ys.astype(np.float64) - cy) * z / fy
+    points_camera = np.stack([x, y, z, np.ones_like(z)], axis=1)
+    return (pose @ points_camera.T).T
 
 
 def _bbox_from_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -320,10 +410,21 @@ def _load_tensor(path: Path) -> torch.Tensor:
 
 
 class Must3rFeatureCache:
-    def __init__(self, root: Path, expected_channels: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        expected_channels: tuple[int, ...],
+        *,
+        strict_paper: bool = False,
+        require_decoder_memory: bool = False,
+        expected_feature_specs: tuple[Any, ...] = ("encoder", 4, 7, 11),
+    ) -> None:
         self.root = root
         self.expected_channels = expected_channels
         self.num_levels = len(expected_channels)
+        self.strict_paper = strict_paper
+        self.require_decoder_memory = require_decoder_memory
+        self.expected_feature_specs = tuple(_feature_spec_label(spec) for spec in expected_feature_specs)
 
     def scene_dir(self, scene: SceneRecord) -> Path:
         return self.root / scene.dataset / scene.scene_id
@@ -334,9 +435,12 @@ class Must3rFeatureCache:
             return None
         return np.load(path)
 
-    def load(self, scene: SceneRecord, frames: list[FrameRecord]) -> tuple[torch.Tensor, ...]:
+    def load(self, scene: SceneRecord, frames: list[FrameRecord]) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
+        metadata = self._metadata(scene)
+        self._validate_metadata(scene, metadata)
         if all(frame.must3r_feature_paths for frame in frames):
-            return self._load_from_manifest_paths(frames)
+            levels = self._load_from_manifest_paths(frames)
+            return self._bundle_if_strict(scene, frames, levels, metadata)
         scene_dir = self.scene_dir(scene)
         levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
         missing: list[Path] = []
@@ -351,7 +455,8 @@ class Must3rFeatureCache:
             preview = ", ".join(str(path) for path in missing[:3])
             suffix = "" if len(missing) <= 3 else f", ... ({len(missing)} total)"
             raise FeatureCacheMissingError(f"Missing MUSt3R feature cache files: {preview}{suffix}")
-        return self._stack_and_validate(levels)
+        stacked = self._stack_and_validate(levels)
+        return self._bundle_if_strict(scene, frames, stacked, metadata)
 
     def expected_paths(self, dataset: str, scene_id: str, frame_ids: tuple[str, ...]) -> list[Path]:
         scene_dir = self.root / dataset / scene_id
@@ -388,6 +493,86 @@ class Must3rFeatureCache:
             )
         return stacked
 
+    def _metadata(self, scene: SceneRecord) -> dict[str, Any] | None:
+        path = self.scene_dir(scene) / "metadata.json"
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else None
+
+    def _validate_metadata(self, scene: SceneRecord, metadata: dict[str, Any] | None) -> None:
+        if not self.strict_paper:
+            return
+        if metadata is None:
+            raise FeatureCacheCompatibilityError(
+                f"Strict paper training requires MUSt3R cache metadata.json for {scene.dataset}/{scene.scene_id}"
+            )
+        if self.require_decoder_memory and metadata.get("decoder_memory") is not True:
+            raise FeatureCacheCompatibilityError(
+                f"Strict paper training requires decoder_memory=true MUSt3R cache for {scene.dataset}/{scene.scene_id}; "
+                "regenerate with scripts/precompute_must3r_features.py --memory-window K or --full-scene-memory."
+            )
+        actual_specs = metadata.get("feature_specs", metadata.get("feature_layers"))
+        if actual_specs is None:
+            raise FeatureCacheCompatibilityError("MUSt3R metadata is missing feature_specs/feature_layers")
+        actual_labels = tuple(_feature_spec_label(spec) for spec in actual_specs)
+        if actual_labels != self.expected_feature_specs:
+            raise FeatureCacheCompatibilityError(
+                f"MUSt3R feature layer mismatch: cache has {list(actual_labels)}, "
+                f"expected {list(self.expected_feature_specs)}"
+            )
+        channels = tuple(int(value) for value in metadata.get("feature_channels", ()))
+        if channels and channels != self.expected_channels:
+            raise FeatureCacheCompatibilityError(
+                f"MUSt3R metadata channel mismatch: cache has {list(channels)}, expected {list(self.expected_channels)}"
+            )
+
+    def _bundle_if_strict(
+        self,
+        scene: SceneRecord,
+        frames: list[FrameRecord],
+        levels: tuple[torch.Tensor, ...],
+        metadata: dict[str, Any] | None,
+    ) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
+        if not self.strict_paper:
+            return levels
+        geometry = self._load_geometry(scene, frames)
+        return Must3rFeatureBundle(levels=levels, metadata=metadata, **geometry)
+
+    def _load_geometry(self, scene: SceneRecord, frames: list[FrameRecord]) -> dict[str, torch.Tensor]:
+        scene_dir = self.scene_dir(scene)
+        tensors: dict[str, list[torch.Tensor]] = {"pe2d": [], "point_map": [], "ray_map": []}
+        missing: list[Path] = []
+        for frame in frames:
+            for key in tensors:
+                path = scene_dir / f"{frame.frame_id}_{key}.pt"
+                if not path.exists():
+                    missing.append(path)
+                    continue
+                tensors[key].append(_load_tensor(path))
+        if missing:
+            preview = ", ".join(str(path) for path in missing[:3])
+            suffix = "" if len(missing) <= 3 else f", ... ({len(missing)} total)"
+            raise FeatureCacheCompatibilityError(
+                f"Strict paper training requires MUSt3R PE2D/point/ray geometry cache files: {preview}{suffix}"
+            )
+        return {key: torch.stack(value, dim=0) for key, value in tensors.items()}
+
+
+def _feature_spec_label(spec: Any) -> str:
+    if isinstance(spec, str):
+        lowered = spec.lower()
+        if lowered == "encoder":
+            return "encoder"
+        if lowered.startswith("decoder_"):
+            return lowered
+        try:
+            return f"decoder_{int(lowered)}"
+        except ValueError:
+            return lowered
+    return f"decoder_{int(spec)}"
+
 
 class ThreeAMTrainingDataset:
     def __init__(
@@ -407,7 +592,16 @@ class ThreeAMTrainingDataset:
         self.rng = rng or random
         model_config = config.get("model", {})
         must3r_channels = tuple(model_config.get("must3r_channels", (256, 512, 768)))
-        self.feature_cache = Must3rFeatureCache(feature_cache_root, expected_channels=tuple(int(c) for c in must3r_channels))
+        self.strict_paper = _strict_paper_enabled(config)
+        self.feature_cache = Must3rFeatureCache(
+            feature_cache_root,
+            expected_channels=tuple(int(c) for c in must3r_channels),
+            strict_paper=self.strict_paper,
+            require_decoder_memory=bool(config.get("features", {}).get("require_decoder_memory", False)),
+            expected_feature_specs=tuple(config.get("features", {}).get("feature_layers", "encoder,4,7,11").split(","))
+            if isinstance(config.get("features", {}).get("feature_layers", "encoder,4,7,11"), str)
+            else tuple(config.get("features", {}).get("feature_layers", ("encoder", 4, 7, 11))),
+        )
         self.sam_image_size = _configured_sam_image_size(config)
 
     @classmethod
@@ -428,6 +622,11 @@ class ThreeAMTrainingDataset:
         )
 
     def sample(self) -> TrainingBatch:
+        if self.strict_paper:
+            return self._sample_strict_paper()
+        return self._sample_compatible()
+
+    def _sample_compatible(self) -> TrainingBatch:
         scene = self.rng.choice(self.scenes)
         frames = list(scene.frames)
         sampling_config = self._sampling_config(scene)
@@ -438,9 +637,19 @@ class ThreeAMTrainingDataset:
         image_shape = tuple(images[0].shape[-2:])
         if any(tuple(image.shape[-2:]) != image_shape for image in images):
             raise ValueError(f"Scene {scene.scene_id} produced variable image sizes in one training sample")
-        mask_arrays = [load_mask_array(frame.mask_path, image_shape) for frame in selected_frames]
+        ignore_values = _mask_ignore_values(self.config, scene.dataset)
+        mask_arrays = [load_mask_array(frame.mask_path, image_shape, ignore_values=ignore_values) for frame in selected_frames]
         reference_index, instance_id, binary_mode = _select_reference(mask_arrays, self.rng)
         target_masks = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
+        max_ratio = _mask_max_foreground_ratio(self.config, scene.dataset)
+        for frame, target in zip(selected_frames, target_masks, strict=True):
+            _validate_mask_foreground_ratio(
+                target,
+                dataset=scene.dataset,
+                scene_id=scene.scene_id,
+                frame_id=frame.frame_id,
+                max_ratio=max_ratio,
+            )
         prompt = build_prompt(scene.dataset, target_masks[reference_index], reference_index, self.rng)
         has_object = target_masks.flatten(1).any(dim=1)
         must3r_features = None
@@ -449,6 +658,7 @@ class ThreeAMTrainingDataset:
                 must3r_features = self.feature_cache.load(scene, selected_frames)
             except FeatureCacheMissingError:
                 must3r_features = None
+        reference_frame_id = selected_frames[reference_index].frame_id if selected_frames else ""
         return TrainingBatch(
             images=torch.stack(images, dim=0),
             target_masks=target_masks,
@@ -459,7 +669,174 @@ class ThreeAMTrainingDataset:
             frame_ids=tuple(frame.frame_id for frame in selected_frames),
             image_paths=tuple(frame.image_path for frame in selected_frames),
             has_object=has_object,
+            sampling_mode="fov" if overlap is not None and len(selected_indices) > 1 else "continuous",
+            reference_frame_id=reference_frame_id,
+            instance_id=instance_id,
+            object_visibility=has_object,
+            must3r_geometry=must3r_features if isinstance(must3r_features, Must3rFeatureBundle) else None,
         )
+
+    def _sample_strict_paper(self) -> TrainingBatch:
+        scene = self.rng.choice(self.scenes)
+        frames = list(scene.frames)
+        sampling_config = self._sampling_config(scene)
+        ignore_values = _mask_ignore_values(self.config, scene.dataset)
+        raw_masks = [load_mask_array(frame.mask_path, ignore_values=ignore_values) for frame in frames]
+        use_fov = (
+            scene.dataset in {"scannetpp", "ase"}
+            and sampling_config.fov_sampling_probability > 0
+            and self._random_float() < sampling_config.fov_sampling_probability
+        )
+        if use_fov:
+            selected_indices, instance_id, binary_mode = self._select_strict_fov_indices(scene, raw_masks, sampling_config)
+            sampling_mode: SamplingMode = "fov"
+        else:
+            selected_indices = self._select_strict_continuous_indices(len(frames), sampling_config.sequence_length)
+            reference_mask = raw_masks[selected_indices[0]]
+            instance_id, binary_mode = self._select_instance_from_mask(reference_mask)
+            sampling_mode = "continuous"
+        selected_frames = [frames[index] for index in selected_indices]
+        images = [load_image_tensor(frame.image_path, self.sam_image_size) for frame in selected_frames]
+        image_shape = tuple(images[0].shape[-2:])
+        mask_arrays = [load_mask_array(frame.mask_path, image_shape, ignore_values=ignore_values) for frame in selected_frames]
+        target_masks = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
+        max_ratio = _mask_max_foreground_ratio(self.config, scene.dataset)
+        for frame, target in zip(selected_frames, target_masks, strict=True):
+            _validate_mask_foreground_ratio(
+                target,
+                dataset=scene.dataset,
+                scene_id=scene.scene_id,
+                frame_id=frame.frame_id,
+                max_ratio=max_ratio,
+            )
+        prompt = build_prompt(scene.dataset, target_masks[0], 0, self.rng)
+        has_object = target_masks.flatten(1).any(dim=1)
+        must3r_features = None
+        if self.load_feature_cache:
+            must3r_features = self.feature_cache.load(scene, selected_frames)
+        reference_frame_id = selected_frames[0].frame_id if selected_frames else ""
+        return TrainingBatch(
+            images=torch.stack(images, dim=0),
+            target_masks=target_masks,
+            prompt=prompt,
+            must3r_features=must3r_features,
+            dataset=scene.dataset,
+            scene_id=scene.scene_id,
+            frame_ids=tuple(frame.frame_id for frame in selected_frames),
+            image_paths=tuple(frame.image_path for frame in selected_frames),
+            has_object=has_object,
+            sampling_mode=sampling_mode,
+            reference_frame_id=reference_frame_id,
+            instance_id=instance_id,
+            object_visibility=has_object,
+            must3r_geometry=must3r_features if isinstance(must3r_features, Must3rFeatureBundle) else None,
+        )
+
+    def _select_strict_continuous_indices(self, num_frames: int, sequence_length: int) -> list[int]:
+        if num_frames <= 0:
+            raise ValueError("num_frames must be positive")
+        max_start = max(0, num_frames - sequence_length)
+        start = self.rng.randrange(max_start + 1) if hasattr(self.rng, "randrange") else random.randrange(max_start + 1)
+        return list(range(start, min(num_frames, start + sequence_length)))
+
+    def _select_instance_from_mask(self, mask: np.ndarray) -> tuple[int | None, bool]:
+        ids = _candidate_instance_ids(mask)
+        if not ids:
+            return None, True
+        if _mask_is_binary(mask):
+            return 1, True
+        return int(self.rng.choice(ids)), False
+
+    def _select_strict_fov_indices(
+        self,
+        scene: SceneRecord,
+        raw_masks: list[np.ndarray],
+        sampling_config: SamplingConfig,
+    ) -> tuple[list[int], int | None, bool]:
+        frames = list(scene.frames)
+        references: list[int] = [index for index, mask in enumerate(raw_masks) if _candidate_instance_ids(mask)]
+        if not references:
+            indices = self._select_strict_continuous_indices(len(frames), sampling_config.sequence_length)
+            return indices, None, True
+        reference_index = int(self.rng.choice(references))
+        instance_id, binary_mode = self._select_instance_from_mask(raw_masks[reference_index])
+        selected = [reference_index]
+        eligible: list[tuple[float, int]] = []
+        for candidate_index, candidate_mask in enumerate(raw_masks):
+            if candidate_index == reference_index:
+                continue
+            target = _target_mask(candidate_mask, instance_id, binary_mode).numpy() > 0.5
+            if not target.any():
+                eligible.append((0.0, candidate_index))
+                continue
+            overlap = self._target_fov_overlap(scene, reference_index, candidate_index, target)
+            if overlap >= sampling_config.fov_threshold:
+                eligible.append((overlap, candidate_index))
+        self._shuffle(eligible)
+        eligible.sort(key=lambda item: item[0], reverse=True)
+        for _, candidate_index in eligible:
+            if len(selected) >= sampling_config.sequence_length:
+                break
+            selected.append(candidate_index)
+        if len(selected) < min(sampling_config.sequence_length, len(frames)):
+            fallback = self._select_strict_continuous_indices(len(frames), sampling_config.sequence_length)
+            for index in fallback:
+                if index not in selected and len(selected) < sampling_config.sequence_length:
+                    selected.append(index)
+        return selected, instance_id, binary_mode
+
+    def _target_fov_overlap(
+        self,
+        scene: SceneRecord,
+        reference_index: int,
+        candidate_index: int,
+        candidate_target_mask: np.ndarray,
+    ) -> float:
+        frames = list(scene.frames)
+        ref = frames[reference_index]
+        candidate = frames[candidate_index]
+        if not (ref.depth_path and ref.pose_path and ref.intrinsics_path and candidate.depth_path and candidate.pose_path and candidate.intrinsics_path):
+            overlap = self.feature_cache.overlap_matrix(scene)
+            if overlap is None:
+                return 0.0
+            return float(overlap[reference_index, candidate_index])
+        depth = _load_depth_array(candidate.depth_path)
+        if candidate_target_mask.shape != depth.shape:
+            resized = Image.fromarray(candidate_target_mask.astype(np.uint8)).resize(
+                (depth.shape[1], depth.shape[0]), resample=Image.Resampling.NEAREST
+            )
+            candidate_target_mask = np.asarray(resized) > 0
+        points_world = _backproject_masked_points(
+            depth,
+            candidate_target_mask,
+            _load_matrix(candidate.intrinsics_path),
+            _load_matrix(candidate.pose_path),
+        )
+        if points_world.size == 0:
+            return 0.0
+        ref_depth = _load_depth_array(ref.depth_path)
+        ref_pose_inv = np.linalg.inv(_load_matrix(ref.pose_path))
+        ref_k = _load_matrix(ref.intrinsics_path)
+        points_ref = (ref_pose_inv @ points_world.T).T[:, :3]
+        z = points_ref[:, 2]
+        valid_z = z > 1e-6
+        projected = (ref_k @ points_ref.T).T
+        u = projected[:, 0] / np.maximum(projected[:, 2], 1e-6)
+        v = projected[:, 1] / np.maximum(projected[:, 2], 1e-6)
+        ref_h, ref_w = ref_depth.shape
+        inside = valid_z & (u >= 0) & (u < ref_w) & (v >= 0) & (v < ref_h)
+        return float(inside.mean())
+
+    def _random_float(self) -> float:
+        method = getattr(self.rng, "random", None)
+        return float(method()) if callable(method) else random.random()
+
+    def _shuffle(self, values: list[Any]) -> None:
+        method = getattr(self.rng, "shuffle", None)
+        if callable(method):
+            method(values)
+        else:
+            random.shuffle(values)
 
     def _sampling_config(self, scene: SceneRecord) -> SamplingConfig:
         global_sampling = self.config.get("sampling", {})

@@ -21,6 +21,7 @@ datasets:
     manifest: data/processed/scannetpp_manifest.json
     scenes: 855
     fov_sampling_probability: 0.8
+    mask_ignore_values: []
   ase:
     root: data/raw/ase
     processed: data/processed/ase
@@ -28,12 +29,14 @@ datasets:
     scenes: 2612
     estimated_size: 23TB
     fov_sampling_probability: 0.8
+    mask_ignore_values: []
   mose:
     root: data/raw/mose
     processed: data/processed/mose
     manifest: data/processed/mose_manifest.json
     videos: 1453
     fov_sampling_probability: 0.0
+    mask_ignore_values: []
   replica:
     root: data/raw/replica
     processed: data/processed/replica
@@ -42,10 +45,14 @@ datasets:
 sampling:
   fov_threshold: 0.25
   sequence_length: 8
+  require_reference_first: true
 
 features:
   cache_root: outputs/must3r_features
   online: false
+  require_decoder_memory: true
+  memory_window: 8
+  full_scene_memory: false
   image_size: 512
   amp: bf16
   max_bs: 1
@@ -57,9 +64,11 @@ model:
   sam_channels: 256
   must3r_channels: [1024, 768, 768, 768]
   hidden_channels: 256
+  geometry_channels: 768
   attention_heads: 8
 
 training:
+  strict_paper: true
   iterations: 1000000
   batch_size: 1
   optimizer: AdamW
@@ -71,6 +80,8 @@ training:
   log_every: 50
   checkpoint_every: 5000
   save_model_every: 5000
+  validate_every: 0
+  validation_scenes: []
   auto_resume: false
   model_out: outputs/checkpoints/3am_model.pt
   visualize_every: 0
