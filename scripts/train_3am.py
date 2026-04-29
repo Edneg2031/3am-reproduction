@@ -475,6 +475,81 @@ def _overlay_mask(image: np.ndarray, mask: torch.Tensor, color: tuple[int, int, 
     return blended.round().clip(0, 255).astype(np.uint8)
 
 
+def _match_error_overlay(
+    image: np.ndarray,
+    target_mask: torch.Tensor,
+    prediction: torch.Tensor,
+    *,
+    threshold: float = 0.5,
+) -> np.ndarray:
+    target = target_mask.detach().float().cpu().numpy() > 0.5
+    pred = prediction.detach().float().cpu().numpy() >= threshold
+    if target.shape != pred.shape:
+        raise ValueError(f"target and prediction masks must have the same shape, got {target.shape} and {pred.shape}")
+    overlay = image.astype(np.float32).copy()
+    alpha = 0.65
+    categories = (
+        (target & pred, np.asarray((255, 220, 0), dtype=np.float32)),
+        (target & ~pred, np.asarray((0, 220, 80), dtype=np.float32)),
+        (~target & pred, np.asarray((255, 60, 40), dtype=np.float32)),
+    )
+    for category_mask, color in categories:
+        if category_mask.any():
+            overlay[category_mask] = overlay[category_mask] * (1.0 - alpha) + color * alpha
+    return overlay.round().clip(0, 255).astype(np.uint8)
+
+
+def _binary_iou_by_frame(predictions: torch.Tensor, targets: torch.Tensor, *, threshold: float = 0.5) -> torch.Tensor:
+    if predictions.shape != targets.shape:
+        raise ValueError(f"predictions and targets must have the same shape, got {predictions.shape} and {targets.shape}")
+    pred = predictions.detach().float().cpu() >= threshold
+    target = targets.detach().float().cpu() > 0.5
+    intersection = (pred & target).flatten(1).sum(dim=1).float()
+    union = (pred | target).flatten(1).sum(dim=1).float()
+    return torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
+
+
+def _format_metric(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"
+
+
+def _training_visualization_header_lines(
+    *,
+    step: int,
+    dataset: str,
+    scene_id: str,
+    prompt_type: str,
+    reference_frame: str,
+    frame_ids: tuple[str, ...],
+    mean_iou: float | None,
+    visible_iou: float | None,
+    tracking_recall: float | None,
+) -> list[str]:
+    joined_frame_ids = ", ".join(frame_ids)
+    return [
+        f"3AM tracking batch | step={step} dataset={dataset} scene={scene_id}",
+        (
+            f"prompt={prompt_type} ref={reference_frame} frames=[{joined_frame_ids}] "
+            f"mean_iou={_format_metric(mean_iou)} visible_iou={_format_metric(visible_iou)} "
+            f"tracking_recall_like={_format_metric(tracking_recall)}"
+        ),
+        "colors: GT=green prediction=red overlap=yellow gt-only=green pred-only=red",
+    ]
+
+
+def _visualization_frame_order(num_frames: int, reference_index: int, max_frames: int) -> list[int]:
+    if num_frames <= 0:
+        return []
+    reference_index = min(max(reference_index, 0), num_frames - 1)
+    limit = min(num_frames, max(1, max_frames))
+    order = [reference_index]
+    order.extend(index for index in range(reference_index + 1, num_frames))
+    order.extend(index for index in range(reference_index - 1, -1, -1))
+    return order[:limit]
+
+
 def _resize_for_visualization(image: Image.Image, max_side: int) -> Image.Image:
     if max_side <= 0:
         return image
@@ -499,39 +574,78 @@ def save_training_visualization(
     target_masks = batch.target_masks.detach()
     logits = _mask_logits_for_visualization(outputs["mask_logits"].detach(), tuple(target_masks.shape[-2:]))
     probabilities = logits.sigmoid()
-    frame_count = min(int(images.shape[0]), max(1, max_frames))
+    num_frames = int(images.shape[0])
+    reference_index = min(max(int(batch.prompt.frame_index), 0), max(num_frames - 1, 0))
+    frame_order = _visualization_frame_order(num_frames, reference_index, max_frames)
+    ious = _binary_iou_by_frame(probabilities, target_masks)
+    has_object = batch.has_object.detach().cpu().bool()
+    mean_iou = float(ious.mean().item()) if ious.numel() else None
+    visible_iou = float(ious[has_object].mean().item()) if bool(has_object.any()) else None
+    tracking_recall = (
+        float(((ious > 0.0) & has_object).float().sum().item() / has_object.float().sum().item())
+        if bool(has_object.any())
+        else None
+    )
     rows: list[Image.Image] = []
-    for frame_index in range(frame_count):
+    for frame_index in frame_order:
         base = _tensor_image_to_uint8(images[frame_index])
         gt_overlay = _overlay_mask(base, target_masks[frame_index], (0, 220, 80))
         pred_overlay = _overlay_mask(base, probabilities[frame_index], (255, 60, 40))
+        match_overlay = _match_error_overlay(base, target_masks[frame_index], probabilities[frame_index])
         panels = [
             _resize_for_visualization(Image.fromarray(base), max_side),
             _resize_for_visualization(Image.fromarray(gt_overlay), max_side),
             _resize_for_visualization(Image.fromarray(pred_overlay), max_side),
+            _resize_for_visualization(Image.fromarray(match_overlay), max_side),
         ]
         row_width = sum(panel.width for panel in panels)
         row_height = max(panel.height for panel in panels)
-        row = Image.new("RGB", (row_width, row_height + 22), (24, 24, 24))
+        label_height = 38
+        row = Image.new("RGB", (row_width, row_height + label_height), (24, 24, 24))
         draw = ImageDraw.Draw(row)
+        frame_id = batch.frame_ids[frame_index]
+        is_reference = frame_index == reference_index
+        visibility = "visible GT" if bool(has_object[frame_index]) else "absent GT"
+        frame_label = f"image | frame {frame_id}"
+        if is_reference:
+            frame_label = f"image | REF/PROMPT {batch.prompt.type} {frame_id}"
         labels = [
-            f"frame {batch.frame_ids[frame_index]}",
+            frame_label,
             "gt mask",
             "prediction",
+            "match/error",
         ]
+        detail = f"IoU={ious[frame_index].item():.3f} | {visibility}"
         x = 0
         for panel, label in zip(panels, labels, strict=True):
-            row.paste(panel, (x, 22))
-            suffix = " prompt" if frame_index == batch.prompt.frame_index and label.startswith("frame") else ""
-            draw.text((x + 4, 4), label + suffix, fill=(235, 235, 235))
+            row.paste(panel, (x, label_height))
+            fill = (255, 236, 120) if is_reference and "REF/PROMPT" in label else (235, 235, 235)
+            draw.text((x + 4, 4), label, fill=fill)
+            draw.text((x + 4, 20), detail if label.startswith("image") else "", fill=(205, 205, 205))
             x += panel.width
         rows.append(row)
-    canvas_width = max(row.width for row in rows)
-    canvas_height = sum(row.height for row in rows)
+    canvas_width = max(720, *(row.width for row in rows))
+    header_height = 58
+    canvas_height = header_height + sum(row.height for row in rows)
     canvas = Image.new("RGB", (canvas_width, canvas_height), (24, 24, 24))
+    draw = ImageDraw.Draw(canvas)
+    reference_frame = batch.frame_ids[reference_index] if 0 <= reference_index < len(batch.frame_ids) else str(reference_index)
+    header_lines = _training_visualization_header_lines(
+        step=step,
+        dataset=batch.dataset,
+        scene_id=batch.scene_id,
+        prompt_type=batch.prompt.type,
+        reference_frame=reference_frame,
+        frame_ids=batch.frame_ids,
+        mean_iou=mean_iou,
+        visible_iou=visible_iou,
+        tracking_recall=tracking_recall,
+    )
+    for line_index, line in enumerate(header_lines):
+        draw.text((8, 6 + line_index * 16), line[:180], fill=(235, 235, 235))
     y = 0
     for row in rows:
-        canvas.paste(row, (0, y))
+        canvas.paste(row, (0, header_height + y))
         y += row.height
     safe_scene = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in batch.scene_id)
     path = output_dir / f"step_{step:07d}_{batch.dataset}_{safe_scene}.png"

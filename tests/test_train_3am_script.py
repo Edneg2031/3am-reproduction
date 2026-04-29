@@ -206,8 +206,58 @@ def test_training_script_writes_visualization_png(tmp_path: Path) -> None:
     assert step == 1
     assert len(files) == 1
     with Image.open(files[0]) as image:
-        assert image.size[0] > 0
-        assert image.size[1] > 0
+        assert image.size[0] >= 720
+        assert image.size[1] > 58
+
+
+def test_training_visualization_header_lines_include_tracking_context() -> None:
+    train_3am = _load_train_module()
+
+    lines = train_3am._training_visualization_header_lines(
+        step=12,
+        dataset="scannetpp",
+        scene_id="scene_a",
+        prompt_type="mask",
+        reference_frame="001",
+        frame_ids=("000", "001", "002"),
+        mean_iou=0.5,
+        visible_iou=0.25,
+        tracking_recall=1.0,
+    )
+    text = "\n".join(lines)
+
+    assert "3AM tracking batch" in text
+    assert "prompt=mask" in text
+    assert "ref=001" in text
+    assert "frames=[000, 001, 002]" in text
+    assert "mean_iou=0.500" in text
+    assert "visible_iou=0.250" in text
+    assert "tracking_recall_like=1.000" in text
+
+
+def test_training_visualization_frame_order_starts_from_reference() -> None:
+    train_3am = _load_train_module()
+
+    assert train_3am._visualization_frame_order(5, 2, 4) == [2, 3, 4, 1]
+    assert train_3am._visualization_frame_order(3, 99, 3) == [2, 1, 0]
+
+
+def test_match_error_overlay_color_semantics() -> None:
+    train_3am = _load_train_module()
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+    target = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
+    prediction = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+
+    overlay = train_3am._match_error_overlay(image, target, prediction)
+    overlap = overlay[0, 0]
+    gt_only = overlay[0, 1]
+    pred_only = overlay[1, 0]
+    background = overlay[1, 1]
+
+    assert overlap[0] > 100 and overlap[1] > 100 and overlap[2] < 50
+    assert gt_only[1] > gt_only[0] and gt_only[1] > gt_only[2]
+    assert pred_only[0] > pred_only[1] and pred_only[0] > pred_only[2]
+    assert np.array_equal(background, np.zeros(3, dtype=np.uint8))
 
 
 def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
