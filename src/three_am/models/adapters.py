@@ -775,13 +775,64 @@ class Must3rFeatureAdapter(nn.Module):
         self._collect_tensors(pointmaps, tensors)
         for tensor in reversed(tensors):
             candidate = tensor.detach().cpu()
-            if candidate.ndim == 4 and candidate.shape[0] == 1:
-                candidate = candidate[0]
-            if candidate.ndim == 3 and candidate.shape[0] == pos.shape[0] and candidate.shape[-1] >= 3:
-                return self._tokens_to_chw(candidate[..., :3], pos.detach().cpu(), true_shape.detach().cpu(), self._patch_size_from_pos(pos), "point_map")
-            if candidate.ndim == 4 and candidate.shape[0] == pos.shape[0] and candidate.shape[1] >= 3:
-                return candidate[:, :3].contiguous()
+            point_map = self._candidate_pointmap_to_chw(
+                candidate,
+                pos.detach().cpu(),
+                true_shape.detach().cpu(),
+            )
+            if point_map is not None:
+                return point_map
         return None
+
+    def _candidate_pointmap_to_chw(
+        self,
+        candidate: torch.Tensor,
+        pos: torch.Tensor,
+        true_shape: torch.Tensor,
+    ) -> torch.Tensor | None:
+        patch_size = self._patch_size_from_pos(pos)
+        num_frames = int(pos.shape[0])
+        if candidate.ndim == 5 and candidate.shape[0] == 1:
+            candidate = candidate[0]
+        elif candidate.ndim == 5 and candidate.shape[0] * candidate.shape[1] == num_frames:
+            candidate = candidate.reshape(num_frames, *candidate.shape[2:])
+        if candidate.ndim == 3 and candidate.shape[0] == num_frames and candidate.shape[-1] >= 3:
+            return self._tokens_to_chw(candidate[..., :3], pos, true_shape, patch_size, "point_map")
+        if candidate.ndim != 4 or candidate.shape[0] != num_frames:
+            return None
+        grid_h, grid_w = self._grid_shape(true_shape, patch_size)
+        height = int(true_shape[0, 0].item())
+        width = int(true_shape[0, 1].item())
+        if candidate.shape[1] >= 3 and self._looks_like_pointmap_spatial(candidate.shape[-2:], height, width, grid_h, grid_w):
+            return self._resize_pointmap_to_grid(candidate[:, :3].contiguous(), grid_h, grid_w)
+        if candidate.shape[-1] >= 3 and self._looks_like_pointmap_spatial(candidate.shape[1:3], height, width, grid_h, grid_w):
+            return self._resize_pointmap_to_grid(candidate[..., :3].permute(0, 3, 1, 2).contiguous(), grid_h, grid_w)
+        return None
+
+    def _grid_shape(self, true_shape: torch.Tensor, patch_size: int) -> tuple[int, int]:
+        if not torch.equal(true_shape, true_shape[:1].expand_as(true_shape)):
+            raise ExternalDependencyError("All frames in one training sample must resize to the same true_shape")
+        height = int(true_shape[0, 0].item())
+        width = int(true_shape[0, 1].item())
+        return height // patch_size, width // patch_size
+
+    def _looks_like_pointmap_spatial(
+        self,
+        spatial: torch.Size | tuple[int, int],
+        height: int,
+        width: int,
+        grid_h: int,
+        grid_w: int,
+    ) -> bool:
+        if len(spatial) != 2:
+            return False
+        shape = (int(spatial[0]), int(spatial[1]))
+        return shape in {(height, width), (grid_h, grid_w)}
+
+    def _resize_pointmap_to_grid(self, point_map: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
+        if tuple(point_map.shape[-2:]) == (grid_h, grid_w):
+            return point_map.float().contiguous()
+        return F.interpolate(point_map.float(), size=(grid_h, grid_w), mode="area").contiguous()
 
     def _collect_tensors(self, value: Any, out: list[torch.Tensor]) -> None:
         if isinstance(value, torch.Tensor):
@@ -886,12 +937,7 @@ class Must3rFeatureAdapter(nn.Module):
         return "encoder" if spec == "encoder" else f"decoder_{spec}"
 
     def _positions_to_chw(self, pos: torch.Tensor, true_shape: torch.Tensor, patch_size: int) -> torch.Tensor:
-        if not torch.equal(true_shape, true_shape[:1].expand_as(true_shape)):
-            raise ExternalDependencyError("All frames in one training sample must resize to the same true_shape")
-        height = int(true_shape[0, 0].item())
-        width = int(true_shape[0, 1].item())
-        grid_h = height // patch_size
-        grid_w = width // patch_size
+        grid_h, grid_w = self._grid_shape(true_shape, patch_size)
         if grid_h * grid_w != pos.shape[1]:
             raise ExternalDependencyError("Could not reshape MUSt3R PE2D positions into token grid")
         return pos.detach().cpu().transpose(1, 2).reshape(pos.shape[0], 2, grid_h, grid_w).contiguous().float()

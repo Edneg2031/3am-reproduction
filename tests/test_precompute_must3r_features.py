@@ -208,6 +208,33 @@ def test_official_extractor_chunks_decoder_by_decode_batch_size(tmp_path: Path) 
     assert [tuple(level.shape) for level in levels] == [(5, 6, 2), (5, 6, 3)]
 
 
+def test_official_extractor_converts_dense_pointmaps_to_token_grid(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        decode_batch_size=1,
+        memory_window=None,
+        full_scene_memory=False,
+        cache_dtype="fp16",
+        feature_layers=("encoder",),
+    )
+    true_shape = torch.tensor([[32, 48], [32, 48]], dtype=torch.int64)
+    y, x = torch.meshgrid(torch.arange(2), torch.arange(3), indexing="ij")
+    pos = torch.stack([y.reshape(-1), x.reshape(-1)], dim=1).unsqueeze(0).repeat(2, 1, 1).float()
+    dense = torch.ones(1, 2, 32, 48, 4)
+
+    point_map = extractor._pointmaps_to_chw([dense], pos, true_shape)
+
+    assert point_map is not None
+    assert tuple(point_map.shape) == (2, 3, 2, 3)
+    assert torch.allclose(point_map, torch.ones_like(point_map))
+
+
 def test_feature_layer_parser_maps_paper_specs_to_return_feats_indices(tmp_path: Path) -> None:
     module = _load_precompute_module()
     extractor = module.OfficialMust3rExtractor(

@@ -235,3 +235,17 @@ def test_must3r_adapter_maps_paper_layers_to_decoder_indices() -> None:
 
     assert specs == ("encoder", 4, 7, 11)
     assert indices == (0, 5, 8, 12)
+
+
+def test_must3r_adapter_converts_official_dense_pointmaps_to_token_grid() -> None:
+    adapter = Must3rFeatureAdapter(ExternalBackboneConfig())
+    true_shape = torch.tensor([[32, 48], [32, 48]], dtype=torch.int64)
+    y, x = torch.meshgrid(torch.arange(2), torch.arange(3), indexing="ij")
+    pos = torch.stack([y.reshape(-1), x.reshape(-1)], dim=1).unsqueeze(0).repeat(2, 1, 1).float()
+    dense = torch.ones(1, 2, 32, 48, 4)
+
+    point_map = adapter._pointmaps_to_chw([dense], pos, true_shape)
+
+    assert point_map is not None
+    assert tuple(point_map.shape) == (2, 3, 2, 3)
+    assert torch.allclose(point_map, torch.ones_like(point_map))
