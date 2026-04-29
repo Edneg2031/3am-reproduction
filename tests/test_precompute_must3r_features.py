@@ -68,6 +68,7 @@ def test_precompute_writes_features_metadata_and_manifest(tmp_path: Path) -> Non
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        cache_dtype="fp16",
         feature_layers=(0, 1, 2),
         write_manifest=feature_manifest,
         limit_scenes=None,
@@ -103,6 +104,7 @@ def test_precompute_dry_run_does_not_create_output(tmp_path: Path, capsys) -> No
         amp=False,
         max_bs=1,
         decode_batch_size=1,
+        cache_dtype="fp16",
         feature_layers=(0, 1, 2),
         write_manifest=None,
         limit_scenes=None,
@@ -126,6 +128,7 @@ def test_official_extractor_passes_true_shape_as_list_to_decoder(tmp_path: Path)
         amp=False,
         max_bs=1,
         decode_batch_size=2,
+        cache_dtype="fp16",
         feature_layers=(0, 1),
     )
 
@@ -159,6 +162,7 @@ def test_official_extractor_chunks_decoder_by_decode_batch_size(tmp_path: Path) 
         amp=False,
         max_bs=1,
         decode_batch_size=2,
+        cache_dtype="fp16",
         feature_layers=(0, 1),
     )
     calls: list[int] = []
@@ -182,6 +186,136 @@ def test_official_extractor_chunks_decoder_by_decode_batch_size(tmp_path: Path) 
 
     assert calls == [2, 2, 1]
     assert [tuple(level.shape) for level in levels] == [(5, 6, 2), (5, 6, 3)]
+
+
+def test_feature_layer_parser_maps_paper_specs_to_return_feats_indices(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        decode_batch_size=1,
+        cache_dtype="fp16",
+        feature_layers=module.parse_feature_layers("encoder,4,7,11"),
+    )
+
+    specs, indices = extractor._normalize_feature_layers(13)
+
+    assert specs == ("encoder", 4, 7, 11)
+    assert indices == (0, 5, 8, 12)
+
+
+def test_official_extractor_exports_paper_token_grid_features(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    frames = tuple(
+        FrameRecord(frame_id=f"{index:03d}", image_path=tmp_path / f"{index:03d}.png") for index in range(2)
+    )
+    scene = SceneRecord("scannetpp", "scene_a", "train", frames)
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        decode_batch_size=1,
+        cache_dtype="fp16",
+        feature_layers=module.parse_feature_layers("encoder,4,7,11"),
+    )
+    grid_h, grid_w = 32, 24
+    num_tokens = grid_h * grid_w
+
+    class FakeEncoder:
+        patch_size = 16
+
+        def __call__(self, images, true_shape):
+            frames_in_chunk = images.shape[0]
+            tokens = torch.ones(frames_in_chunk, num_tokens, 1024)
+            y, x = torch.meshgrid(torch.arange(grid_h), torch.arange(grid_w), indexing="ij")
+            pos = torch.stack([y.reshape(-1), x.reshape(-1)], dim=1).to(dtype=torch.float32)
+            return tokens, pos.unsqueeze(0).expand(frames_in_chunk, -1, -1).clone()
+
+    class FakeDecoder:
+        def forward_list(self, x, pos, true_shape, return_feats):
+            frames_in_chunk = x[0].shape[1]
+            feats = [x[0]]
+            feats.extend(torch.ones(1, frames_in_chunk, num_tokens, 768) * layer for layer in range(12))
+            return object(), object(), [feats]
+
+    def fake_load_images(chunk_frames, patch_size):
+        return [torch.zeros(3, 512, 384) for _ in chunk_frames], [
+            torch.tensor([512, 384], dtype=torch.int64) for _ in chunk_frames
+        ]
+
+    extractor.model = (FakeEncoder(), FakeDecoder())
+    extractor._load_images = fake_load_images  # type: ignore[method-assign]
+
+    features = extractor.extract_scene(scene)
+    output_dir = tmp_path / "cache"
+    module.save_scene_features(scene, features, output_dir=output_dir, manifest=tmp_path / "manifest.json")
+
+    scene_dir = output_dir / "scannetpp" / "scene_a"
+    saved = [torch.load(scene_dir / f"000_level{level}.pt", map_location="cpu", weights_only=True) for level in range(4)]
+    assert [tuple(tensor.shape) for tensor in saved] == [
+        (1024, 32, 24),
+        (768, 32, 24),
+        (768, 32, 24),
+        (768, 32, 24),
+    ]
+    assert all(tensor.dtype == torch.float16 for tensor in saved)
+    metadata = json.loads((scene_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["feature_specs"] == ["encoder", "decoder_4", "decoder_7", "decoder_11"]
+    assert metadata["feature_channels"] == [1024, 768, 768, 768]
+    assert metadata["feature_grid"] == [[32, 24], [32, 24], [32, 24], [32, 24]]
+
+
+def test_official_extractor_rejects_non_paper_channels(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        decode_batch_size=1,
+        cache_dtype="fp16",
+        feature_layers=("encoder",),
+    )
+    y, x = torch.meshgrid(torch.arange(32), torch.arange(24), indexing="ij")
+    pos = torch.stack([y.reshape(-1), x.reshape(-1)], dim=1).unsqueeze(0).to(dtype=torch.float32)
+    true_shape = torch.tensor([[512, 384]], dtype=torch.int64)
+
+    import pytest
+
+    with pytest.raises(module.Must3rPrecomputeError, match="encoder=1024"):
+        extractor._tokens_to_chw(torch.ones(1, 32 * 24, 768), pos, true_shape, 16, "encoder")
+
+
+def test_official_extractor_rejects_dense_grid_features(tmp_path: Path) -> None:
+    module = _load_precompute_module()
+    extractor = module.OfficialMust3rExtractor(
+        weights=tmp_path / "unused.pth",
+        must3r_repo=None,
+        device="cpu",
+        image_size=512,
+        amp=False,
+        max_bs=1,
+        decode_batch_size=1,
+        cache_dtype="fp16",
+        feature_layers=(4,),
+    )
+    dense_tokens = 512 * 512
+    pos = torch.zeros(1, dense_tokens, 2)
+    true_shape = torch.tensor([[512, 384]], dtype=torch.int64)
+
+    import pytest
+
+    with pytest.raises(module.Must3rPrecomputeError, match="Refusing to save a dense full-resolution"):
+        extractor._tokens_to_chw(torch.ones(1, dense_tokens, 768), pos, true_shape, 16, 4)
 
 
 def test_compute_fov_overlap_skips_when_geometry_missing(tmp_path: Path) -> None:

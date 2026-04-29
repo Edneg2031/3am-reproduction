@@ -18,6 +18,9 @@ from three_am.training.dataset import resolve_project_path
 from three_am.utils.config import load_yaml
 
 
+FeatureLayerSpec = str | int
+
+
 class FeatureExtractor(Protocol):
     def extract_scene(self, scene: SceneRecord) -> "SceneFeatures": ...
 
@@ -40,7 +43,8 @@ class PrecomputeOptions:
     amp: str | bool
     max_bs: int
     decode_batch_size: int
-    feature_layers: tuple[int, ...]
+    cache_dtype: str
+    feature_layers: tuple[FeatureLayerSpec, ...]
     write_manifest: Path | None
     limit_scenes: int | None
     dry_run: bool
@@ -58,11 +62,16 @@ def _prepend_repo_to_sys_path(repo: Path | None) -> None:
         sys.path.insert(0, str(repo))
 
 
-def parse_feature_layers(value: str) -> tuple[int, ...]:
-    layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+def parse_feature_layers(value: str) -> tuple[FeatureLayerSpec, ...]:
+    layers: list[FeatureLayerSpec] = []
+    for part in (part.strip() for part in value.split(",") if part.strip()):
+        if part.lower() == "encoder":
+            layers.append("encoder")
+        else:
+            layers.append(int(part))
     if not layers:
-        raise ValueError("--feature-layers must contain at least one integer layer index")
-    return layers
+        raise ValueError("--feature-layers must contain at least one layer, such as encoder,4,7,11")
+    return tuple(layers)
 
 
 def parse_amp(value: str) -> str | bool:
@@ -79,6 +88,16 @@ def _dtype_for_amp(amp: str | bool) -> torch.dtype:
     if amp == "bf16":
         return torch.bfloat16
     return torch.float32
+
+
+def _dtype_for_cache(cache_dtype: str) -> torch.dtype:
+    if cache_dtype == "fp16":
+        return torch.float16
+    if cache_dtype == "bf16":
+        return torch.bfloat16
+    if cache_dtype == "float32":
+        return torch.float32
+    raise ValueError("--cache-dtype must be fp16, bf16, or float32")
 
 
 def _external_path(config: dict[str, Any], name: str, override: str | Path | None = None) -> Path | None:
@@ -111,7 +130,8 @@ class OfficialMust3rExtractor:
         amp: str | bool,
         max_bs: int,
         decode_batch_size: int,
-        feature_layers: tuple[int, ...],
+        cache_dtype: str,
+        feature_layers: tuple[FeatureLayerSpec, ...],
     ) -> None:
         if max_bs < 1:
             raise ValueError("max_bs must be >= 1")
@@ -124,6 +144,7 @@ class OfficialMust3rExtractor:
         self.amp = amp
         self.max_bs = max_bs
         self.decode_batch_size = decode_batch_size
+        self.cache_dtype = cache_dtype
         self.feature_layers = feature_layers
         self.model: tuple[Any, Any] | None = None
 
@@ -145,17 +166,20 @@ class OfficialMust3rExtractor:
         if self.model is None:
             raise Must3rPrecomputeError("MUSt3R model failed to load")
         encoder, decoder = self.model
+        patch_size = int(encoder.patch_size)
         if not scene.frames:
             raise Must3rPrecomputeError(f"Scene {scene.scene_id} has no frames")
         true_shape_chunks: list[torch.Tensor] = []
+        pos_chunks: list[torch.Tensor] = []
         selected_chunks: list[list[torch.Tensor]] | None = None
+        selected_specs: tuple[FeatureLayerSpec, ...] | None = None
         selected_indices: tuple[int, ...] | None = None
         with torch.no_grad():
             dtype = _dtype_for_amp(self.amp)
             with torch.autocast(self.device.type, dtype=dtype, enabled=bool(self.amp) and self.device.type == "cuda"):
                 for start in range(0, len(scene.frames), self.decode_batch_size):
                     end = min(len(scene.frames), start + self.decode_batch_size)
-                    images, true_shape = self._load_images(scene.frames[start:end], encoder.patch_size)
+                    images, true_shape = self._load_images(scene.frames[start:end], patch_size)
                     if not images:
                         raise Must3rPrecomputeError(
                             f"Scene {scene.scene_id} frame chunk {start}:{end} produced no loaded images"
@@ -165,11 +189,12 @@ class OfficialMust3rExtractor:
                     image_tensor = torch.stack(images, dim=0).to(self.device)
                     chunk_true_shape = true_shape_tensor.to(self.device)
                     encoder_tokens, pos = self._encode_frames(encoder, image_tensor, chunk_true_shape)
+                    pos_chunks.append(pos.detach().cpu())
                     raw_levels = self._decode_feature_levels(decoder, encoder_tokens, pos, chunk_true_shape)
                     if selected_indices is None:
-                        selected_indices = self._normalize_feature_layers(len(raw_levels))
+                        selected_specs, selected_indices = self._normalize_feature_layers(len(raw_levels))
                         selected_chunks = [[] for _ in selected_indices]
-                    if selected_chunks is None or selected_indices is None:
+                    if selected_chunks is None or selected_specs is None or selected_indices is None:
                         raise Must3rPrecomputeError("MUSt3R decoder returned no selectable feature levels")
                     if any(index >= len(raw_levels) for index in selected_indices):
                         raise Must3rPrecomputeError(
@@ -180,20 +205,31 @@ class OfficialMust3rExtractor:
                     del image_tensor, chunk_true_shape, encoder_tokens, pos, raw_levels
         if selected_chunks is None:
             raise Must3rPrecomputeError(f"Scene {scene.scene_id} produced no MUSt3R feature chunks")
+        if selected_specs is None:
+            raise Must3rPrecomputeError(f"Scene {scene.scene_id} produced no selected MUSt3R feature specs")
         true_shape_tensor = torch.cat(true_shape_chunks, dim=0)
+        pos_tensor = torch.cat(pos_chunks, dim=0)
         selected_token_levels = tuple(torch.cat(chunks, dim=0) for chunks in selected_chunks)
-        selected_levels = tuple(self._tokens_to_chw(level, true_shape_tensor) for level in selected_token_levels)
+        selected_levels = tuple(
+            self._tokens_to_chw(level, pos_tensor, true_shape_tensor, patch_size, spec).to(
+                dtype=_dtype_for_cache(self.cache_dtype)
+            )
+            for level, spec in zip(selected_token_levels, selected_specs, strict=True)
+        )
         return SceneFeatures(
             levels=selected_levels,
             metadata={
-                "extractor": "official_must3r_raw",
-                "feature_layers": list(self.feature_layers),
+                "extractor": "official_must3r_token_grid",
+                "feature_layers": [self._feature_layer_label(spec) for spec in self.feature_layers],
+                "feature_specs": [self._feature_layer_label(spec) for spec in selected_specs],
                 "feature_channels": [int(level.shape[1]) for level in selected_levels],
                 "feature_grid": [list(level.shape[-2:]) for level in selected_levels],
                 "image_size": self.image_size,
                 "amp": self.amp,
                 "encoder_batch_size": self.max_bs,
                 "decode_batch_size": self.decode_batch_size,
+                "cache_dtype": self.cache_dtype,
+                "patch_size": patch_size,
                 "decoder_memory": False,
                 "checkpoint": str(self.weights),
                 "frame_ids": [frame.frame_id for frame in scene.frames],
@@ -255,33 +291,85 @@ class OfficialMust3rExtractor:
             raise Must3rPrecomputeError("MUSt3R decoder returned no feature levels")
         return [torch.cat(chunks, dim=0) for chunks in level_chunks]
 
-    def _normalize_feature_layers(self, num_levels: int) -> tuple[int, ...]:
+    def _normalize_feature_layers(
+        self, num_levels: int
+    ) -> tuple[tuple[FeatureLayerSpec, ...], tuple[int, ...]]:
+        specs: list[FeatureLayerSpec] = []
         indices: list[int] = []
         for layer in self.feature_layers:
-            index = layer if layer >= 0 else num_levels + layer
+            if layer == "encoder":
+                index = 0
+            elif isinstance(layer, int) and layer >= 0:
+                index = layer + 1
+            elif isinstance(layer, int):
+                index = num_levels + layer
+            else:
+                raise Must3rPrecomputeError(f"Unsupported MUSt3R feature layer spec: {layer!r}")
             if index < 0 or index >= num_levels:
                 raise Must3rPrecomputeError(
                     f"Requested MUSt3R feature layer {layer}, but decoder returned {num_levels} levels"
                 )
+            specs.append(layer)
             indices.append(index)
-        return tuple(indices)
+        return tuple(specs), tuple(indices)
 
-    def _tokens_to_chw(self, tokens: torch.Tensor, true_shape: torch.Tensor) -> torch.Tensor:
+    def _tokens_to_chw(
+        self,
+        tokens: torch.Tensor,
+        pos: torch.Tensor,
+        true_shape: torch.Tensor,
+        patch_size: int,
+        spec: FeatureLayerSpec,
+    ) -> torch.Tensor:
         # tokens: T, N, C
         if tokens.ndim != 3:
             raise Must3rPrecomputeError(f"Expected token features with shape TNC, got {tuple(tokens.shape)}")
+        expected_channels = self._expected_channels(spec)
+        if tokens.shape[2] != expected_channels:
+            raise Must3rPrecomputeError(
+                "MUSt3R feature channel mismatch for "
+                f"{self._feature_layer_label(spec)}: got {tokens.shape[2]}, expected {expected_channels}. "
+                "The 3AM paper uses encoder=1024 channels and decoder layers=768 channels."
+            )
+        if pos.shape[:2] != tokens.shape[:2]:
+            raise Must3rPrecomputeError(
+                f"MUSt3R token/position mismatch: tokens {tuple(tokens.shape)}, pos {tuple(pos.shape)}"
+            )
         height = int(true_shape[0, 0].item())
         width = int(true_shape[0, 1].item())
         if not torch.equal(true_shape, true_shape[:1].expand_as(true_shape)):
-            raise Must3rPrecomputeError("All frames in a scene must resize to the same true_shape for raw feature export")
-        patch = int(round((height * width / tokens.shape[1]) ** 0.5))
-        grid_h = height // patch
-        grid_w = width // patch
+            raise Must3rPrecomputeError(
+                "All frames in a scene must resize to the same true_shape for token-grid feature export"
+            )
+        grid_h = height // patch_size
+        grid_w = width // patch_size
         if grid_h * grid_w != tokens.shape[1]:
             raise Must3rPrecomputeError(
-                f"Could not reshape {tokens.shape[1]} MUSt3R tokens into a grid for true_shape {(height, width)}"
+                f"Could not reshape {tokens.shape[1]} MUSt3R tokens into paper token grid "
+                f"{(grid_h, grid_w)} for true_shape {(height, width)} and patch_size {patch_size}. "
+                "Refusing to save a dense full-resolution feature map."
             )
+        self._validate_pos_grid(pos, grid_h, grid_w)
         return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[2], grid_h, grid_w).contiguous()
+
+    def _validate_pos_grid(self, pos: torch.Tensor, grid_h: int, grid_w: int) -> None:
+        for frame_index, frame_pos in enumerate(pos.detach().cpu()):
+            if frame_pos.ndim != 2 or frame_pos.shape[1] != 2:
+                raise Must3rPrecomputeError(f"Expected MUSt3R positions with shape N2, got {tuple(frame_pos.shape)}")
+            first = torch.unique(frame_pos[:, 0]).numel()
+            second = torch.unique(frame_pos[:, 1]).numel()
+            if sorted((int(first), int(second))) != sorted((grid_h, grid_w)):
+                raise Must3rPrecomputeError(
+                    "MUSt3R position grid mismatch for frame "
+                    f"{frame_index}: pos unique counts {(int(first), int(second))}, expected {(grid_h, grid_w)}. "
+                    "Refusing to save non-token-grid features."
+                )
+
+    def _expected_channels(self, spec: FeatureLayerSpec) -> int:
+        return 1024 if spec == "encoder" else 768
+
+    def _feature_layer_label(self, spec: FeatureLayerSpec) -> str:
+        return "encoder" if spec == "encoder" else f"decoder_{spec}"
 
 
 def _load_depth(path: Path) -> np.ndarray:
@@ -431,6 +519,7 @@ def run_precompute(options: PrecomputeOptions, extractor: FeatureExtractor | Non
         "amp": options.amp,
         "max_bs": options.max_bs,
         "decode_batch_size": options.decode_batch_size,
+        "cache_dtype": options.cache_dtype,
         "feature_layers": list(options.feature_layers),
     }
     if options.dry_run:
@@ -447,6 +536,7 @@ def run_precompute(options: PrecomputeOptions, extractor: FeatureExtractor | Non
             amp=options.amp,
             max_bs=options.max_bs,
             decode_batch_size=options.decode_batch_size,
+            cache_dtype=options.cache_dtype,
             feature_layers=options.feature_layers,
         )
     options.output_dir.mkdir(parents=True, exist_ok=True)
@@ -489,6 +579,7 @@ def options_from_args(args: argparse.Namespace) -> PrecomputeOptions:
         amp=parse_amp(args.amp),
         max_bs=args.max_bs,
         decode_batch_size=args.decode_batch_size,
+        cache_dtype=args.cache_dtype,
         feature_layers=parse_feature_layers(args.feature_layers),
         write_manifest=write_manifest,
         limit_scenes=args.limit_scenes,
@@ -508,7 +599,8 @@ def main() -> None:
     parser.add_argument("--amp", default="bf16", choices=["false", "bf16", "fp16"])
     parser.add_argument("--max-bs", type=int, default=1)
     parser.add_argument("--decode-batch-size", type=int, default=1)
-    parser.add_argument("--feature-layers", default="0,-2,-1")
+    parser.add_argument("--cache-dtype", default="fp16", choices=["fp16", "bf16", "float32"])
+    parser.add_argument("--feature-layers", default="encoder,4,7,11")
     parser.add_argument("--write-manifest", default=None)
     parser.add_argument("--limit-scenes", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")

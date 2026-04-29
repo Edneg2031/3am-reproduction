@@ -48,7 +48,7 @@ features:
 
 model:
   sam_channels: 256
-  must3r_channels: [256, 512, 768]
+  must3r_channels: [1024, 768, 768, 768]
   hidden_channels: 256
   attention_heads: 8
 
