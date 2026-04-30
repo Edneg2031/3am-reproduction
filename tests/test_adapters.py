@@ -187,6 +187,62 @@ class FakeOfficialSam2Modules(nn.Module):
         current_out["maskmem_pos_enc"] = [torch.zeros_like(high_res_masks)]
 
 
+class FakeDecoratedOfficialSam2Modules(FakeOfficialSam2Modules):
+    @torch.no_grad()
+    def _prepare_backbone_features(self, backbone_out):
+        return super()._prepare_backbone_features(backbone_out)
+
+    @torch.no_grad()
+    def _track_step(
+        self,
+        frame_idx,
+        is_init_cond_frame,
+        current_vision_feats,
+        current_vision_pos_embeds,
+        feat_sizes,
+        point_inputs,
+        mask_inputs,
+        output_dict,
+        num_frames,
+        track_in_reverse,
+        prev_sam_mask_logits,
+    ):
+        return super()._track_step(
+            frame_idx=frame_idx,
+            is_init_cond_frame=is_init_cond_frame,
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=point_inputs,
+            mask_inputs=mask_inputs,
+            output_dict=output_dict,
+            num_frames=num_frames,
+            track_in_reverse=track_in_reverse,
+            prev_sam_mask_logits=prev_sam_mask_logits,
+        )
+
+    @torch.no_grad()
+    def _encode_memory_in_output(
+        self,
+        current_vision_feats,
+        feat_sizes,
+        point_inputs,
+        run_mem_encoder,
+        high_res_masks,
+        object_score_logits,
+        current_out,
+    ):
+        return super()._encode_memory_in_output(
+            current_vision_feats,
+            feat_sizes,
+            point_inputs,
+            run_mem_encoder,
+            high_res_masks,
+            object_score_logits,
+            current_out,
+        )
+
+
 def test_sam2_adapter_falls_back_to_official_track_step_modules() -> None:
     adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
     model = FakeOfficialSam2Modules()
@@ -212,6 +268,33 @@ def test_sam2_adapter_falls_back_to_official_track_step_modules() -> None:
     assert outputs["iou_scores"].shape == (3,)
     assert outputs["occlusion_logits"].shape == (3, 2)
     assert model.steps[0] == (1, True)
+
+
+def test_sam2_adapter_bypasses_no_grad_wrapped_official_modules() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
+    model = FakeDecoratedOfficialSam2Modules()
+    adapter.model = model
+    images = torch.randn(2, 3, 64, 64)
+    target_masks = torch.zeros(2, 64, 64)
+    batch = TrainingBatch(
+        images=images,
+        target_masks=target_masks,
+        prompt=Prompt(type="mask", frame_index=0, mask=target_masks[0]),
+        must3r_features=None,
+        dataset="scannetpp",
+        scene_id="scene_a",
+        frame_ids=("000", "001"),
+        image_paths=(),
+        has_object=torch.tensor([False, False]),
+    )
+
+    sam_features = adapter.encode_sam_features(images)
+    merged = sam_features.clone().requires_grad_(True)
+    outputs = adapter.forward_train_sequence(batch, merged)
+    loss = outputs["mask_logits"].sum() + outputs["occlusion_logits"].sum()
+    loss.backward()
+
+    assert merged.grad is not None
 
 
 class FakePerFrameSam2(nn.Module):

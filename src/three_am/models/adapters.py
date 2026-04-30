@@ -233,6 +233,17 @@ class Sam2TrainingAdapter(nn.Module):
         self._last_feature_selector = selector
         self._last_sam_feature_shape = tuple(sam_feature.shape)
 
+    def _call_with_grad(self, method: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Call SAM2 internals without inference/no-grad decorators when possible."""
+        callable_method = method
+        receiver = getattr(method, "__self__", None)
+        while hasattr(callable_method, "__wrapped__"):
+            callable_method = callable_method.__wrapped__
+        with torch.enable_grad():
+            if receiver is not None and not inspect.ismethod(callable_method):
+                return callable_method(receiver, *args, **kwargs)
+            return callable_method(*args, **kwargs)
+
     def _select_sam_feature(self, features: Any) -> tuple[torch.Tensor, tuple[str, str | int] | None]:
         if isinstance(features, torch.Tensor):
             return features, None
@@ -343,7 +354,10 @@ class Sam2TrainingAdapter(nn.Module):
         if self.model is None or not hasattr(self.model, "_prepare_backbone_features"):
             return None
         try:
-            _, vision_feats, vision_pos_embeds, feat_sizes = self.model._prepare_backbone_features(backbone_out)
+            _, vision_feats, vision_pos_embeds, feat_sizes = self._call_with_grad(
+                self.model._prepare_backbone_features,
+                backbone_out,
+            )
         except Exception as error:
             raise ExternalDependencyError("SAM2 could not prepare merged backbone features for tracking") from error
         num_frames = int(getattr(batch, "target_masks").shape[0])
@@ -362,7 +376,8 @@ class Sam2TrainingAdapter(nn.Module):
             point_inputs, mask_inputs = self._prompt_inputs_for_frame(batch, frame_index, current_feats[-1].device)
             is_cond_frame = frame_index == reference_index
             try:
-                current_out, sam_outputs, _, _ = self.model._track_step(
+                current_out, sam_outputs, _, _ = self._call_with_grad(
+                    self.model._track_step,
                     frame_idx=frame_index,
                     is_init_cond_frame=is_cond_frame,
                     current_vision_feats=current_feats,
@@ -383,7 +398,8 @@ class Sam2TrainingAdapter(nn.Module):
             current_out["obj_ptr"] = sam_outputs[5]
             current_out["object_score_logits"] = object_score_logits
             if hasattr(self.model, "_encode_memory_in_output"):
-                self.model._encode_memory_in_output(
+                self._call_with_grad(
+                    self.model._encode_memory_in_output,
                     current_feats,
                     feat_sizes,
                     point_inputs,
@@ -416,7 +432,8 @@ class Sam2TrainingAdapter(nn.Module):
             if high_res_features_all is not None:
                 high_res_features = [level[frame_index : frame_index + 1] for level in high_res_features_all]
             try:
-                sam_outputs = self.model._forward_sam_heads(
+                sam_outputs = self._call_with_grad(
+                    self.model._forward_sam_heads,
                     backbone_features=feature,
                     point_inputs=point_inputs,
                     mask_inputs=mask_inputs,
@@ -528,7 +545,7 @@ class Sam2TrainingAdapter(nn.Module):
         try:
             signature = inspect.signature(method)
         except (TypeError, ValueError):
-            return method(batch=batch, merged_features=merged_features, backbone_out=backbone_out)
+            return self._call_with_grad(method, batch=batch, merged_features=merged_features, backbone_out=backbone_out)
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
             return method(**kwargs)
         supported = {
@@ -546,7 +563,7 @@ class Sam2TrainingAdapter(nn.Module):
         ]
         if missing_required:
             return None
-        return method(**supported)
+        return self._call_with_grad(method, **supported)
 
     def _validate_training_outputs(self, outputs: Any, method_name: str) -> dict[str, torch.Tensor]:
         if not isinstance(outputs, dict):

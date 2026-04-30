@@ -325,6 +325,39 @@ def _trainable_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def _trainable_parameter_summary(module: nn.Module, *, max_names: int = 8) -> str:
+    names = [name for name, parameter in module.named_parameters() if parameter.requires_grad]
+    preview = ", ".join(names[:max_names])
+    if len(names) > max_names:
+        preview += f", ... ({len(names)} total)"
+    return preview or "none"
+
+
+def _output_grad_summary(outputs: dict[str, torch.Tensor]) -> str:
+    parts: list[str] = []
+    for key, value in outputs.items():
+        if isinstance(value, torch.Tensor):
+            parts.append(f"{key}:requires_grad={value.requires_grad},grad_fn={type(value.grad_fn).__name__ if value.grad_fn else 'None'}")
+    return "; ".join(parts) or "no tensor outputs"
+
+
+def _ensure_loss_is_differentiable(
+    loss: torch.Tensor,
+    *,
+    wrapper: ThreeAMTrainingWrapper,
+    outputs: dict[str, torch.Tensor],
+) -> None:
+    if loss.requires_grad and loss.grad_fn is not None:
+        return
+    selector = getattr(wrapper.sam2_adapter, "last_feature_selector", None)
+    raise RuntimeError(
+        "3AM training loss is detached before backward. This usually means the selected SAM2 tracking forward path "
+        "ran under no_grad/inference_mode or did not use the merged 3AM backbone feature. "
+        f"sam2_feature_selector={selector!r}; trainable_parameters={_trainable_parameter_summary(wrapper)}; "
+        f"outputs=({_output_grad_summary(outputs)})"
+    )
+
+
 def _load_model_state(wrapper: ThreeAMTrainingWrapper, payload: dict[str, Any]) -> None:
     if "model" not in payload:
         raise ValueError("Checkpoint is missing model state")
@@ -974,6 +1007,7 @@ def run_training(
         with _autocast(device, amp_enabled):
             outputs = wrapper(batch, must3r_features)
             loss = sam2_training_loss(outputs, batch.target_masks, batch.has_object, weights)
+        _ensure_loss_is_differentiable(loss.total, wrapper=wrapper, outputs=outputs)
         scaler.scale(loss.total).backward()
         scaler.step(optimizer)
         scaler.update()
