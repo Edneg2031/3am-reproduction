@@ -147,25 +147,10 @@ class Sam2TrainingAdapter(nn.Module):
         if self.model is None:
             raise ExternalDependencyError("SAM2 model is not loaded")
         self._validate_image_tensor(images)
-        if hasattr(self.model, "encode_sam_features"):
-            features = self.model.encode_sam_features(images)  # type: ignore[attr-defined]
-            sam_feature, selector = self._select_sam_feature(features)
-            self._remember_feature_payload(features, selector, sam_feature)
-            return sam_feature
-        if hasattr(self.model, "forward_image"):
-            features = self.model.forward_image(images)  # type: ignore[attr-defined]
-            sam_feature, selector = self._select_sam_feature(features)
-            self._remember_feature_payload(features, selector, sam_feature)
-            return sam_feature
-        if hasattr(self.model, "image_encoder"):
-            features = self.model.image_encoder(images)  # type: ignore[attr-defined]
-            sam_feature, selector = self._select_sam_feature(features)
-            self._remember_feature_payload(features, selector, sam_feature)
-            return sam_feature
-        raise ExternalDependencyError(
-            "SAM2 adapter could not obtain trainable image features. Install official SAM2 training internals "
-            "or subclass Sam2TrainingAdapter.encode_sam_features for the selected SAM2 release."
-        )
+        features = self._encode_sam_backbone_payload(images)
+        sam_feature, selector = self._select_sam_feature(features)
+        self._remember_feature_payload(features, selector, sam_feature)
+        return sam_feature
 
     def _validate_image_tensor(self, images: torch.Tensor) -> None:
         if images.ndim != 4:
@@ -177,6 +162,20 @@ class Sam2TrainingAdapter(nn.Module):
                 f"tiles exactly; got image size {(height, width)}. Set model.sam_image_size to 1024 "
                 "or another multiple of 32."
             )
+
+    def _encode_sam_backbone_payload(self, images: torch.Tensor) -> Any:
+        if self.model is None:
+            raise ExternalDependencyError("SAM2 model is not loaded")
+        if hasattr(self.model, "encode_sam_features"):
+            return self.model.encode_sam_features(images)  # type: ignore[attr-defined]
+        if hasattr(self.model, "forward_image"):
+            return self.model.forward_image(images)  # type: ignore[attr-defined]
+        if hasattr(self.model, "image_encoder"):
+            return self.model.image_encoder(images)  # type: ignore[attr-defined]
+        raise ExternalDependencyError(
+            "SAM2 adapter could not obtain image features. Install official SAM2 training internals "
+            "or subclass Sam2TrainingAdapter for the selected SAM2 release."
+        )
 
     def forward_train_sequence(self, batch: Any, merged_features: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.model is None:
@@ -222,6 +221,48 @@ class Sam2TrainingAdapter(nn.Module):
             "or forward_train_sequence(batch, merged_features), returning mask_logits, iou_scores, and "
             "occlusion_logits."
         )
+
+    def predict_masks_from_points(
+        self,
+        images: torch.Tensor,
+        points_by_frame: Sequence[torch.Tensor],
+        labels_by_frame: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """Generate detached SAM2 masks from image-space point prompts."""
+        if self.model is None:
+            raise ExternalDependencyError("SAM2 model is not loaded")
+        self._validate_image_tensor(images)
+        if len(points_by_frame) != int(images.shape[0]) or len(labels_by_frame) != int(images.shape[0]):
+            raise ValueError("points_by_frame and labels_by_frame must have one entry per image frame")
+        with torch.no_grad():
+            backbone_out = self._encode_sam_backbone_payload(images)
+            feature, _ = self._select_sam_feature(backbone_out)
+            if hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step"):
+                return self._predict_point_masks_with_tracking(images, backbone_out, points_by_frame, labels_by_frame)
+            if hasattr(self.model, "_forward_sam_heads"):
+                return self._predict_point_masks_per_frame(images, feature, backbone_out, points_by_frame, labels_by_frame)
+        raise ExternalDependencyError(
+            "SAM2 point-prompt mask generation requires official _track_step or _forward_sam_heads internals."
+        )
+
+    def track_masks_from_points(
+        self,
+        images: torch.Tensor,
+        *,
+        reference_index: int,
+        points: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate detached video masks by tracking one point prompt through the sequence."""
+        if self.model is None:
+            raise ExternalDependencyError("SAM2 model is not loaded")
+        self._validate_image_tensor(images)
+        if not (hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step")):
+            raise ExternalDependencyError("SAM2 point-prompt tracking requires official _prepare_backbone_features and _track_step")
+        reference_index = min(max(int(reference_index), 0), int(images.shape[0]) - 1)
+        with torch.no_grad():
+            backbone_out = self._encode_sam_backbone_payload(images)
+            return self._track_point_masks_with_backbone(images, backbone_out, reference_index, points, labels)
 
     def _remember_feature_payload(
         self,
@@ -445,6 +486,168 @@ class Sam2TrainingAdapter(nn.Module):
             _, high_res_masks, iou_scores, object_score_logits = self._unpack_sam_outputs(sam_outputs)
             frame_outputs[frame_index] = (high_res_masks[:, 0], iou_scores, object_score_logits)
         return self._format_sam_training_outputs(batch, frame_outputs)
+
+    def _predict_point_masks_with_tracking(
+        self,
+        images: torch.Tensor,
+        backbone_out: Any,
+        points_by_frame: Sequence[torch.Tensor],
+        labels_by_frame: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        try:
+            _, vision_feats, vision_pos_embeds, feat_sizes = self.model._prepare_backbone_features(backbone_out)  # type: ignore[union-attr]
+        except Exception as error:
+            raise ExternalDependencyError("SAM2 could not prepare backbone features for point-prompt masks") from error
+        masks: list[torch.Tensor] = []
+        output_dict: dict[str, dict[int, dict[str, Any]]] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        num_frames = int(images.shape[0])
+        for frame_index in range(num_frames):
+            current_feats = [feature[:, frame_index : frame_index + 1, :] for feature in vision_feats]
+            current_pos = [pos[:, frame_index : frame_index + 1, :] for pos in vision_pos_embeds]
+            point_inputs = self._point_prompt_inputs(points_by_frame[frame_index], labels_by_frame[frame_index], current_feats[-1].device)
+            try:
+                current_out, sam_outputs, _, _ = self.model._track_step(  # type: ignore[union-attr]
+                    frame_idx=frame_index,
+                    is_init_cond_frame=True,
+                    current_vision_feats=current_feats,
+                    current_vision_pos_embeds=current_pos,
+                    feat_sizes=feat_sizes,
+                    point_inputs=point_inputs,
+                    mask_inputs=None,
+                    output_dict=output_dict,
+                    num_frames=num_frames,
+                    track_in_reverse=False,
+                    prev_sam_mask_logits=None,
+                )
+            except Exception as error:
+                raise ExternalDependencyError("SAM2 _track_step failed while generating point-prompt masks") from error
+            _, high_res_masks, _, object_score_logits = self._unpack_sam_outputs(sam_outputs)
+            current_out["pred_masks_high_res"] = high_res_masks
+            current_out["object_score_logits"] = object_score_logits
+            masks.append(high_res_masks[0, 0])
+        return self._resize_predicted_masks(torch.stack(masks, dim=0), tuple(images.shape[-2:]))
+
+    def _track_point_masks_with_backbone(
+        self,
+        images: torch.Tensor,
+        backbone_out: Any,
+        reference_index: int,
+        points: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        try:
+            _, vision_feats, vision_pos_embeds, feat_sizes = self.model._prepare_backbone_features(backbone_out)  # type: ignore[union-attr]
+        except Exception as error:
+            raise ExternalDependencyError("SAM2 could not prepare backbone features for point-prompt tracking") from error
+        num_frames = int(images.shape[0])
+        output_dict: dict[str, dict[int, dict[str, Any]]] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        ordered = [reference_index]
+        ordered.extend(index for index in range(reference_index + 1, num_frames))
+        ordered.extend(index for index in range(reference_index - 1, -1, -1))
+        frame_masks: dict[int, torch.Tensor] = {}
+        for frame_index in ordered:
+            current_feats = [feature[:, frame_index : frame_index + 1, :] for feature in vision_feats]
+            current_pos = [pos[:, frame_index : frame_index + 1, :] for pos in vision_pos_embeds]
+            point_inputs = (
+                self._point_prompt_inputs(points, labels, current_feats[-1].device)
+                if frame_index == reference_index
+                else None
+            )
+            try:
+                current_out, sam_outputs, _, _ = self.model._track_step(  # type: ignore[union-attr]
+                    frame_idx=frame_index,
+                    is_init_cond_frame=frame_index == reference_index,
+                    current_vision_feats=current_feats,
+                    current_vision_pos_embeds=current_pos,
+                    feat_sizes=feat_sizes,
+                    point_inputs=point_inputs,
+                    mask_inputs=None,
+                    output_dict=output_dict,
+                    num_frames=num_frames,
+                    track_in_reverse=frame_index < reference_index,
+                    prev_sam_mask_logits=None,
+                )
+            except Exception as error:
+                raise ExternalDependencyError("SAM2 _track_step failed while tracking point-prompt masks") from error
+            low_res_masks, high_res_masks, _, object_score_logits = self._unpack_sam_outputs(sam_outputs)
+            current_out["pred_masks"] = low_res_masks
+            current_out["pred_masks_high_res"] = high_res_masks
+            current_out["obj_ptr"] = sam_outputs[5]
+            current_out["object_score_logits"] = object_score_logits
+            if hasattr(self.model, "_encode_memory_in_output"):
+                self.model._encode_memory_in_output(  # type: ignore[union-attr]
+                    current_feats,
+                    feat_sizes,
+                    point_inputs,
+                    True,
+                    high_res_masks,
+                    object_score_logits,
+                    current_out,
+                )
+            group = "cond_frame_outputs" if frame_index == reference_index else "non_cond_frame_outputs"
+            output_dict[group][frame_index] = current_out
+            frame_masks[frame_index] = high_res_masks[0, 0]
+        return self._resize_predicted_masks(
+            torch.stack([frame_masks[index] for index in range(num_frames)], dim=0),
+            tuple(images.shape[-2:]),
+        )
+
+    def _predict_point_masks_per_frame(
+        self,
+        images: torch.Tensor,
+        feature: torch.Tensor,
+        backbone_out: Any | None,
+        points_by_frame: Sequence[torch.Tensor],
+        labels_by_frame: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        high_res_features_all = self._high_res_features_from_backbone(backbone_out)
+        masks: list[torch.Tensor] = []
+        for frame_index in range(int(images.shape[0])):
+            frame_feature = feature[frame_index : frame_index + 1]
+            high_res_features = None
+            if high_res_features_all is not None:
+                high_res_features = [level[frame_index : frame_index + 1] for level in high_res_features_all]
+            point_inputs = self._point_prompt_inputs(points_by_frame[frame_index], labels_by_frame[frame_index], frame_feature.device)
+            try:
+                sam_outputs = self.model._forward_sam_heads(  # type: ignore[union-attr]
+                    backbone_features=frame_feature,
+                    point_inputs=point_inputs,
+                    mask_inputs=None,
+                    high_res_features=high_res_features,
+                    multimask_output=False,
+                )
+            except Exception as error:
+                raise ExternalDependencyError("SAM2 _forward_sam_heads failed while generating point-prompt masks") from error
+            _, high_res_masks, _, _ = self._unpack_sam_outputs(sam_outputs)
+            masks.append(high_res_masks[0, 0])
+        return self._resize_predicted_masks(torch.stack(masks, dim=0), tuple(images.shape[-2:]))
+
+    def _point_prompt_inputs(
+        self,
+        points: torch.Tensor,
+        labels: torch.Tensor,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "point_coords": points.to(device=device, dtype=torch.float32)[None],
+            "point_labels": labels.to(device=device, dtype=torch.int32)[None],
+        }
+
+    def _resize_predicted_masks(self, masks: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
+        if tuple(masks.shape[-2:]) == target_size:
+            return masks.float()
+        return F.interpolate(
+            masks[:, None].float(),
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )[:, 0]
 
     def _prompt_inputs_for_frame(
         self,

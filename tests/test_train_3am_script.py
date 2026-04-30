@@ -39,6 +39,22 @@ class FakeSam2Adapter(nn.Module):
             "occlusion_logits": torch.stack([-pooled, pooled], dim=1),
         }
 
+    def track_masks_from_points(
+        self,
+        images: torch.Tensor,
+        *,
+        reference_index: int,
+        points: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        masks = torch.full((images.shape[0], images.shape[-2], images.shape[-1]), -12.0, device=images.device)
+        x = int(points[0, 0].detach().cpu().item())
+        y = int(points[0, 1].detach().cpu().item())
+        x0, x1 = max(0, x - 1), min(images.shape[-1], x + 2)
+        y0, y1 = max(0, y - 1), min(images.shape[-2], y + 2)
+        masks[:, y0:y1, x0:x1] = 12.0
+        return masks
+
 
 class FakeMust3rAdapter(nn.Module):
     model = object()
@@ -82,14 +98,15 @@ def _write_image(path: Path) -> None:
     Image.fromarray(np.full((4, 4, 3), 128, dtype=np.uint8)).save(path)
 
 
-def _write_mask(path: Path) -> None:
+def _write_mask(path: Path, *, full: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    mask = np.zeros((4, 4), dtype=np.uint8)
-    mask[1:3, 1:3] = 255
+    mask = np.full((4, 4), 255, dtype=np.uint8) if full else np.zeros((4, 4), dtype=np.uint8)
+    if not full:
+        mask[1:3, 1:3] = 255
     Image.fromarray(mask).save(path)
 
 
-def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = True) -> Path:
+def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = True, full_masks: bool = False) -> Path:
     scene_dir = tmp_path / "data" / "processed" / "scannetpp" / "scene_a"
     frames: list[FrameRecord] = []
     for index in range(2):
@@ -97,7 +114,7 @@ def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = 
         image_path = scene_dir / "images" / f"{frame_id}.png"
         mask_path = scene_dir / "masks" / f"{frame_id}.png"
         _write_image(image_path)
-        _write_mask(mask_path)
+        _write_mask(mask_path, full=full_masks)
         frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
     write_manifest(manifest, [SceneRecord("scannetpp", "scene_a", "train", tuple(frames))])
@@ -217,6 +234,60 @@ def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: P
     assert [path.name for path in must3r.seen_paths] == ["000.png", "001.png"]
 
 
+def test_training_replaces_full_scannetpp_masks_with_sam2_point_pseudo_masks(tmp_path: Path, capsys) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path, full_masks=True)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["sam2_point_pseudo_masks"] = {
+        "mode": "auto",
+        "datasets": ["scannetpp"],
+        "auto_foreground_ratio_threshold": 0.98,
+        "max_attempts": 1,
+        "min_foreground_ratio": 0.001,
+        "max_foreground_ratio": 0.9,
+        "allow_out_of_range_fallback": False,
+    }
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        log_every=1,
+        checkpoint_every=0,
+        save_model_every=0,
+        sam2_adapter=FakeSam2Adapter(),
+    )
+    captured = capsys.readouterr()
+
+    assert "target_source=sam2_point_pseudo_mask_auto_full_dataset_mask" in captured.out
+
+
+def test_training_keeps_normal_scannetpp_dataset_masks_by_default(tmp_path: Path, capsys) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path, full_masks=False)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["sam2_point_pseudo_masks"] = {
+        "mode": "auto",
+        "datasets": ["scannetpp"],
+        "auto_foreground_ratio_threshold": 0.98,
+    }
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        log_every=1,
+        checkpoint_every=0,
+        save_model_every=0,
+        sam2_adapter=FakeSam2Adapter(),
+    )
+    captured = capsys.readouterr()
+
+    assert "target_source=dataset_mask" in captured.out
+
+
 def test_online_must3r_dependency_failure_reports_underlying_error(tmp_path: Path) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path, write_feature_cache=False)
@@ -305,10 +376,12 @@ def test_training_visualization_header_lines_include_tracking_context() -> None:
         target_areas=(0, 4, 8),
         has_object_flags=(False, True, True),
         instance_id=7,
+        target_source="sam2_point_pseudo_mask_auto_full_dataset_mask",
     )
     text = "\n".join(lines)
 
     assert "3AM tracking batch" in text
+    assert "target_source=sam2_point_pseudo_mask_auto_full_dataset_mask" in text
     assert "prompt=mask" in text
     assert "ref=001" in text
     assert "frames=[000, 001, 002]" in text
@@ -443,3 +516,4 @@ def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
     assert "must3r_importable" in captured.out
     assert "mast3r_importable" in captured.out
     assert "dust3r_importable" in captured.out
+    assert "sam2_point_pseudo_masks" in captured.out

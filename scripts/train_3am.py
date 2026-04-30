@@ -8,6 +8,7 @@ import random
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -28,6 +29,7 @@ from three_am.models.adapters import (
 from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.models.three_am import ThreeAMConfig, ThreeAMCore
 from three_am.training.dataset import (
+    Prompt,
     TrainingBatch,
     ThreeAMTrainingDataset,
     configured_feature_cache_root,
@@ -244,6 +246,7 @@ def dry_run(
             "auto_resume": bool(training.get("auto_resume", False)),
             "strict_paper": bool(training.get("strict_paper", False)),
             "validate_every": int(training.get("validate_every", 0)),
+            "sam2_point_pseudo_masks": training.get("sam2_point_pseudo_masks", {}),
         },
         "external": {
             "sam2_repo": str(external.sam2_repo) if external.sam2_repo else None,
@@ -355,7 +358,8 @@ def _ensure_loss_is_differentiable(
     if batch is not None:
         batch_context = (
             f"; batch_frames={list(batch.frame_ids)}; has_object={batch.has_object.detach().cpu().tolist()}; "
-            f"prompt_frame_index={int(batch.prompt.frame_index)}; sampling_mode={batch.sampling_mode}"
+            f"prompt_frame_index={int(batch.prompt.frame_index)}; sampling_mode={batch.sampling_mode}; "
+            f"target_source={batch.target_source}"
         )
     raise RuntimeError(
         "3AM training loss is detached before backward. This usually means the selected SAM2 tracking forward path "
@@ -529,6 +533,178 @@ def _load_missing_must3r_features(
     return tuple(feature.to(device) for feature in features)
 
 
+def _mask_foreground_ratios(target_masks: torch.Tensor) -> torch.Tensor:
+    return target_masks.detach().float().flatten(1).mean(dim=1).cpu()
+
+
+def _batch_masks_exceed_ratio(batch: TrainingBatch, max_ratio: float) -> bool:
+    if batch.target_masks.numel() == 0:
+        return False
+    return bool((_mask_foreground_ratios(batch.target_masks) >= float(max_ratio)).any().item())
+
+
+def _scan_dataset_training_config(config: dict[str, Any]) -> dict[str, Any]:
+    return dict(config.get("training", {}).get("sam2_point_pseudo_masks", {}))
+
+
+def _sam2_point_pseudo_masks_enabled(config: dict[str, Any], batch: TrainingBatch) -> bool:
+    pseudo = _scan_dataset_training_config(config)
+    datasets = tuple(str(value) for value in pseudo.get("datasets", ("scannetpp",)))
+    if batch.dataset not in datasets:
+        return False
+    mode = str(pseudo.get("mode", "auto")).lower()
+    if mode in {"off", "false", "none", "0"}:
+        return False
+    if mode in {"on", "true", "always", "force", "1"}:
+        return True
+    threshold = float(pseudo.get("auto_foreground_ratio_threshold", 0.98))
+    return _batch_masks_exceed_ratio(batch, threshold)
+
+
+def _random_prompt_point_from_image(batch: TrainingBatch) -> tuple[int, torch.Tensor, torch.Tensor]:
+    num_frames = int(batch.images.shape[0])
+    reference_index = random.randrange(max(1, num_frames))
+    height, width = int(batch.images.shape[-2]), int(batch.images.shape[-1])
+    point = torch.tensor(
+        [[float(random.randrange(max(1, width))), float(random.randrange(max(1, height)))]],
+        dtype=torch.float32,
+        device=batch.images.device,
+    )
+    labels = torch.ones(1, dtype=torch.int64, device=batch.images.device)
+    return reference_index, point, labels
+
+
+def _binarize_pseudo_masks(masks: torch.Tensor, threshold: float) -> torch.Tensor:
+    return (masks.detach().float().sigmoid() >= float(threshold)).to(dtype=torch.float32)
+
+
+def _valid_pseudo_mask_areas(
+    target_masks: torch.Tensor,
+    *,
+    reference_index: int,
+    min_ratio: float,
+    max_ratio: float,
+) -> bool:
+    ratios = _mask_foreground_ratios(target_masks)
+    if ratios.numel() == 0:
+        return False
+    reference_index = min(max(int(reference_index), 0), ratios.numel() - 1)
+    reference_valid = float(min_ratio) <= float(ratios[reference_index].item()) <= float(max_ratio)
+    no_full_frame = bool((ratios <= float(max_ratio)).all().item())
+    return reference_valid and no_full_frame
+
+
+def _apply_sam2_point_pseudo_masks(
+    batch: TrainingBatch,
+    *,
+    sam2_adapter: Sam2TrainingAdapter,
+    config: dict[str, Any],
+) -> TrainingBatch:
+    if not _sam2_point_pseudo_masks_enabled(config, batch):
+        return batch
+    pseudo = _scan_dataset_training_config(config)
+    attempts = max(1, int(pseudo.get("max_attempts", 8)))
+    threshold = float(pseudo.get("mask_threshold", 0.5))
+    min_ratio = float(pseudo.get("min_foreground_ratio", 0.001))
+    max_ratio = float(pseudo.get("max_foreground_ratio", 0.9))
+    source_reason = (
+        "sam2_point_pseudo_mask_forced"
+        if str(pseudo.get("mode", "auto")).lower() in {"on", "true", "always", "force", "1"}
+        else "sam2_point_pseudo_mask_auto_full_dataset_mask"
+    )
+    best: tuple[TrainingBatch, torch.Tensor] | None = None
+    best_distance = float("inf")
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        reference_index, point, labels = _random_prompt_point_from_image(batch)
+        try:
+            pseudo_logits = _sam2_point_prompt_masks_for_batch(
+                sam2_adapter,
+                batch,
+                reference_index=reference_index,
+                point=point,
+                labels=labels,
+            )
+        except Exception as error:
+            last_error = error
+            continue
+        target_masks = _binarize_pseudo_masks(pseudo_logits, threshold)
+        has_object = target_masks.flatten(1).any(dim=1).to(device=batch.has_object.device)
+        prompt = Prompt(
+            type="point",
+            frame_index=reference_index,
+            points=point.detach().clone(),
+            point_labels=labels.detach().clone(),
+        )
+        updated = replace(
+            batch,
+            target_masks=target_masks.to(device=batch.target_masks.device),
+            has_object=has_object,
+            object_visibility=has_object,
+            prompt=prompt,
+            reference_frame_id=batch.frame_ids[reference_index],
+            instance_id=None,
+            target_source=source_reason,
+        )
+        if _valid_pseudo_mask_areas(
+            updated.target_masks,
+            reference_index=reference_index,
+            min_ratio=min_ratio,
+            max_ratio=max_ratio,
+        ):
+            return updated
+        ratios = _mask_foreground_ratios(updated.target_masks)
+        distance = float(torch.minimum((ratios - min_ratio).abs(), (ratios - max_ratio).abs()).mean().item())
+        if best is None or distance < best_distance:
+            best = (updated, ratios)
+            best_distance = distance
+    if best is not None and bool(pseudo.get("allow_out_of_range_fallback", False)):
+        updated, ratios = best
+        print(
+            " ".join(
+                [
+                    "sam2_point_pseudo_mask_warning=area_out_of_range",
+                    f"dataset={batch.dataset}",
+                    f"scene={batch.scene_id}",
+                    f"frames={list(batch.frame_ids)}",
+                    f"ratios={[round(float(value), 6) for value in ratios.tolist()]}",
+                    f"accepted_range=[{min_ratio},{max_ratio}]",
+                ]
+            )
+        )
+        return updated
+    if last_error is not None:
+        raise ExternalDependencyError("SAM2 point-prompt pseudo-mask generation failed") from last_error
+    raise ExternalDependencyError("SAM2 point-prompt pseudo-mask generation produced no usable masks")
+
+
+def _sam2_point_prompt_masks_for_batch(
+    sam2_adapter: Sam2TrainingAdapter,
+    batch: TrainingBatch,
+    *,
+    reference_index: int,
+    point: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    track_method = getattr(sam2_adapter, "track_masks_from_points", None)
+    if callable(track_method):
+        try:
+            return track_method(
+                batch.images,
+                reference_index=reference_index,
+                points=point,
+                labels=labels,
+            )
+        except ExternalDependencyError:
+            pass
+    predict_method = getattr(sam2_adapter, "predict_masks_from_points", None)
+    if not callable(predict_method):
+        raise ExternalDependencyError("SAM2 adapter does not expose point-prompt mask generation")
+    points_by_frame = [point.detach().clone() for _ in range(int(batch.images.shape[0]))]
+    labels_by_frame = [labels.detach().clone() for _ in range(int(batch.images.shape[0]))]
+    return predict_method(batch.images, points_by_frame, labels_by_frame)
+
+
 def _extract_online_must3r_features(
     adapter: Must3rFeatureAdapter,
     batch: TrainingBatch,
@@ -573,6 +749,7 @@ def run_validation_step(
     wrapper.eval()
     with torch.no_grad():
         batch = dataset.sample().to(device)
+        batch = _apply_sam2_point_pseudo_masks(batch, sam2_adapter=wrapper.sam2_adapter, config=config)
         must3r_features = _load_missing_must3r_features(
             batch,
             must3r_adapter,
@@ -668,6 +845,25 @@ def _draw_mask_contour(
     result = Image.fromarray(array)
     if draw_bbox:
         _draw_bbox(ImageDraw.Draw(result), _mask_bbox(mask), color)
+    return result
+
+
+def _draw_prompt_points(image: Image.Image, prompt: Prompt, frame_index: int) -> Image.Image:
+    if prompt.type != "point" or int(prompt.frame_index) != frame_index or prompt.points is None:
+        return image
+    result = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(result)
+    labels = prompt.point_labels
+    for point_index, point in enumerate(prompt.points.detach().float().cpu()):
+        x, y = float(point[0]), float(point[1])
+        label = int(labels[point_index].item()) if labels is not None and point_index < labels.numel() else 1
+        color = (80, 180, 255) if label > 0 else (255, 180, 60)
+        radius = 6
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=(0, 0, 0), width=3)
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, width=2)
+        if label > 0:
+            draw.line((x - radius, y, x + radius, y), fill=color, width=2)
+            draw.line((x, y - radius, x, y + radius), fill=color, width=2)
     return result
 
 
@@ -826,10 +1022,14 @@ def _training_visualization_header_lines(
     instance_id: int | None = None,
     warnings: Sequence[str] = (),
     sampling_mode: str = "unknown",
+    target_source: str = "dataset_mask",
 ) -> list[str]:
     joined_frame_ids = ", ".join(frame_ids)
     lines = [
-        f"3AM tracking batch | step={step} dataset={dataset} scene={scene_id} sampling={sampling_mode}",
+        (
+            f"3AM tracking batch | step={step} dataset={dataset} scene={scene_id} "
+            f"sampling={sampling_mode} target_source={target_source}"
+        ),
         (
             f"prompt={prompt_type} ref={reference_frame} frames=[{joined_frame_ids}] "
             f"batch_iou_empty_is_one={_format_metric(batch_iou_empty_is_one)} "
@@ -907,6 +1107,7 @@ def save_training_visualization(
         pred_bool = _mask_bool(probabilities[frame_index], threshold=0.5)
         image_panel = _draw_mask_contour(Image.fromarray(base), target_bool, (0, 255, 80))
         image_panel = _draw_mask_contour(image_panel, pred_bool, (255, 60, 40))
+        image_panel = _draw_prompt_points(image_panel, batch.prompt, frame_index)
         gt_panel = _binary_mask_panel(target_bool, color=(0, 220, 80))
         pred_panel = _binary_mask_panel(pred_bool, color=(255, 60, 40))
         compare_panel = _comparison_panel(base, target_bool, pred_bool)
@@ -959,7 +1160,8 @@ def save_training_visualization(
             draw.text((x + 4, 4), label, fill=fill)
             draw.text((x + 4, 20), sublabel[:56], fill=(205, 205, 205))
             if label.startswith("image"):
-                draw.text((x + 4, 36), "contours: GT=green Pred=red", fill=(170, 210, 170))
+                prompt_note = " prompt point=blue" if batch.prompt.type == "point" and is_reference else ""
+                draw.text((x + 4, 36), f"contours: GT=green Pred=red{prompt_note}"[:64], fill=(170, 210, 170))
             x += panel.width
         rows.append(row)
     canvas_width = max(720, *(row.width for row in rows))
@@ -983,6 +1185,7 @@ def save_training_visualization(
         instance_id=batch.instance_id,
         warnings=diagnostics["warnings"],
         sampling_mode=batch.sampling_mode,
+        target_source=batch.target_source,
     )
     header_height = max(58, 10 + len(header_lines) * 16)
     canvas_height = header_height + sum(row.height for row in rows)
@@ -1122,6 +1325,7 @@ def run_training(
         batch: TrainingBatch | None = None
         for attempt in range(max(1, max_detached_loss_resample_attempts)):
             batch = dataset.sample().to(device)
+            batch = _apply_sam2_point_pseudo_masks(batch, sam2_adapter=wrapper.sam2_adapter, config=config)
             must3r_features = _load_missing_must3r_features(
                 batch,
                 must3r_adapter,
@@ -1147,6 +1351,7 @@ def run_training(
                             f"has_object={batch.has_object.detach().cpu().tolist()}",
                             f"prompt_index={int(batch.prompt.frame_index)}",
                             f"sampling={batch.sampling_mode}",
+                            f"target_source={batch.target_source}",
                         ]
                     )
                 )
@@ -1177,6 +1382,7 @@ def run_training(
                         f"step={step}",
                         f"dataset={batch.dataset}",
                         f"scene={batch.scene_id}",
+                        f"target_source={batch.target_source}",
                         f"fps={step / elapsed:.3f}",
                         *(f"{key}={value:.6f}" for key, value in items.items()),
                     ]

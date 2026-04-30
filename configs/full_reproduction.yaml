@@ -88,5 +88,14 @@ training:
   visualization_dir: outputs/visualizations/train
   visualization_max_frames: 4
   visualization_max_side: 384
+  sam2_point_pseudo_masks:
+    mode: auto
+    datasets: [scannetpp]
+    auto_foreground_ratio_threshold: 0.98
+    max_attempts: 8
+    mask_threshold: 0.5
+    min_foreground_ratio: 0.001
+    max_foreground_ratio: 0.9
+    allow_out_of_range_fallback: false
   amp: true
   checkpoint_out: outputs/checkpoints/3am_full.pt

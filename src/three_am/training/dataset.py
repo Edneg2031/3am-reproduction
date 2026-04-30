@@ -77,6 +77,7 @@ class TrainingBatch:
     instance_id: int | None = None
     object_visibility: torch.Tensor | None = None
     must3r_geometry: Must3rFeatureBundle | None = None
+    target_source: str = "dataset_mask"
 
     def to(self, device: torch.device | str) -> "TrainingBatch":
         must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle | None
