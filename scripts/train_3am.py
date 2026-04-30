@@ -13,7 +13,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from torch import nn
 from torch.nn import functional as F
 
@@ -626,6 +626,93 @@ def _overlay_mask(image: np.ndarray, mask: torch.Tensor, color: tuple[int, int, 
     return blended.round().clip(0, 255).astype(np.uint8)
 
 
+def _mask_bool(mask: torch.Tensor, *, threshold: float = 0.5) -> np.ndarray:
+    return mask.detach().float().cpu().numpy() >= threshold
+
+
+def _mask_area(mask: np.ndarray) -> int:
+    return int(mask.astype(bool).sum())
+
+
+def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask.astype(bool))
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _mask_edges(mask: np.ndarray) -> np.ndarray:
+    mask_image = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+    dilated = np.asarray(mask_image.filter(ImageFilter.MaxFilter(3))) > 0
+    eroded = np.asarray(mask_image.filter(ImageFilter.MinFilter(3))) > 0
+    return dilated ^ eroded
+
+
+def _draw_bbox(draw: ImageDraw.ImageDraw, bbox: tuple[int, int, int, int] | None, color: tuple[int, int, int]) -> None:
+    if bbox is None:
+        return
+    draw.rectangle(bbox, outline=color, width=2)
+
+
+def _draw_mask_contour(
+    image: Image.Image,
+    mask: np.ndarray,
+    color: tuple[int, int, int],
+    *,
+    draw_bbox: bool = True,
+) -> Image.Image:
+    result = image.convert("RGB").copy()
+    array = np.asarray(result).copy()
+    edges = _mask_edges(mask)
+    array[edges] = np.asarray(color, dtype=np.uint8)
+    result = Image.fromarray(array)
+    if draw_bbox:
+        _draw_bbox(ImageDraw.Draw(result), _mask_bbox(mask), color)
+    return result
+
+
+def _binary_mask_panel(
+    mask: np.ndarray,
+    *,
+    color: tuple[int, int, int],
+    background: tuple[int, int, int] = (12, 12, 12),
+) -> Image.Image:
+    panel = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    panel[:, :] = np.asarray(background, dtype=np.uint8)
+    panel[mask.astype(bool)] = np.asarray(color, dtype=np.uint8)
+    image = Image.fromarray(panel)
+    image = _draw_mask_contour(image, mask, (255, 255, 255), draw_bbox=False)
+    _draw_bbox(ImageDraw.Draw(image), _mask_bbox(mask), color)
+    return image
+
+
+def _comparison_panel(base: np.ndarray, target: np.ndarray, prediction: np.ndarray) -> Image.Image:
+    image = Image.fromarray(base)
+    image = _draw_mask_contour(image, target, (0, 255, 80))
+    image = _draw_mask_contour(image, prediction, (255, 70, 60))
+    return image
+
+
+def _error_panel(target: np.ndarray, prediction: np.ndarray) -> Image.Image:
+    if target.shape != prediction.shape:
+        raise ValueError(f"target and prediction masks must have the same shape, got {target.shape} and {prediction.shape}")
+    panel = np.zeros((*target.shape, 3), dtype=np.uint8)
+    panel[:, :] = np.asarray((14, 14, 14), dtype=np.uint8)
+    panel[target & prediction] = np.asarray((255, 220, 0), dtype=np.uint8)
+    panel[target & ~prediction] = np.asarray((0, 220, 80), dtype=np.uint8)
+    panel[~target & prediction] = np.asarray((255, 60, 40), dtype=np.uint8)
+    return Image.fromarray(panel)
+
+
+def _heatmap_panel(probability: torch.Tensor) -> Image.Image:
+    prob = probability.detach().float().cpu().clamp(0, 1).numpy()
+    red = (prob * 255.0).round()
+    green = ((1.0 - np.abs(prob - 0.5) * 2.0) * 180.0).clip(0, 180).round()
+    blue = ((1.0 - prob) * 255.0).round()
+    heatmap = np.stack([red, green, blue], axis=-1).astype(np.uint8)
+    return Image.fromarray(heatmap)
+
+
 def _match_error_overlay(
     image: np.ndarray,
     target_mask: torch.Tensor,
@@ -633,21 +720,13 @@ def _match_error_overlay(
     *,
     threshold: float = 0.5,
 ) -> np.ndarray:
-    target = target_mask.detach().float().cpu().numpy() > 0.5
-    pred = prediction.detach().float().cpu().numpy() >= threshold
-    if target.shape != pred.shape:
-        raise ValueError(f"target and prediction masks must have the same shape, got {target.shape} and {pred.shape}")
-    overlay = image.astype(np.float32).copy()
-    alpha = 0.65
-    categories = (
-        (target & pred, np.asarray((255, 220, 0), dtype=np.float32)),
-        (target & ~pred, np.asarray((0, 220, 80), dtype=np.float32)),
-        (~target & pred, np.asarray((255, 60, 40), dtype=np.float32)),
-    )
-    for category_mask, color in categories:
-        if category_mask.any():
-            overlay[category_mask] = overlay[category_mask] * (1.0 - alpha) + color * alpha
-    return overlay.round().clip(0, 255).astype(np.uint8)
+    target = _mask_bool(target_mask, threshold=0.5)
+    pred = _mask_bool(prediction, threshold=threshold)
+    error = np.asarray(_error_panel(target, pred))
+    background = image.astype(np.float32) * 0.2
+    foreground = error.astype(np.float32) * 0.8
+    mask = (target | pred)[..., None]
+    return np.where(mask, foreground + background, background).round().clip(0, 255).astype(np.uint8)
 
 
 def _binary_iou_by_frame(predictions: torch.Tensor, targets: torch.Tensor, *, threshold: float = 0.5) -> torch.Tensor:
@@ -762,7 +841,7 @@ def _training_visualization_header_lines(
             f"instance_id={instance_id if instance_id is not None else 'n/a'} "
             f"has_object={_format_bool_flags(has_object_flags)} target_areas={_format_sequence(target_areas)}"
         ),
-        "colors: GT=green prediction=red overlap=yellow gt-only=green pred-only=red",
+        "panels: image contours | GT binary | prediction binary | contour compare | error map | confidence heatmap",
     ]
     lines.extend(warnings)
     return lines
@@ -787,6 +866,13 @@ def _resize_for_visualization(image: Image.Image, max_side: int) -> Image.Image:
     if scale >= 1.0:
         return image
     return image.resize((max(1, round(width * scale)), max(1, round(height * scale))), Image.Resampling.BILINEAR)
+
+
+def _bbox_text(mask: np.ndarray) -> str:
+    bbox = _mask_bbox(mask)
+    if bbox is None:
+        return "bbox=none"
+    return f"bbox=({bbox[0]},{bbox[1]})-({bbox[2]},{bbox[3]})"
 
 
 def save_training_visualization(
@@ -817,18 +903,26 @@ def save_training_visualization(
     rows: list[Image.Image] = []
     for frame_index in frame_order:
         base = _tensor_image_to_uint8(images[frame_index])
-        gt_overlay = _overlay_mask(base, target_masks[frame_index], (0, 220, 80))
-        pred_overlay = _overlay_mask(base, probabilities[frame_index], (255, 60, 40))
-        match_overlay = _match_error_overlay(base, target_masks[frame_index], probabilities[frame_index])
+        target_bool = _mask_bool(target_masks[frame_index], threshold=0.5)
+        pred_bool = _mask_bool(probabilities[frame_index], threshold=0.5)
+        image_panel = _draw_mask_contour(Image.fromarray(base), target_bool, (0, 255, 80))
+        image_panel = _draw_mask_contour(image_panel, pred_bool, (255, 60, 40))
+        gt_panel = _binary_mask_panel(target_bool, color=(0, 220, 80))
+        pred_panel = _binary_mask_panel(pred_bool, color=(255, 60, 40))
+        compare_panel = _comparison_panel(base, target_bool, pred_bool)
+        error_panel = _error_panel(target_bool, pred_bool)
+        heatmap_panel = _heatmap_panel(probabilities[frame_index])
         panels = [
-            _resize_for_visualization(Image.fromarray(base), max_side),
-            _resize_for_visualization(Image.fromarray(gt_overlay), max_side),
-            _resize_for_visualization(Image.fromarray(pred_overlay), max_side),
-            _resize_for_visualization(Image.fromarray(match_overlay), max_side),
+            _resize_for_visualization(image_panel, max_side),
+            _resize_for_visualization(gt_panel, max_side),
+            _resize_for_visualization(pred_panel, max_side),
+            _resize_for_visualization(compare_panel, max_side),
+            _resize_for_visualization(error_panel, max_side),
+            _resize_for_visualization(heatmap_panel, max_side),
         ]
         row_width = sum(panel.width for panel in panels)
         row_height = max(panel.height for panel in panels)
-        label_height = 38
+        label_height = 54
         row = Image.new("RGB", (row_width, row_height + label_height), (24, 24, 24))
         draw = ImageDraw.Draw(row)
         frame_id = batch.frame_ids[frame_index]
@@ -837,19 +931,35 @@ def save_training_visualization(
         frame_label = f"image | frame {frame_id}"
         if is_reference:
             frame_label = f"image | REF/PROMPT {batch.prompt.type} {frame_id}"
+        gt_area = _mask_area(target_bool)
+        pred_area = _mask_area(pred_bool)
+        overlap_area = _mask_area(target_bool & pred_bool)
+        fp_area = _mask_area(~target_bool & pred_bool)
+        fn_area = _mask_area(target_bool & ~pred_bool)
         labels = [
             frame_label,
-            "gt mask",
-            "prediction",
-            "match/error",
+            "GT binary",
+            "SAM2/3AM prediction",
+            "GT green + Pred red",
+            "error map",
+            "prediction confidence",
         ]
-        detail = f"IoU={ious[frame_index].item():.3f} | {visibility}"
+        sublabels = [
+            f"IoU={ious[frame_index].item():.3f} | {visibility}",
+            f"GT area={gt_area} | {_bbox_text(target_bool)}",
+            f"Pred area={pred_area} | {_bbox_text(pred_bool)}",
+            f"overlap={overlap_area} fp={fp_area} fn={fn_area}",
+            f"yellow=ok green=missed red=extra",
+            f"red=high blue=low",
+        ]
         x = 0
-        for panel, label in zip(panels, labels, strict=True):
+        for panel, label, sublabel in zip(panels, labels, sublabels, strict=True):
             row.paste(panel, (x, label_height))
             fill = (255, 236, 120) if is_reference and "REF/PROMPT" in label else (235, 235, 235)
             draw.text((x + 4, 4), label, fill=fill)
-            draw.text((x + 4, 20), detail if label.startswith("image") else "", fill=(205, 205, 205))
+            draw.text((x + 4, 20), sublabel[:56], fill=(205, 205, 205))
+            if label.startswith("image"):
+                draw.text((x + 4, 36), "contours: GT=green Pred=red", fill=(170, 210, 170))
             x += panel.width
         rows.append(row)
     canvas_width = max(720, *(row.width for row in rows))

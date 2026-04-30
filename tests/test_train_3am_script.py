@@ -408,7 +408,27 @@ def test_match_error_overlay_color_semantics() -> None:
     assert overlap[0] > 100 and overlap[1] > 100 and overlap[2] < 50
     assert gt_only[1] > gt_only[0] and gt_only[1] > gt_only[2]
     assert pred_only[0] > pred_only[1] and pred_only[0] > pred_only[2]
-    assert np.array_equal(background, np.zeros(3, dtype=np.uint8))
+    assert np.all(background < 10)
+
+
+def test_training_visualization_mask_helpers_report_area_and_bbox() -> None:
+    train_3am = _load_train_module()
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[1:3, 2:5] = True
+
+    assert train_3am._mask_area(mask) == 6
+    assert train_3am._bbox_text(mask) == "bbox=(2,1)-(4,2)"
+    assert train_3am._bbox_text(np.zeros((4, 5), dtype=bool)) == "bbox=none"
+
+
+def test_training_visualization_binary_panel_uses_mask_color() -> None:
+    train_3am = _load_train_module()
+    mask = np.zeros((3, 3), dtype=bool)
+    mask[1, 1] = True
+
+    panel = np.asarray(train_3am._binary_mask_panel(mask, color=(255, 60, 40)))
+
+    assert panel[1, 1, 0] >= panel[1, 1, 1]
 
 
 def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
