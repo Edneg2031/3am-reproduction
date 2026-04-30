@@ -526,6 +526,20 @@ class Sam2TrainingAdapter(nn.Module):
             "occlusion_logits": torch.stack([-object_scores_tensor, object_scores_tensor], dim=1),
         }
 
+    def _frame_output_grad_summary(
+        self,
+        frame_outputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> str:
+        parts: list[str] = []
+        for frame_index in sorted(frame_outputs):
+            mask_logits, iou_score, object_score = frame_outputs[frame_index]
+            parts.append(
+                "frame="
+                f"{frame_index}:mask_grad={mask_logits.requires_grad},"
+                f"iou_grad={iou_score.requires_grad},object_grad={object_score.requires_grad}"
+            )
+        return "; ".join(parts)
+
     def _call_training_method(
         self,
         method: Any,
@@ -547,7 +561,7 @@ class Sam2TrainingAdapter(nn.Module):
         except (TypeError, ValueError):
             return self._call_with_grad(method, batch=batch, merged_features=merged_features, backbone_out=backbone_out)
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
-            return method(**kwargs)
+            return self._call_with_grad(method, **kwargs)
         supported = {
             name: value
             for name, value in kwargs.items()

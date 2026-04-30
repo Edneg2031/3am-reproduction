@@ -346,16 +346,27 @@ def _ensure_loss_is_differentiable(
     *,
     wrapper: ThreeAMTrainingWrapper,
     outputs: dict[str, torch.Tensor],
+    batch: TrainingBatch | None = None,
 ) -> None:
     if loss.requires_grad and loss.grad_fn is not None:
         return
     selector = getattr(wrapper.sam2_adapter, "last_feature_selector", None)
+    batch_context = ""
+    if batch is not None:
+        batch_context = (
+            f"; batch_frames={list(batch.frame_ids)}; has_object={batch.has_object.detach().cpu().tolist()}; "
+            f"prompt_frame_index={int(batch.prompt.frame_index)}; sampling_mode={batch.sampling_mode}"
+        )
     raise RuntimeError(
         "3AM training loss is detached before backward. This usually means the selected SAM2 tracking forward path "
         "ran under no_grad/inference_mode or did not use the merged 3AM backbone feature. "
         f"sam2_feature_selector={selector!r}; trainable_parameters={_trainable_parameter_summary(wrapper)}; "
-        f"outputs=({_output_grad_summary(outputs)})"
+        f"outputs=({_output_grad_summary(outputs)}){batch_context}"
     )
+
+
+def _loss_is_differentiable(loss: torch.Tensor) -> bool:
+    return bool(loss.requires_grad and loss.grad_fn is not None)
 
 
 def _load_model_state(wrapper: ThreeAMTrainingWrapper, payload: dict[str, Any]) -> None:
@@ -993,21 +1004,46 @@ def run_training(
     wrapper.train()
     last_step = start_step
     started = time.time()
+    max_detached_loss_resample_attempts = int(training_config.get("max_detached_loss_resample_attempts", 10))
     for step_index in range(start_step, total_iterations):
         step = step_index + 1
-        batch = dataset.sample().to(device)
-        must3r_features = _load_missing_must3r_features(
-            batch,
-            must3r_adapter,
-            config,
-            device,
-            online_must3r=online_enabled,
-        )
-        optimizer.zero_grad(set_to_none=True)
-        with _autocast(device, amp_enabled):
-            outputs = wrapper(batch, must3r_features)
-            loss = sam2_training_loss(outputs, batch.target_masks, batch.has_object, weights)
-        _ensure_loss_is_differentiable(loss.total, wrapper=wrapper, outputs=outputs)
+        outputs: dict[str, torch.Tensor] | None = None
+        loss = None
+        batch: TrainingBatch | None = None
+        for attempt in range(max(1, max_detached_loss_resample_attempts)):
+            batch = dataset.sample().to(device)
+            must3r_features = _load_missing_must3r_features(
+                batch,
+                must3r_adapter,
+                config,
+                device,
+                online_must3r=online_enabled,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast(device, amp_enabled):
+                outputs = wrapper(batch, must3r_features)
+                loss = sam2_training_loss(outputs, batch.target_masks, batch.has_object, weights)
+            if _loss_is_differentiable(loss.total):
+                break
+            if attempt + 1 < max_detached_loss_resample_attempts:
+                print(
+                    " ".join(
+                        [
+                            f"step={step}",
+                            f"detached_loss_resample={attempt + 1}",
+                            f"dataset={batch.dataset}",
+                            f"scene={batch.scene_id}",
+                            f"frames={list(batch.frame_ids)}",
+                            f"has_object={batch.has_object.detach().cpu().tolist()}",
+                            f"prompt_index={int(batch.prompt.frame_index)}",
+                            f"sampling={batch.sampling_mode}",
+                        ]
+                    )
+                )
+                continue
+        if outputs is None or loss is None or batch is None:
+            raise RuntimeError("Training loop failed to produce a batch")
+        _ensure_loss_is_differentiable(loss.total, wrapper=wrapper, outputs=outputs, batch=batch)
         scaler.scale(loss.total).backward()
         scaler.step(optimizer)
         scaler.update()

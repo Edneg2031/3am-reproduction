@@ -13,6 +13,7 @@ from torch import nn
 from three_am.data.io import write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
 from three_am.models.feature_merger import Must3rFeatureBundle
+from three_am.training.dataset import Prompt
 
 
 class FakeSam2Adapter(nn.Module):
@@ -361,6 +362,35 @@ def test_training_visualization_frame_order_starts_from_reference() -> None:
 
     assert train_3am._visualization_frame_order(5, 2, 4) == [2, 3, 4, 1]
     assert train_3am._visualization_frame_order(3, 99, 3) == [2, 1, 0]
+
+
+def test_training_loss_differentiability_check_reports_batch_context() -> None:
+    train_3am = _load_train_module()
+    batch = train_3am.TrainingBatch(
+        images=torch.zeros(1, 3, 4, 4),
+        target_masks=torch.zeros(1, 4, 4),
+        prompt=Prompt(type="mask", frame_index=0, mask=torch.zeros(4, 4)),
+        must3r_features=None,
+        dataset="scannetpp",
+        scene_id="scene_a",
+        frame_ids=("000",),
+        image_paths=(),
+        has_object=torch.tensor([False]),
+        sampling_mode="fov",
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        train_3am._ensure_loss_is_differentiable(
+            torch.tensor(1.0),
+            wrapper=type("Wrapper", (), {"sam2_adapter": object(), "named_parameters": lambda self: iter(())})(),
+            outputs={"mask_logits": torch.zeros(1, 4, 4)},
+            batch=batch,
+        )
+
+    message = str(excinfo.value)
+    assert "batch_frames=['000']" in message
+    assert "has_object=[False]" in message
+    assert "sampling_mode=fov" in message
 
 
 def test_match_error_overlay_color_semantics() -> None:
