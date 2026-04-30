@@ -63,6 +63,13 @@ class FakeSam2BackboneAware(nn.Module):
         }
 
 
+class FakeSam2WithVisionAlias(FakeSam2BackboneAware):
+    def forward_image(self, images: torch.Tensor) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        backbone_out = super().forward_image(images)
+        backbone_out["vision_features"] = torch.full((images.shape[0], 256, 8, 8), 3.0)
+        return backbone_out
+
+
 def test_sam2_adapter_injects_merged_features_into_backbone_fpn() -> None:
     adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
     model = FakeSam2BackboneAware()
@@ -77,6 +84,22 @@ def test_sam2_adapter_injects_merged_features_into_backbone_fpn() -> None:
     assert torch.equal(model.seen_backbone["backbone_fpn"][-1], merged)
     assert torch.equal(model.seen_backbone["backbone_fpn"][0], torch.zeros(2, 32, 16, 16))
     assert set(outputs) == {"mask_logits", "iou_scores", "occlusion_logits"}
+
+
+def test_sam2_adapter_prefers_backbone_fpn_over_vision_feature_alias() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
+    model = FakeSam2WithVisionAlias()
+    adapter.model = model
+    images = torch.randn(2, 3, 64, 64)
+
+    sam_features = adapter.encode_sam_features(images)
+    merged = torch.full_like(sam_features, 9.0)
+    adapter.forward_train_sequence(batch=object(), merged_features=merged)
+
+    assert adapter.last_feature_selector == ("dict_list", "backbone_fpn")
+    assert model.seen_backbone is not None
+    assert model.seen_backbone["backbone_fpn"][-1] is merged
+    assert model.seen_backbone["vision_features"] is merged
 
 
 def test_sam2_adapter_rejects_merged_feature_shape_mismatch() -> None:
@@ -222,7 +245,29 @@ def test_strict_sam2_adapter_rejects_per_frame_head_fallback() -> None:
     )
     sam_features = adapter.encode_sam_features(images)
 
-    with pytest.raises(ExternalDependencyError, match="Strict paper training requires official SAM2 tracking"):
+    with pytest.raises(ExternalDependencyError, match="backbone_fpn"):
+        adapter.forward_train_sequence(batch, sam_features)
+
+
+def test_strict_sam2_adapter_rejects_tracking_without_backbone_fpn_injection() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig(strict_paper=True))
+    adapter.model = FakePerFrameSam2()
+    images = torch.randn(1, 3, 64, 64)
+    target_masks = torch.zeros(1, 64, 64)
+    batch = TrainingBatch(
+        images=images,
+        target_masks=target_masks,
+        prompt=Prompt(type="mask", frame_index=0, mask=target_masks[0]),
+        must3r_features=None,
+        dataset="scannetpp",
+        scene_id="scene_a",
+        frame_ids=("000",),
+        image_paths=(),
+        has_object=torch.tensor([False]),
+    )
+    sam_features = adapter.encode_sam_features(images)
+
+    with pytest.raises(ExternalDependencyError, match="backbone_fpn"):
         adapter.forward_train_sequence(batch, sam_features)
 
 

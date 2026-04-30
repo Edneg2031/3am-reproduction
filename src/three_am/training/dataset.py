@@ -782,6 +782,9 @@ class ThreeAMTrainingDataset:
             fallback = self._select_strict_continuous_indices(len(frames), sampling_config.sequence_length)
             for index in fallback:
                 if index not in selected and len(selected) < sampling_config.sequence_length:
+                    target = _target_mask(raw_masks[index], instance_id, binary_mode).numpy() > 0.5
+                    if target.any():
+                        continue
                     selected.append(index)
         return selected, instance_id, binary_mode
 

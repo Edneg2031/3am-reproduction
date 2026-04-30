@@ -9,7 +9,7 @@ import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -616,6 +616,67 @@ def _binary_iou_by_frame(predictions: torch.Tensor, targets: torch.Tensor, *, th
     return torch.where(union > 0, intersection / union.clamp_min(1), torch.ones_like(union))
 
 
+def _format_sequence(values: Sequence[Any], *, max_items: int = 8) -> str:
+    items = [str(value) for value in values[:max_items]]
+    if len(values) > max_items:
+        items.append("...")
+    return "[" + ",".join(items) + "]"
+
+
+def _format_bool_flags(values: Sequence[bool], *, max_items: int = 16) -> str:
+    items = ["1" if value else "0" for value in values[:max_items]]
+    if len(values) > max_items:
+        items.append("...")
+    return "".join(items)
+
+
+def _visualization_diagnostics(
+    probabilities: torch.Tensor,
+    target_masks: torch.Tensor,
+    *,
+    has_object: torch.Tensor,
+    reference_index: int,
+    threshold: float = 0.5,
+) -> dict[str, Any]:
+    ious = _binary_iou_by_frame(probabilities, target_masks, threshold=threshold)
+    predictions = probabilities.detach().float().cpu() >= threshold
+    targets = target_masks.detach().float().cpu() > 0.5
+    target_areas = targets.flatten(1).sum(dim=1).to(dtype=torch.int64)
+    prediction_areas = predictions.flatten(1).sum(dim=1).to(dtype=torch.int64)
+    visible = has_object.detach().cpu().bool()
+    if visible.numel() != target_masks.shape[0]:
+        raise ValueError(f"has_object must have one value per frame, got {tuple(has_object.shape)}")
+    non_ref = torch.ones_like(visible, dtype=torch.bool)
+    if non_ref.numel():
+        reference_index = min(max(reference_index, 0), non_ref.numel() - 1)
+        non_ref[reference_index] = False
+    visible_non_ref = visible & non_ref
+    empty_empty = (target_areas == 0) & (prediction_areas == 0)
+    warnings: list[str] = []
+    if int(visible.sum().item()) == 0:
+        warnings.append("[WARN] all target masks are empty; batch_iou_empty_is_one can be 1.000 without tracking signal")
+    elif not bool(visible[reference_index]):
+        warnings.append("[WARN] reference/prompt mask is empty")
+    if not bool(visible_non_ref.any()):
+        warnings.append("[WARN] no non-reference visible target frames in visualization")
+    return {
+        "ious": ious,
+        "batch_iou_empty_is_one": float(ious.mean().item()) if ious.numel() else None,
+        "visible_iou": float(ious[visible].mean().item()) if bool(visible.any()) else None,
+        "non_ref_visible_iou": float(ious[visible_non_ref].mean().item()) if bool(visible_non_ref.any()) else None,
+        "ref_iou": float(ious[reference_index].item()) if ious.numel() else None,
+        "tracking_recall": float(((ious > 0.0) & visible).float().sum().item() / visible.float().sum().item())
+        if bool(visible.any())
+        else None,
+        "visible_frames": int(visible.sum().item()),
+        "empty_empty_frames": int(empty_empty.sum().item()),
+        "target_areas": [int(value) for value in target_areas.tolist()],
+        "prediction_areas": [int(value) for value in prediction_areas.tolist()],
+        "has_object_flags": [bool(value) for value in visible.tolist()],
+        "warnings": warnings,
+    }
+
+
 def _format_metric(value: float | None) -> str:
     if value is None:
         return "n/a"
@@ -630,21 +691,37 @@ def _training_visualization_header_lines(
     prompt_type: str,
     reference_frame: str,
     frame_ids: tuple[str, ...],
-    mean_iou: float | None,
+    batch_iou_empty_is_one: float | None,
     visible_iou: float | None,
+    non_ref_visible_iou: float | None,
+    ref_iou: float | None,
     tracking_recall: float | None,
+    visible_frames: int,
+    empty_empty_frames: int,
+    target_areas: Sequence[int] = (),
+    has_object_flags: Sequence[bool] = (),
+    instance_id: int | None = None,
+    warnings: Sequence[str] = (),
     sampling_mode: str = "unknown",
 ) -> list[str]:
     joined_frame_ids = ", ".join(frame_ids)
-    return [
+    lines = [
         f"3AM tracking batch | step={step} dataset={dataset} scene={scene_id} sampling={sampling_mode}",
         (
             f"prompt={prompt_type} ref={reference_frame} frames=[{joined_frame_ids}] "
-            f"mean_iou={_format_metric(mean_iou)} visible_iou={_format_metric(visible_iou)} "
-            f"tracking_recall_like={_format_metric(tracking_recall)}"
+            f"batch_iou_empty_is_one={_format_metric(batch_iou_empty_is_one)} "
+            f"visible_iou={_format_metric(visible_iou)} non_ref_visible_iou={_format_metric(non_ref_visible_iou)} "
+            f"ref_iou={_format_metric(ref_iou)} tracking_recall_like={_format_metric(tracking_recall)}"
+        ),
+        (
+            f"visible_frames={visible_frames}/{len(frame_ids)} empty_empty_frames={empty_empty_frames} "
+            f"instance_id={instance_id if instance_id is not None else 'n/a'} "
+            f"has_object={_format_bool_flags(has_object_flags)} target_areas={_format_sequence(target_areas)}"
         ),
         "colors: GT=green prediction=red overlap=yellow gt-only=green pred-only=red",
     ]
+    lines.extend(warnings)
+    return lines
 
 
 def _visualization_frame_order(num_frames: int, reference_index: int, max_frames: int) -> list[int]:
@@ -685,15 +762,14 @@ def save_training_visualization(
     num_frames = int(images.shape[0])
     reference_index = min(max(int(batch.prompt.frame_index), 0), max(num_frames - 1, 0))
     frame_order = _visualization_frame_order(num_frames, reference_index, max_frames)
-    ious = _binary_iou_by_frame(probabilities, target_masks)
-    has_object = batch.has_object.detach().cpu().bool()
-    mean_iou = float(ious.mean().item()) if ious.numel() else None
-    visible_iou = float(ious[has_object].mean().item()) if bool(has_object.any()) else None
-    tracking_recall = (
-        float(((ious > 0.0) & has_object).float().sum().item() / has_object.float().sum().item())
-        if bool(has_object.any())
-        else None
+    diagnostics = _visualization_diagnostics(
+        probabilities,
+        target_masks,
+        has_object=batch.has_object,
+        reference_index=reference_index,
     )
+    ious = diagnostics["ious"]
+    has_object = batch.has_object.detach().cpu().bool()
     rows: list[Image.Image] = []
     for frame_index in frame_order:
         base = _tensor_image_to_uint8(images[frame_index])
@@ -733,10 +809,6 @@ def save_training_visualization(
             x += panel.width
         rows.append(row)
     canvas_width = max(720, *(row.width for row in rows))
-    header_height = 58
-    canvas_height = header_height + sum(row.height for row in rows)
-    canvas = Image.new("RGB", (canvas_width, canvas_height), (24, 24, 24))
-    draw = ImageDraw.Draw(canvas)
     reference_frame = batch.frame_ids[reference_index] if 0 <= reference_index < len(batch.frame_ids) else str(reference_index)
     header_lines = _training_visualization_header_lines(
         step=step,
@@ -745,13 +817,26 @@ def save_training_visualization(
         prompt_type=batch.prompt.type,
         reference_frame=reference_frame,
         frame_ids=batch.frame_ids,
-        mean_iou=mean_iou,
-        visible_iou=visible_iou,
-        tracking_recall=tracking_recall,
+        batch_iou_empty_is_one=diagnostics["batch_iou_empty_is_one"],
+        visible_iou=diagnostics["visible_iou"],
+        non_ref_visible_iou=diagnostics["non_ref_visible_iou"],
+        ref_iou=diagnostics["ref_iou"],
+        tracking_recall=diagnostics["tracking_recall"],
+        visible_frames=diagnostics["visible_frames"],
+        empty_empty_frames=diagnostics["empty_empty_frames"],
+        target_areas=diagnostics["target_areas"],
+        has_object_flags=diagnostics["has_object_flags"],
+        instance_id=batch.instance_id,
+        warnings=diagnostics["warnings"],
         sampling_mode=batch.sampling_mode,
     )
+    header_height = max(58, 10 + len(header_lines) * 16)
+    canvas_height = header_height + sum(row.height for row in rows)
+    canvas = Image.new("RGB", (canvas_width, canvas_height), (24, 24, 24))
+    draw = ImageDraw.Draw(canvas)
     for line_index, line in enumerate(header_lines):
-        draw.text((8, 6 + line_index * 16), line[:180], fill=(235, 235, 235))
+        fill = (255, 105, 80) if line.startswith("[WARN]") else (235, 235, 235)
+        draw.text((8, 6 + line_index * 16), line[:180], fill=fill)
     y = 0
     for row in rows:
         canvas.paste(row, (0, header_height + y))

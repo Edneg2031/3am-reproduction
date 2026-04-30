@@ -282,6 +282,45 @@ def test_strict_training_dataset_keeps_reference_as_prompt_frame_zero(tmp_path: 
     assert batch.reference_frame_id == batch.frame_ids[0]
 
 
+def test_strict_fov_fallback_does_not_add_visible_low_overlap_frames(tmp_path: Path) -> None:
+    masks = [np.ones((4, 4), dtype=np.uint8) for _ in range(4)]
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
+    scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
+    scene_cache.mkdir(parents=True)
+    np.save(scene_cache / "overlap.npy", np.zeros((4, 4), dtype=np.float32))
+
+    dataset = ThreeAMTrainingDataset.from_config(
+        _strict_config(tmp_path, "scannetpp", manifest),
+        load_feature_cache=False,
+        rng=random.Random(0),
+    )
+    batch = dataset.sample()
+
+    assert batch.sampling_mode == "fov"
+    assert len(batch.frame_ids) == 1
+    assert batch.has_object.tolist() == [True]
+
+
+def test_strict_fov_fallback_can_add_empty_frames(tmp_path: Path) -> None:
+    masks = [np.ones((4, 4), dtype=np.uint8)] + [np.zeros((4, 4), dtype=np.uint8) for _ in range(3)]
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
+    scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
+    scene_cache.mkdir(parents=True)
+    np.save(scene_cache / "overlap.npy", np.zeros((4, 4), dtype=np.float32))
+
+    dataset = ThreeAMTrainingDataset.from_config(
+        _strict_config(tmp_path, "scannetpp", manifest),
+        load_feature_cache=False,
+        rng=random.Random(1),
+    )
+    batch = dataset.sample()
+
+    assert len(batch.frame_ids) == 2
+    assert batch.has_object.tolist() == [True, False]
+
+
 def test_strict_training_dataset_applies_mask_ignore_values(tmp_path: Path) -> None:
     mask = np.full((4, 4), 255, dtype=np.uint8)
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"

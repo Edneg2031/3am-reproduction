@@ -294,9 +294,16 @@ def test_training_visualization_header_lines_include_tracking_context() -> None:
         prompt_type="mask",
         reference_frame="001",
         frame_ids=("000", "001", "002"),
-        mean_iou=0.5,
+        batch_iou_empty_is_one=0.5,
         visible_iou=0.25,
+        non_ref_visible_iou=0.125,
+        ref_iou=1.0,
         tracking_recall=1.0,
+        visible_frames=2,
+        empty_empty_frames=1,
+        target_areas=(0, 4, 8),
+        has_object_flags=(False, True, True),
+        instance_id=7,
     )
     text = "\n".join(lines)
 
@@ -304,9 +311,49 @@ def test_training_visualization_header_lines_include_tracking_context() -> None:
     assert "prompt=mask" in text
     assert "ref=001" in text
     assert "frames=[000, 001, 002]" in text
-    assert "mean_iou=0.500" in text
+    assert "batch_iou_empty_is_one=0.500" in text
     assert "visible_iou=0.250" in text
+    assert "non_ref_visible_iou=0.125" in text
+    assert "ref_iou=1.000" in text
     assert "tracking_recall_like=1.000" in text
+    assert "visible_frames=2/3" in text
+    assert "empty_empty_frames=1" in text
+    assert "instance_id=7" in text
+    assert "has_object=011" in text
+    assert "target_areas=[0,4,8]" in text
+
+
+def test_training_visualization_diagnostics_separates_empty_empty_from_visible_signal() -> None:
+    train_3am = _load_train_module()
+    probabilities = torch.tensor(
+        [
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[0.9, 0.1], [0.1, 0.1]],
+            [[0.0, 0.0], [0.0, 0.0]],
+        ]
+    )
+    targets = torch.tensor(
+        [
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[1.0, 0.0], [0.0, 0.0]],
+            [[0.0, 1.0], [0.0, 0.0]],
+        ]
+    )
+
+    diagnostics = train_3am._visualization_diagnostics(
+        probabilities,
+        targets,
+        has_object=torch.tensor([False, True, True]),
+        reference_index=1,
+    )
+
+    assert diagnostics["batch_iou_empty_is_one"] == pytest.approx(2 / 3)
+    assert diagnostics["visible_iou"] == pytest.approx(0.5)
+    assert diagnostics["non_ref_visible_iou"] == pytest.approx(0.0)
+    assert diagnostics["ref_iou"] == pytest.approx(1.0)
+    assert diagnostics["empty_empty_frames"] == 1
+    assert diagnostics["visible_frames"] == 2
+    assert diagnostics["target_areas"] == [0, 1, 1]
 
 
 def test_training_visualization_frame_order_starts_from_reference() -> None:

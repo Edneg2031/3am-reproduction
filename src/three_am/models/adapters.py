@@ -108,6 +108,10 @@ class Sam2TrainingAdapter(nn.Module):
         self._last_feature_selector: tuple[str, str | int] | None = None
         self._last_sam_feature_shape: tuple[int, ...] | None = None
 
+    @property
+    def last_feature_selector(self) -> tuple[str, str | int] | None:
+        return self._last_feature_selector
+
     def load(self) -> None:
         _prepend_repo_to_sys_path(self.config.sam2_repo)
         try:
@@ -179,6 +183,7 @@ class Sam2TrainingAdapter(nn.Module):
             raise ExternalDependencyError("SAM2 model is not loaded")
         backbone_out = self._inject_merged_features(merged_features)
         if self.config.strict_paper:
+            self._validate_strict_backbone_injection(backbone_out, merged_features)
             outputs = self._forward_with_official_sam2_modules(batch, merged_features, backbone_out, require_tracking=True)
             if outputs is None:
                 raise ExternalDependencyError(
@@ -232,15 +237,15 @@ class Sam2TrainingAdapter(nn.Module):
         if isinstance(features, torch.Tensor):
             return features, None
         if isinstance(features, dict):
-            for key in ("vision_features", "image_embed"):
-                value = features.get(key)
-                if isinstance(value, torch.Tensor):
-                    return value, ("dict", key)
             value = features.get("backbone_fpn")
             if isinstance(value, (list, tuple)) and value and isinstance(value[-1], torch.Tensor):
                 return value[-1], ("dict_list", "backbone_fpn")
             if isinstance(value, torch.Tensor):
                 return value, ("dict", "backbone_fpn")
+            for key in ("vision_features", "image_embed"):
+                value = features.get(key)
+                if isinstance(value, torch.Tensor):
+                    return value, ("dict", key)
         if isinstance(features, (list, tuple)) and features and isinstance(features[-1], torch.Tensor):
             return features[-1], ("sequence", len(features) - 1)
         raise ExternalDependencyError("SAM2 image encoder returned unsupported feature payload")
@@ -259,18 +264,58 @@ class Sam2TrainingAdapter(nn.Module):
         if kind == "dict":
             updated = dict(payload)
             updated[key] = merged_features
+            self._replace_matching_feature_aliases(updated, merged_features)
             return updated
         if kind == "dict_list":
             updated = dict(payload)
             values = list(updated[key])
             values[-1] = merged_features
             updated[key] = values
+            self._replace_matching_feature_aliases(updated, merged_features)
             return updated
         if kind == "sequence":
             values = list(payload)
             values[int(key)] = merged_features
             return values
         return None
+
+    def _replace_matching_feature_aliases(self, payload: dict[str, Any], merged_features: torch.Tensor) -> None:
+        expected_shape = tuple(merged_features.shape)
+        for key in ("vision_features", "image_embed"):
+            value = payload.get(key)
+            if isinstance(value, torch.Tensor) and tuple(value.shape) == expected_shape:
+                payload[key] = merged_features
+        value = payload.get("backbone_fpn")
+        if isinstance(value, (list, tuple)) and value:
+            values = list(value)
+            for index in range(len(values) - 1, -1, -1):
+                if isinstance(values[index], torch.Tensor) and tuple(values[index].shape) == expected_shape:
+                    values[index] = merged_features
+                    break
+            payload["backbone_fpn"] = values
+        elif isinstance(value, torch.Tensor) and tuple(value.shape) == expected_shape:
+            payload["backbone_fpn"] = merged_features
+
+    def _validate_strict_backbone_injection(self, backbone_out: Any | None, merged_features: torch.Tensor) -> None:
+        if not isinstance(backbone_out, dict):
+            raise ExternalDependencyError(
+                "Strict paper training requires merged 3AM features to be injected into SAM2 backbone_fpn."
+            )
+        feature_maps = backbone_out.get("backbone_fpn")
+        tensors: list[torch.Tensor] = []
+        if isinstance(feature_maps, torch.Tensor):
+            tensors = [feature_maps]
+        elif isinstance(feature_maps, (list, tuple)):
+            tensors = [feature for feature in feature_maps if isinstance(feature, torch.Tensor)]
+        if not tensors:
+            raise ExternalDependencyError(
+                "Strict paper training requires SAM2 backbone_fpn tensors so merged 3AM features feed tracking."
+            )
+        if not any(feature is merged_features for feature in tensors):
+            raise ExternalDependencyError(
+                "Strict paper training did not inject merged 3AM features into backbone_fpn. "
+                f"Selected SAM2 feature selector was {self._last_feature_selector!r}."
+            )
 
     def _forward_with_official_sam2_modules(
         self,

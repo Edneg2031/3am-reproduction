@@ -20,10 +20,18 @@ def choose_conditioning_frame(mask_paths: list[str | Path]) -> int:
     return int(np.argmax(areas))
 
 
-def evaluate_saved_masks(prediction_paths: list[str | Path], target_paths: list[str | Path], output_path: str | Path) -> dict[str, float]:
+def evaluate_saved_masks(
+    prediction_paths: list[str | Path],
+    target_paths: list[str | Path],
+    output_path: str | Path,
+    *,
+    conditioning_frame: int | None = None,
+) -> dict[str, float]:
     predictions = [load_mask(path) for path in prediction_paths]
     targets = [load_mask(path) for path in target_paths]
     metrics = tracking_metrics(predictions, targets)
+    selected_conditioning_frame = choose_conditioning_frame(target_paths) if conditioning_frame is None else int(conditioning_frame)
+    metrics["conditioning_frame"] = float(selected_conditioning_frame)
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
