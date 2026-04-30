@@ -9,6 +9,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+from PIL import Image
+
 from three_am.data.io import write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
 
@@ -44,6 +47,57 @@ def _normalized_frame(scene_dir: Path, image_path: Path) -> FrameRecord:
         pose_path=pose_path if pose_path.exists() else None,
         intrinsics_path=intrinsics_path if intrinsics_path.exists() else None,
     )
+
+
+def _load_label_map(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        array = np.asarray(image)
+    if array.ndim == 3:
+        array = array[..., 0]
+    if array.ndim != 2:
+        raise ValueError(f"{path}: mask must be a 2D label map, got shape {array.shape}")
+    return array.astype(np.int64, copy=False)
+
+
+def _foreground_ratio(array: np.ndarray) -> float:
+    return float((array > 0).mean()) if array.size else 0.0
+
+
+def _positive_ids(array: np.ndarray) -> np.ndarray:
+    values = np.unique(array)
+    return values[values > 0]
+
+
+def _validate_scannetpp_masks(
+    scene_dir: Path,
+    frames: tuple[FrameRecord, ...],
+    *,
+    require_instances: bool,
+    max_singleton_foreground_ratio: float,
+) -> None:
+    instances_path = scene_dir / "instances.json"
+    if require_instances and not instances_path.exists():
+        raise ValueError(
+            f"{scene_dir}: ScanNet++ scenes must include instances.json generated from projected 3D instance labels. "
+            "Run scripts/preprocess_scannetpp_instance_masks.py on ScanNet++ obj_ids/<scene_id>/*.pth outputs before "
+            "building the manifest, or pass --allow-missing-instances for a legacy/debug manifest."
+        )
+    missing_masks = [frame.frame_id for frame in frames if frame.mask_path is None or not frame.mask_path.exists()]
+    if missing_masks:
+        preview = ", ".join(missing_masks[:8])
+        suffix = "" if len(missing_masks) <= 8 else f", ... ({len(missing_masks)} total)"
+        raise ValueError(f"{scene_dir}: ScanNet++ frames are missing per-frame instance label masks: {preview}{suffix}")
+    for frame in frames:
+        if frame.mask_path is None:
+            continue
+        label_map = _load_label_map(frame.mask_path)
+        positive_ids = _positive_ids(label_map)
+        foreground_ratio = _foreground_ratio(label_map)
+        if len(positive_ids) <= 1 and foreground_ratio >= max_singleton_foreground_ratio:
+            raise ValueError(
+                f"{frame.mask_path}: one positive id covers {foreground_ratio:.3f} of the image. This looks like a "
+                "full-frame/valid-region mask, not a ScanNet++ projected instance-id label map."
+            )
 
 
 def _nerfstudio_transform_paths(scene_dir: Path) -> list[Path]:
@@ -202,6 +256,8 @@ def discover_scene(
     manifest_format: ManifestFormat = "auto",
     camera_sidecar_root: Path | None = None,
     require_cameras: bool = False,
+    allow_missing_instances: bool = False,
+    max_singleton_foreground_ratio: float = 0.98,
 ) -> SceneRecord | None:
     image_root = _image_root(scene_dir)
     if image_root is None:
@@ -219,6 +275,13 @@ def discover_scene(
         frames = _fill_nerfstudio_cameras(scene_dir, frames, camera_sidecar_root)
     if require_cameras:
         _require_complete_cameras(scene_dir, frames)
+    if dataset == "scannetpp":
+        _validate_scannetpp_masks(
+            scene_dir,
+            frames,
+            require_instances=not allow_missing_instances,
+            max_singleton_foreground_ratio=max_singleton_foreground_ratio,
+        )
     instances_path = scene_dir / "instances.json"
     return SceneRecord(
         dataset=dataset, scene_id=scene_dir.name, split=split, frames=frames, instances_path=instances_path if instances_path.exists() else None
@@ -233,6 +296,8 @@ def discover_scenes(
     manifest_format: ManifestFormat,
     camera_sidecar_root: Path,
     require_cameras: bool = False,
+    allow_missing_instances: bool = False,
+    max_singleton_foreground_ratio: float = 0.98,
 ) -> list[SceneRecord]:
     return [
         scene
@@ -246,6 +311,8 @@ def discover_scenes(
                 manifest_format=manifest_format,
                 camera_sidecar_root=camera_sidecar_root,
                 require_cameras=require_cameras,
+                allow_missing_instances=allow_missing_instances,
+                max_singleton_foreground_ratio=max_singleton_foreground_ratio,
             )
         ]
         if scene
@@ -260,6 +327,17 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--format", default="auto", choices=["auto", "normalized", "nerfstudio_3dgs"], help="scene folder format to discover")
     parser.add_argument("--require-cameras", action="store_true", help="fail if any frame is missing pose or intrinsics")
+    parser.add_argument(
+        "--allow-missing-instances",
+        action="store_true",
+        help="allow ScanNet++ scenes without instances.json; intended only for legacy/debug manifests",
+    )
+    parser.add_argument(
+        "--max-singleton-foreground-ratio",
+        type=float,
+        default=0.98,
+        help="reject ScanNet++ masks with one positive id covering at least this fraction of the image",
+    )
     args = parser.parse_args()
     root = Path(args.root)
     output_path = Path(args.output)
@@ -271,6 +349,8 @@ def main() -> None:
         manifest_format=args.format,
         camera_sidecar_root=camera_sidecar_root,
         require_cameras=args.require_cameras,
+        allow_missing_instances=args.allow_missing_instances,
+        max_singleton_foreground_ratio=args.max_singleton_foreground_ratio,
     )
     write_manifest(args.output, scenes)
     print(f"Wrote {len(scenes)} scenes to {args.output}")

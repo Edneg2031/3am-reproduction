@@ -328,6 +328,51 @@ def _validate_mask_foreground_ratio(mask: torch.Tensor, *, dataset: str, scene_i
         )
 
 
+def _scannetpp_requires_instance_label_maps(config: dict[str, Any]) -> bool:
+    dataset_config = config.get("datasets", {}).get("scannetpp", {})
+    training_config = config.get("training", {})
+    default = bool(training_config.get("strict_paper", False))
+    pseudo = training_config.get("sam2_point_pseudo_masks", {})
+    pseudo_mode = str(pseudo.get("mode", "off")).lower() if isinstance(pseudo, dict) else "off"
+    if pseudo_mode not in {"off", "false", "none", "0"}:
+        default = False
+    return bool(dataset_config.get("require_instance_label_maps", default))
+
+
+def _looks_like_full_frame_singleton_mask(mask: np.ndarray, *, max_ratio: float = 0.98) -> bool:
+    if mask.size == 0:
+        return False
+    positive_ids = [int(value) for value in np.unique(mask) if int(value) > 0]
+    if len(positive_ids) > 1:
+        return False
+    return float((mask > 0).mean()) >= max_ratio
+
+
+def _validate_scannetpp_source_masks(
+    config: dict[str, Any],
+    scene: SceneRecord,
+    frames: list[FrameRecord],
+    mask_arrays: list[np.ndarray],
+) -> None:
+    if scene.dataset != "scannetpp" or not _scannetpp_requires_instance_label_maps(config):
+        return
+    if scene.instances_path is None:
+        raise MaskCompatibilityError(
+            f"ScanNet++ scene {scene.scene_id} has no instances_path in the manifest. "
+            "Use scripts/preprocess_scannetpp_instance_masks.py to convert ScanNet++ obj_ids into per-frame "
+            "instance-id label maps before training."
+        )
+    for frame, mask in zip(frames, mask_arrays, strict=True):
+        if frame.mask_path is None:
+            raise MaskCompatibilityError(f"ScanNet++ frame {scene.scene_id}/{frame.frame_id} has no instance mask path")
+        if _looks_like_full_frame_singleton_mask(mask):
+            ratio = float((mask > 0).mean())
+            raise MaskCompatibilityError(
+                f"ScanNet++ mask {frame.mask_path} has one positive id covering {ratio:.3f} of the image. "
+                "This looks like a valid-region/full-frame mask, not a projected instance-id label map."
+            )
+
+
 def _load_depth_array(path: Path) -> np.ndarray:
     with Image.open(path) as image:
         depth = np.asarray(image).astype(np.float32)
@@ -640,6 +685,7 @@ class ThreeAMTrainingDataset:
             raise ValueError(f"Scene {scene.scene_id} produced variable image sizes in one training sample")
         ignore_values = _mask_ignore_values(self.config, scene.dataset)
         mask_arrays = [load_mask_array(frame.mask_path, image_shape, ignore_values=ignore_values) for frame in selected_frames]
+        _validate_scannetpp_source_masks(self.config, scene, selected_frames, mask_arrays)
         reference_index, instance_id, binary_mode = _select_reference(mask_arrays, self.rng)
         target_masks = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
         max_ratio = _mask_max_foreground_ratio(self.config, scene.dataset)
@@ -683,6 +729,7 @@ class ThreeAMTrainingDataset:
         sampling_config = self._sampling_config(scene)
         ignore_values = _mask_ignore_values(self.config, scene.dataset)
         raw_masks = [load_mask_array(frame.mask_path, ignore_values=ignore_values) for frame in frames]
+        _validate_scannetpp_source_masks(self.config, scene, frames, raw_masks)
         use_fov = (
             scene.dataset in {"scannetpp", "ase"}
             and sampling_config.fov_sampling_probability > 0

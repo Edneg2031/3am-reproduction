@@ -22,6 +22,7 @@ datasets:
     scenes: 855
     fov_sampling_probability: 0.8
     mask_ignore_values: []
+    require_instance_label_maps: true
   ase:
     root: data/raw/ase
     processed: data/processed/ase
@@ -89,7 +90,7 @@ training:
   visualization_max_frames: 4
   visualization_max_side: 384
   sam2_point_pseudo_masks:
-    mode: auto
+    mode: off
     datasets: [scannetpp]
     auto_foreground_ratio_threshold: 0.98
     max_attempts: 8

@@ -78,6 +78,22 @@ scene_id/
 
 MOSE does not need `depth`, `poses`, or `intrinsics`.
 
+For ScanNet++, `masks/*.png` must be per-frame **instance-id label maps**, not anonymization masks, valid-pixel masks, or all-foreground binary masks. The 3AM paper trains/evaluates with 2D masks obtained by projecting 3D instance labels into each RGB frame, and uses those masks as mask prompts/supervision for ScanNet++ and ASE. ScanNet++ does not ship SAM2 prompt masks directly.
+
+To prepare ScanNet++:
+
+1. Use the official ScanNet++ toolbox to rasterize semantics and run `semantic.prep.semantics_2d` with object-id GT saving enabled, producing files like `obj_ids/<scene_id>/*.pth`.
+2. Convert those object-id maps into the normalized layout:
+
+```bash
+PYTHONPATH=src python scripts/preprocess_scannetpp_instance_masks.py \
+  --obj-id-root /path/to/scannetpp/obj_ids \
+  --data-root data/raw/scannetpp \
+  --output-root data/processed/scannetpp
+```
+
+The script writes 16-bit PNG label maps under `data/processed/scannetpp/<scene_id>/masks`, symlinks RGB images by default, and creates `instances.json`. It fails fast when an input mask has one positive id covering almost the whole frame, which usually means a valid-region/full-frame mask was supplied instead of projected instance labels.
+
 Build manifests with:
 
 ```bash
@@ -86,6 +102,10 @@ python scripts/build_manifest.py --dataset ase --root data/processed/ase --split
 python scripts/build_manifest.py --dataset mose --root data/processed/mose --split train --output data/processed/mose_manifest.json
 python scripts/build_manifest.py --dataset replica --root data/processed/replica --split eval --output data/processed/replica_manifest.json
 ```
+
+`build_manifest.py --dataset scannetpp` now requires `instances.json` and rejects full-frame singleton masks by default. Use `--allow-missing-instances` only for legacy/debug manifests, not for paper-aligned training.
+
+The default full reproduction config sets `datasets.scannetpp.require_instance_label_maps: true` and `training.sam2_point_pseudo_masks.mode: off`. The SAM2 random point pseudo-mask fallback is useful only as an emergency diagnostic when inspecting broken data; it is not the ScanNet++ training target used by the paper.
 
 ## Important limitations
 

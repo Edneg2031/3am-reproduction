@@ -116,8 +116,13 @@ def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = 
         _write_image(image_path)
         _write_mask(mask_path, full=full_masks)
         frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+    instances_path = scene_dir / "instances.json"
+    instances_path.write_text(
+        '{"schema":"three_am_scannetpp_instances_v1","instances":[{"id":1},{"id":255}]}',
+        encoding="utf-8",
+    )
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
-    write_manifest(manifest, [SceneRecord("scannetpp", "scene_a", "train", tuple(frames))])
+    write_manifest(manifest, [SceneRecord("scannetpp", "scene_a", "train", tuple(frames), instances_path=instances_path)])
     feature_dir = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
     if write_feature_cache:
         feature_dir.mkdir(parents=True)

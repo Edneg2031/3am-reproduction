@@ -10,7 +10,7 @@ from PIL import Image
 
 from three_am.data.io import read_manifest, write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
-from three_am.training.dataset import FeatureCacheCompatibilityError, ThreeAMTrainingDataset, configured_manifest_path
+from three_am.training.dataset import FeatureCacheCompatibilityError, MaskCompatibilityError, ThreeAMTrainingDataset, configured_manifest_path
 
 
 def _write_image(path: Path) -> None:
@@ -33,7 +33,18 @@ def _scene(tmp_path: Path, dataset: str, masks: list[np.ndarray]) -> SceneRecord
         _write_image(image_path)
         _write_mask(mask_path, mask)
         frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
-    return SceneRecord(dataset=dataset, scene_id="scene_a", split="train", frames=tuple(frames))
+    instances_path = None
+    if dataset == "scannetpp":
+        instances_path = scene_dir / "instances.json"
+        instances_path.write_text(
+            '{"schema":"three_am_scannetpp_instances_v1","instances":[{"id":1},{"id":5},{"id":7},{"id":255}]}',
+            encoding="utf-8",
+        )
+    return SceneRecord(dataset=dataset, scene_id="scene_a", split="train", frames=tuple(frames), instances_path=instances_path)
+
+
+def _dense_instance_mask() -> np.ndarray:
+    return np.array([[5, 5, 0, 0], [5, 5, 7, 0], [0, 7, 7, 0], [0, 0, 0, 0]], dtype=np.uint8)
 
 
 def _config(tmp_path: Path, dataset: str, manifest: Path, *, fov_probability: float = 0.0) -> dict[str, object]:
@@ -263,7 +274,7 @@ def test_training_dataset_reports_feature_channel_mismatch(tmp_path: Path) -> No
 
 
 def test_strict_training_dataset_keeps_reference_as_prompt_frame_zero(tmp_path: Path) -> None:
-    masks = [np.ones((4, 4), dtype=np.uint8) for _ in range(4)]
+    masks = [_dense_instance_mask() for _ in range(4)]
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
     write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
     scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
@@ -283,7 +294,7 @@ def test_strict_training_dataset_keeps_reference_as_prompt_frame_zero(tmp_path: 
 
 
 def test_strict_fov_fallback_does_not_add_visible_low_overlap_frames(tmp_path: Path) -> None:
-    masks = [np.ones((4, 4), dtype=np.uint8) for _ in range(4)]
+    masks = [_dense_instance_mask() for _ in range(4)]
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
     write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
     scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
@@ -303,7 +314,7 @@ def test_strict_fov_fallback_does_not_add_visible_low_overlap_frames(tmp_path: P
 
 
 def test_strict_fov_fallback_can_add_empty_frames(tmp_path: Path) -> None:
-    masks = [np.ones((4, 4), dtype=np.uint8)] + [np.zeros((4, 4), dtype=np.uint8) for _ in range(3)]
+    masks = [_dense_instance_mask()] + [np.zeros((4, 4), dtype=np.uint8) for _ in range(3)]
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
     write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
     scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
@@ -335,8 +346,40 @@ def test_strict_training_dataset_applies_mask_ignore_values(tmp_path: Path) -> N
     assert batch.has_object.tolist() == [False, False]
 
 
+def test_strict_scannetpp_rejects_full_frame_singleton_masks(tmp_path: Path) -> None:
+    mask = np.ones((4, 4), dtype=np.uint8)
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [_scene(tmp_path, "scannetpp", [mask, mask])])
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+
+    with pytest.raises(MaskCompatibilityError, match="valid-region/full-frame mask"):
+        dataset.sample()
+
+
+def test_strict_scannetpp_requires_instances_path(tmp_path: Path) -> None:
+    scene_dir = tmp_path / "data" / "processed" / "scannetpp" / "scene_a"
+    frames: list[FrameRecord] = []
+    for index in range(2):
+        frame_id = f"{index:03d}"
+        image_path = scene_dir / "images" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        _write_image(image_path)
+        _write_mask(mask_path, _dense_instance_mask())
+        frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [SceneRecord("scannetpp", "scene_a", "train", tuple(frames))])
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+
+    with pytest.raises(MaskCompatibilityError, match="instances_path"):
+        dataset.sample()
+
+
 def test_strict_training_dataset_rejects_cache_without_decoder_memory(tmp_path: Path) -> None:
-    masks = [np.ones((4, 4), dtype=np.uint8) for _ in range(2)]
+    masks = [_dense_instance_mask() for _ in range(2)]
     manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
     write_manifest(manifest, [_scene(tmp_path, "scannetpp", masks)])
     scene_cache = tmp_path / "outputs" / "must3r_features" / "scannetpp" / "scene_a"
