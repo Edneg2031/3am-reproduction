@@ -7,11 +7,15 @@ import math
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -239,6 +243,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--axis-convention", default="y-up", choices=["y-up", "z-up"])
     parser.add_argument("--object-size", type=float, default=1.35)
     parser.add_argument("--motion", default="camera", choices=["camera", "object"], help="camera keeps the object fixed and moves/pans the camera; object keeps the old moving-object behavior")
+    parser.add_argument("--mask-mode", default="project", choices=["project", "render"], help="project rasterizes mesh triangles directly; render uses a slower Blender mask pass")
     parser.add_argument("--camera-radius", type=float, default=4.2)
     parser.add_argument("--camera-height", type=float, default=1.12)
     parser.add_argument("--camera-orbit-deg", type=float, default=28.0)
@@ -446,6 +451,102 @@ def _mask_pixel_count(bpy: object, path: Path) -> int:
         bpy.data.images.remove(image)
 
 
+def _camera_intrinsics(camera: object, *, width: int, height: int) -> tuple[float, float, float, float]:
+    fx = 0.5 * width / math.tan(0.5 * camera.data.angle_x)
+    fy = 0.5 * height / math.tan(0.5 * camera.data.angle_y)
+    return fx, fy, width * 0.5, height * 0.5
+
+
+def _rasterize_triangle(mask: np.ndarray, points: np.ndarray) -> None:
+    height, width = mask.shape
+    min_x = max(0, int(math.floor(float(points[:, 0].min()))))
+    max_x = min(width - 1, int(math.ceil(float(points[:, 0].max()))))
+    min_y = max(0, int(math.floor(float(points[:, 1].min()))))
+    max_y = min(height - 1, int(math.ceil(float(points[:, 1].max()))))
+    if max_x < min_x or max_y < min_y:
+        return
+    p0, p1, p2 = points.astype(np.float64, copy=False)
+    area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+    if abs(area) < 1e-8:
+        return
+    ys, xs = np.mgrid[min_y : max_y + 1, min_x : max_x + 1]
+    px = xs.astype(np.float64) + 0.5
+    py = ys.astype(np.float64) + 0.5
+    e0 = (p1[0] - p0[0]) * (py - p0[1]) - (p1[1] - p0[1]) * (px - p0[0])
+    e1 = (p2[0] - p1[0]) * (py - p1[1]) - (p2[1] - p1[1]) * (px - p1[0])
+    e2 = (p0[0] - p2[0]) * (py - p2[1]) - (p0[1] - p2[1]) * (px - p2[0])
+    if area < 0:
+        inside = (e0 <= 0) & (e1 <= 0) & (e2 <= 0)
+    else:
+        inside = (e0 >= 0) & (e1 >= 0) & (e2 >= 0)
+    mask[min_y : max_y + 1, min_x : max_x + 1][inside] = 255
+
+
+def _projected_mesh_mask(
+    meshes: Sequence[object],
+    camera: object,
+    Vector: object,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    fx, fy, cx, cy = _camera_intrinsics(camera, width=width, height=height)
+    camera_inv = camera.matrix_world.inverted()
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for mesh in meshes:
+        world = mesh.matrix_world
+        vertices_camera = [camera_inv @ (world @ vertex.co) for vertex in mesh.data.vertices]
+        for polygon in mesh.data.polygons:
+            indices = list(polygon.vertices)
+            if len(indices) < 3:
+                continue
+            for offset in range(1, len(indices) - 1):
+                tri = [vertices_camera[indices[0]], vertices_camera[indices[offset]], vertices_camera[indices[offset + 1]]]
+                projected: list[tuple[float, float]] = []
+                skip = False
+                for point in tri:
+                    depth = -float(point.z)
+                    if depth <= 1e-5:
+                        skip = True
+                        break
+                    projected.append((fx * float(point.x) / depth + cx, cy - fy * float(point.y) / depth))
+                if skip:
+                    continue
+                _rasterize_triangle(mask, np.asarray(projected, dtype=np.float64))
+    return mask
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def _write_gray_png(path: Path, mask: np.ndarray) -> None:
+    if mask.ndim != 2:
+        raise ValueError(f"mask must be HW, got {mask.shape}")
+    height, width = mask.shape
+    rows = b"".join(b"\x00" + mask[row].astype(np.uint8, copy=False).tobytes() for row in range(height))
+    payload = b"\x89PNG\r\n\x1a\n"
+    payload += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+    payload += _png_chunk(b"IDAT", zlib.compress(rows, level=1))
+    payload += _png_chunk(b"IEND", b"")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def _write_projected_mask(
+    path: Path,
+    *,
+    meshes: Sequence[object],
+    camera: object,
+    Vector: object,
+    width: int,
+    height: int,
+) -> int:
+    mask = _projected_mesh_mask(meshes, camera, Vector, width=width, height=height)
+    _write_gray_png(path, mask)
+    return int((mask > 0).sum())
+
+
 def _render_mask(bpy: object, path: Path, *, meshes: Sequence[object], floor: object, white: object, black: object) -> int:
     mesh_materials = {mesh.name: [slot.material for slot in mesh.material_slots] for mesh in meshes}
     floor_materials = [slot.material for slot in floor.material_slots]
@@ -564,7 +665,17 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
             root.rotation_euler[2] = 0.28 * math.sin(frame_index * 0.12)
         frame_id = f"{frame_index:06d}"
         _render_still(bpy, rgb_dir / f"{frame_id}.png")
-        pixels = _render_mask(bpy, mask_dir / f"{frame_id}.png", meshes=meshes, floor=floor, white=white, black=black)
+        if args.mask_mode == "project":
+            pixels = _write_projected_mask(
+                mask_dir / f"{frame_id}.png",
+                meshes=meshes,
+                camera=camera,
+                Vector=Vector,
+                width=args.width,
+                height=args.height,
+            )
+        else:
+            pixels = _render_mask(bpy, mask_dir / f"{frame_id}.png", meshes=meshes, floor=floor, white=white, black=black)
         mask_pixels.append(pixels)
         visible.append(pixels >= args.min_visible_mask_pixels)
 
@@ -594,6 +705,7 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
         "width": args.width,
         "height": args.height,
         "motion": args.motion,
+        "mask_mode": args.mask_mode,
         "rgb_dir": str(rgb_dir),
         "mask_dir": str(mask_dir),
         "video_path": video_path,
