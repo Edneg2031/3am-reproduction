@@ -57,6 +57,13 @@ class WorkerSpec:
     env: dict[str, str]
 
 
+@dataclass(frozen=True)
+class CameraPose:
+    location: tuple[float, float, float]
+    target: tuple[float, float, float]
+    roll_rad: float = 0.0
+
+
 def _candidate_obj_paths(model_dir: Path) -> tuple[Path, ...]:
     return (
         model_dir / "models" / "model_normalized.obj",
@@ -333,9 +340,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--object-size", type=float, default=1.35)
     parser.add_argument("--motion", default="camera", choices=["camera", "object"], help="camera keeps the object fixed and moves/pans the camera; object keeps the old moving-object behavior")
     parser.add_argument("--mask-mode", default="project", choices=["project", "render"], help="project rasterizes mesh triangles directly; render uses a slower Blender mask pass")
+    parser.add_argument(
+        "--camera-path",
+        default="human-linear",
+        choices=["human-linear", "orbit"],
+        help="human-linear uses a linear camera move with smoothed Gaussian hand-held jitter; orbit keeps the previous sinusoidal path",
+    )
     parser.add_argument("--camera-radius", type=float, default=4.2)
     parser.add_argument("--camera-height", type=float, default=1.12)
     parser.add_argument("--camera-orbit-deg", type=float, default=28.0)
+    parser.add_argument("--camera-linear-x", type=float, default=1.3, help="Total x travel for --camera-path human-linear")
+    parser.add_argument("--camera-linear-y", type=float, default=0.18, help="Total y travel for --camera-path human-linear")
+    parser.add_argument("--camera-linear-z", type=float, default=0.12, help="Total z travel for --camera-path human-linear")
+    parser.add_argument("--camera-jitter-std", type=float, default=0.025, help="World-space smoothed Gaussian camera-position jitter")
+    parser.add_argument("--camera-aim-jitter-std", type=float, default=0.018, help="World-space smoothed Gaussian look-target jitter")
+    parser.add_argument("--camera-roll-jitter-deg", type=float, default=0.35, help="Smoothed Gaussian camera roll jitter in degrees")
+    parser.add_argument("--camera-jitter-smooth-frames", type=float, default=8.0, help="Gaussian smoothing sigma for camera jitter, in frames")
+    parser.add_argument("--camera-jitter-ramp-frames", type=int, default=8, help="Frames used to fade hand-held jitter in and out")
     parser.add_argument("--lookaway-x", type=float, default=4.0, help="World-space look target x-offset used to make the fixed object leave the camera view")
     parser.add_argument("--lookaway-transition-frames", type=int, default=10)
     parser.add_argument("--offscreen-x", type=float, default=4.2)
@@ -745,11 +766,105 @@ def _lookaway_offset(frame_index: int, window: AbsenceWindow, *, offset: float, 
     return 0.0
 
 
-def _set_camera_for_frame(camera: object, Vector: object, frame_index: int, total_frames: int, window: AbsenceWindow, args: argparse.Namespace) -> None:
+def _linear_lookaway_offset(frame_index: int, window: AbsenceWindow, *, offset: float, transition_frames: int) -> float:
+    transition = max(1, int(transition_frames))
+    ramp_in_start = max(0, window.start - transition)
+    ramp_out_end = window.end + transition
+    if frame_index < ramp_in_start:
+        return 0.0
+    if frame_index < window.start:
+        return offset * ((frame_index - ramp_in_start) / max(1, window.start - ramp_in_start))
+    if frame_index < window.end:
+        return offset
+    if frame_index < ramp_out_end:
+        return offset * (1.0 - ((frame_index - window.end) / max(1, ramp_out_end - window.end)))
+    return 0.0
+
+
+def _lerp_tuple(start: tuple[float, float, float], end: tuple[float, float, float], amount: float) -> tuple[float, float, float]:
+    return tuple(float(a + (b - a) * amount) for a, b in zip(start, end))
+
+
+def _add_scaled(vector: tuple[float, float, float], direction: tuple[float, float, float], scale: float) -> tuple[float, float, float]:
+    return tuple(float(value + axis * scale) for value, axis in zip(vector, direction))
+
+
+def _sub_tuple(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return tuple(float(left - right) for left, right in zip(a, b))
+
+
+def _cross_tuple(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _normalize_tuple(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    length = math.sqrt(sum(value * value for value in vector))
+    if length <= 1e-8:
+        return (0.0, 0.0, 0.0)
+    return tuple(float(value / length) for value in vector)
+
+
+def _camera_basis(location: tuple[float, float, float], target: tuple[float, float, float]) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    forward = _normalize_tuple(_sub_tuple(target, location))
+    world_up = (0.0, 0.0, 1.0)
+    right = _normalize_tuple(_cross_tuple(forward, world_up))
+    if right == (0.0, 0.0, 0.0):
+        right = (1.0, 0.0, 0.0)
+    up = _normalize_tuple(_cross_tuple(right, forward))
+    return right, up, forward
+
+
+def _gaussian_kernel_1d(sigma_frames: float) -> np.ndarray:
+    if sigma_frames <= 0.0:
+        return np.asarray([1.0], dtype=np.float64)
+    radius = max(1, int(math.ceil(3.0 * sigma_frames)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / float(sigma_frames)) ** 2)
+    return kernel / kernel.sum()
+
+
+def _smooth_gaussian_noise(noise: np.ndarray, *, sigma_frames: float) -> np.ndarray:
+    kernel = _gaussian_kernel_1d(sigma_frames)
+    radius = len(kernel) // 2
+    if radius == 0:
+        smoothed = noise.astype(np.float64, copy=True)
+    elif noise.ndim == 1:
+        padded = np.pad(noise, (radius, radius), mode="edge")
+        smoothed = np.convolve(padded, kernel, mode="valid")
+    else:
+        columns = []
+        for channel in range(noise.shape[1]):
+            padded = np.pad(noise[:, channel], (radius, radius), mode="edge")
+            columns.append(np.convolve(padded, kernel, mode="valid"))
+        smoothed = np.stack(columns, axis=1)
+
+    axis = 0 if smoothed.ndim > 1 else None
+    std = np.std(smoothed, axis=axis, keepdims=smoothed.ndim > 1)
+    return np.divide(smoothed, std, out=np.zeros_like(smoothed, dtype=np.float64), where=std > 1e-8)
+
+
+def _jitter_envelope(frame_index: int, total_frames: int, ramp_frames: int) -> float:
+    if ramp_frames <= 0 or total_frames <= 1:
+        return 1.0
+    edge = min(float(ramp_frames), max(1.0, (total_frames - 1) * 0.5))
+    amount = min(1.0, frame_index / edge, (total_frames - 1 - frame_index) / edge)
+    return smoothstep(amount)
+
+
+def _camera_seed(args: argparse.Namespace, obj: ShapeNetObject) -> int:
+    payload = f"{args.seed}:{obj.synset_id}:{obj.model_id}:{obj.obj_path}".encode("utf-8")
+    return zlib.crc32(payload) & 0xFFFFFFFF
+
+
+def _orbit_camera_pose(frame_index: int, total_frames: int, window: AbsenceWindow, args: argparse.Namespace) -> CameraPose:
     progress = frame_index / max(1, total_frames - 1)
     orbit = math.radians(args.camera_orbit_deg) * math.sin(2.0 * math.pi * progress)
     radius = float(args.camera_radius)
-    camera.location = (
+    location = (
         radius * math.sin(orbit),
         -radius * math.cos(orbit),
         float(args.camera_height) + 0.12 * math.sin(2.0 * math.pi * progress + 0.7),
@@ -760,8 +875,56 @@ def _set_camera_for_frame(camera: object, Vector: object, frame_index: int, tota
         offset=float(args.lookaway_x),
         transition_frames=int(args.lookaway_transition_frames),
     )
-    target = Vector((lookaway, 0.0, 0.1 + 0.05 * math.sin(2.0 * math.pi * progress)))
-    _look_at(camera, target)
+    target = (lookaway, 0.0, 0.1 + 0.05 * math.sin(2.0 * math.pi * progress))
+    return CameraPose(location=location, target=target)
+
+
+def _human_linear_camera_poses(total_frames: int, window: AbsenceWindow, args: argparse.Namespace, *, seed: int) -> list[CameraPose]:
+    rng = np.random.default_rng(seed)
+    position_noise = _smooth_gaussian_noise(rng.normal(size=(total_frames, 3)), sigma_frames=float(args.camera_jitter_smooth_frames))
+    aim_noise = _smooth_gaussian_noise(rng.normal(size=(total_frames, 2)), sigma_frames=float(args.camera_jitter_smooth_frames))
+    roll_noise = _smooth_gaussian_noise(rng.normal(size=total_frames), sigma_frames=float(args.camera_jitter_smooth_frames))
+
+    radius = float(args.camera_radius)
+    height = float(args.camera_height)
+    camera_start = (-0.5 * float(args.camera_linear_x), -radius - 0.5 * float(args.camera_linear_y), height - 0.5 * float(args.camera_linear_z))
+    camera_end = (0.5 * float(args.camera_linear_x), -radius + 0.5 * float(args.camera_linear_y), height + 0.5 * float(args.camera_linear_z))
+    base_target_z = 0.1
+    poses: list[CameraPose] = []
+    for frame_index in range(total_frames):
+        progress = frame_index / max(1, total_frames - 1)
+        location = _lerp_tuple(camera_start, camera_end, progress)
+        lookaway = _linear_lookaway_offset(
+            frame_index,
+            window,
+            offset=float(args.lookaway_x),
+            transition_frames=int(args.lookaway_transition_frames),
+        )
+        target = (lookaway, 0.0, base_target_z)
+        right, up, forward = _camera_basis(location, target)
+        envelope = _jitter_envelope(frame_index, total_frames, int(args.camera_jitter_ramp_frames))
+
+        location = _add_scaled(location, right, envelope * float(args.camera_jitter_std) * float(position_noise[frame_index, 0]))
+        location = _add_scaled(location, up, envelope * float(args.camera_jitter_std) * float(position_noise[frame_index, 1]))
+        location = _add_scaled(location, forward, envelope * float(args.camera_jitter_std) * 0.35 * float(position_noise[frame_index, 2]))
+        target = _add_scaled(target, right, envelope * float(args.camera_aim_jitter_std) * float(aim_noise[frame_index, 0]))
+        target = _add_scaled(target, up, envelope * float(args.camera_aim_jitter_std) * float(aim_noise[frame_index, 1]))
+        roll = envelope * math.radians(float(args.camera_roll_jitter_deg)) * float(roll_noise[frame_index])
+        poses.append(CameraPose(location=location, target=target, roll_rad=roll))
+    return poses
+
+
+def build_camera_poses(total_frames: int, window: AbsenceWindow, args: argparse.Namespace, *, seed: int) -> list[CameraPose]:
+    if args.camera_path == "orbit":
+        return [_orbit_camera_pose(frame_index, total_frames, window, args) for frame_index in range(total_frames)]
+    return _human_linear_camera_poses(total_frames, window, args, seed=seed)
+
+
+def _set_camera_pose(camera: object, Vector: object, pose: CameraPose) -> None:
+    camera.location = pose.location
+    _look_at(camera, Vector(pose.target))
+    if abs(pose.roll_rad) > 1e-10:
+        camera.rotation_euler.rotate_axis("Z", pose.roll_rad)
 
 
 def _verify_frame_sequence(directory: Path, *, expected_frames: int, label: str) -> None:
@@ -788,6 +951,8 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
     white = _material(bpy, "target_mask_white", (1.0, 1.0, 1.0, 1.0), emission=True)
     black = _material(bpy, "mask_black", (0.0, 0.0, 0.0, 1.0), emission=True)
     window = absence_window(args.frames, start=args.absent_start, length=args.absent_frames)
+    camera_seed = _camera_seed(args, obj)
+    camera_poses = build_camera_poses(args.frames, window, args, seed=camera_seed) if args.motion == "camera" else []
 
     mask_pixels: list[int] = []
     visible: list[bool] = []
@@ -796,7 +961,7 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
         if args.motion == "camera":
             root.location.x = 0.0
             root.rotation_euler[2] = 0.0
-            _set_camera_for_frame(camera, Vector, frame_index, args.frames, window, args)
+            _set_camera_pose(camera, Vector, camera_poses[frame_index])
         else:
             root.location.x = object_x(frame_index, args.frames, window, offscreen_x=args.offscreen_x)
             root.rotation_euler[2] = 0.28 * math.sin(frame_index * 0.12)
@@ -843,6 +1008,20 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
         "height": args.height,
         "motion": args.motion,
         "mask_mode": args.mask_mode,
+        "camera_path": args.camera_path,
+        "camera_seed": camera_seed if args.motion == "camera" else None,
+        "camera_linear": {
+            "x": args.camera_linear_x,
+            "y": args.camera_linear_y,
+            "z": args.camera_linear_z,
+        },
+        "camera_jitter": {
+            "position_std": args.camera_jitter_std,
+            "aim_std": args.camera_aim_jitter_std,
+            "roll_deg": args.camera_roll_jitter_deg,
+            "smooth_frames": args.camera_jitter_smooth_frames,
+            "ramp_frames": args.camera_jitter_ramp_frames,
+        },
         "rgb_dir": str(rgb_dir),
         "mask_dir": str(mask_dir),
         "video_path": video_path,

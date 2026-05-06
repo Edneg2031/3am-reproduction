@@ -6,6 +6,7 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -38,6 +39,60 @@ def test_parse_parallel_gpus_rejects_invalid_lists() -> None:
         module.parse_parallel_gpus("0,0")
     with pytest.raises(RuntimeError, match="could not detect"):
         module.parse_parallel_gpus("auto", detected_gpu_ids=[])
+
+
+def test_default_camera_path_is_human_linear(tmp_path: Path) -> None:
+    module = _load_render_module()
+
+    args = module.parse_args(["--output-root", str(tmp_path)])
+
+    assert args.camera_path == "human-linear"
+
+
+def test_human_linear_camera_path_is_reproducible_and_linear_without_jitter(tmp_path: Path) -> None:
+    module = _load_render_module()
+    args = module.parse_args(
+        [
+            "--output-root",
+            str(tmp_path),
+            "--frames",
+            "96",
+            "--camera-jitter-std",
+            "0",
+            "--camera-aim-jitter-std",
+            "0",
+            "--camera-roll-jitter-deg",
+            "0",
+        ]
+    )
+    window = module.absence_window(args.frames, start=args.absent_start, length=args.absent_frames)
+
+    poses = module.build_camera_poses(args.frames, window, args, seed=1234)
+    poses_again = module.build_camera_poses(args.frames, window, args, seed=1234)
+
+    assert poses == poses_again
+    np.testing.assert_allclose(poses[0].location, (-0.65, -4.29, 1.06), atol=1e-8)
+    np.testing.assert_allclose(poses[-1].location, (0.65, -4.11, 1.18), atol=1e-8)
+    np.testing.assert_allclose(poses[0].target, (0.0, 0.0, 0.1), atol=1e-8)
+    np.testing.assert_allclose(poses[-1].target, (0.0, 0.0, 0.1), atol=1e-8)
+    assert all(pose.roll_rad == 0.0 for pose in poses)
+
+
+def test_human_linear_camera_path_adds_seeded_smooth_jitter(tmp_path: Path) -> None:
+    module = _load_render_module()
+    args = module.parse_args(["--output-root", str(tmp_path), "--frames", "96"])
+    window = module.absence_window(args.frames, start=args.absent_start, length=args.absent_frames)
+
+    poses_a = module.build_camera_poses(args.frames, window, args, seed=1234)
+    poses_b = module.build_camera_poses(args.frames, window, args, seed=1234)
+    poses_c = module.build_camera_poses(args.frames, window, args, seed=5678)
+
+    assert poses_a == poses_b
+    assert poses_a != poses_c
+    locations = np.asarray([pose.location for pose in poses_a])
+    frame_deltas = np.linalg.norm(np.diff(locations, axis=0), axis=1)
+    assert float(frame_deltas.max()) < 0.2
+    assert any(abs(pose.roll_rad) > 0.0 for pose in poses_a[1:-1])
 
 
 def test_shard_indexed_objects_is_stable_without_duplicates() -> None:
