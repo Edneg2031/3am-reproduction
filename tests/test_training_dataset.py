@@ -24,9 +24,30 @@ def _write_image(path: Path) -> None:
     Image.fromarray(np.full((4, 4, 3), 127, dtype=np.uint8)).save(path)
 
 
+def _write_image_sized(path: Path, *, height: int, width: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.full((height, width, 3), 127, dtype=np.uint8)).save(path)
+
+
 def _write_mask(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(array.astype(np.uint8)).save(path)
+
+
+def _content_box(image: torch.Tensor) -> tuple[int, int]:
+    content = image.sum(dim=0) > 0
+    rows = torch.nonzero(content.any(dim=1), as_tuple=False).flatten()
+    cols = torch.nonzero(content.any(dim=0), as_tuple=False).flatten()
+    return int(rows[-1] - rows[0] + 1), int(cols[-1] - cols[0] + 1)
+
+
+def _mask_box_area(mask: torch.Tensor) -> int:
+    foreground = torch.nonzero(mask > 0.5, as_tuple=False)
+    if foreground.numel() == 0:
+        return 0
+    height = int(foreground[:, 0].max().item() - foreground[:, 0].min().item() + 1)
+    width = int(foreground[:, 1].max().item() - foreground[:, 1].min().item() + 1)
+    return height * width
 
 
 def _scene(tmp_path: Path, dataset: str, masks: list[np.ndarray]) -> SceneRecord:
@@ -122,14 +143,15 @@ def test_shapenet_training_dataset_uses_dynamic_length_resize_and_incomplete_pro
         frame_id = f"{index:06d}"
         image_path = scene_dir / "rgb" / f"{frame_id}.png"
         mask_path = scene_dir / "masks" / f"{frame_id}.png"
-        _write_image(image_path)
-        mask = np.zeros((6 + index, 8 + index), dtype=np.uint8)
-        mask[1:4, 2:6] = 255
+        _write_image_sized(image_path, height=48, width=64)
+        mask = np.zeros((48, 64), dtype=np.uint8)
+        mask[10:30, 20:44] = 255
         _write_mask(mask_path, mask)
         frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
     manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
     write_manifest(manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(frames))])
     config = _config(tmp_path, "shapenet", manifest)
+    config["model"]["sam_image_size"] = 1024  # type: ignore[index]
     config["datasets"]["shapenet"].update(  # type: ignore[index]
         {
             "sequence_length_min": 3,
@@ -150,12 +172,17 @@ def test_shapenet_training_dataset_uses_dynamic_length_resize_and_incomplete_pro
     batch = dataset.sample()
 
     assert 3 <= len(batch.frame_ids) <= 5
-    assert batch.images.shape[-1] in {32, 64}
-    assert batch.images.shape[-2] in {32, 64}
+    assert batch.images.shape[-2:] == (1024, 1024)
+    assert batch.target_masks.shape[-2:] == (1024, 1024)
     assert batch.prompt.type == "mask"
     assert batch.prompt.mask is not None
     assert batch.prompt.mask.sum().item() > 0
     assert batch.prompt.mask.sum().item() < batch.target_masks[batch.prompt.frame_index].sum().item()
+    content_height, content_width = _content_box(batch.images[0])
+    assert content_height in {32, 64}
+    assert content_width in {32, 64}
+    padding = ~(batch.images[0].sum(dim=0) > 0)
+    assert torch.count_nonzero(batch.target_masks[batch.prompt.frame_index][padding]).item() == 0
 
 
 def test_strict_shapenet_training_dataset_uses_dynamic_sampling_when_feature_paths_exist(tmp_path: Path) -> None:
@@ -192,6 +219,7 @@ def test_strict_shapenet_training_dataset_uses_dynamic_sampling_when_feature_pat
     config = _strict_config(tmp_path, "shapenet", manifest, fov_probability=0.0)
     config["features"]["feature_layers"] = "encoder"  # type: ignore[index]
     config["features"]["require_decoder_memory"] = False  # type: ignore[index]
+    config["model"]["sam_image_size"] = 1024  # type: ignore[index]
     config["datasets"]["shapenet"].update(  # type: ignore[index]
         {
             "sequence_length_min": 3,
@@ -205,11 +233,51 @@ def test_strict_shapenet_training_dataset_uses_dynamic_sampling_when_feature_pat
     batch = dataset.sample()
 
     assert 3 <= len(batch.frame_ids) <= 5
-    assert batch.images.shape[-1] in {32, 64}
+    assert batch.images.shape[-2:] == (1024, 1024)
     assert batch.prompt.type == "mask"
     assert batch.prompt.mask is not None
     assert 0 < batch.prompt.mask.sum().item() <= batch.target_masks[batch.prompt.frame_index].sum().item()
     assert batch.must3r_features is not None
+
+
+def test_shapenet_letterbox_keeps_dynamic_content_scale(tmp_path: Path) -> None:
+    scene_dir = tmp_path / "data" / "processed" / "shapenet_tracking" / "scene_a"
+    frames: list[FrameRecord] = []
+    for index in range(3):
+        frame_id = f"{index:06d}"
+        image_path = scene_dir / "rgb" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        _write_image_sized(image_path, height=48, width=64)
+        mask = np.zeros((48, 64), dtype=np.uint8)
+        mask[12:36, 20:44] = 255
+        _write_mask(mask_path, mask)
+        frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+    manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
+    write_manifest(manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(frames))])
+
+    config_small = _config(tmp_path, "shapenet", manifest)
+    config_small["model"]["sam_image_size"] = 1024  # type: ignore[index]
+    config_small["datasets"]["shapenet"].update(  # type: ignore[index]
+        {
+            "sequence_length_min": 2,
+            "sequence_length_max": 2,
+            "dynamic_resize": {"enabled": True, "min_size": 32, "max_size": 32, "multiple": 32},
+        }
+    )
+    config_large = _config(tmp_path, "shapenet", manifest)
+    config_large["model"]["sam_image_size"] = 1024  # type: ignore[index]
+    config_large["datasets"]["shapenet"].update(  # type: ignore[index]
+        {
+            "sequence_length_min": 2,
+            "sequence_length_max": 2,
+            "dynamic_resize": {"enabled": True, "min_size": 64, "max_size": 64, "multiple": 32},
+        }
+    )
+
+    batch_small = ThreeAMTrainingDataset.from_config(config_small, load_feature_cache=False, rng=random.Random(0)).sample()
+    batch_large = ThreeAMTrainingDataset.from_config(config_large, load_feature_cache=False, rng=random.Random(0)).sample()
+
+    assert _mask_box_area(batch_large.target_masks[0]) > _mask_box_area(batch_small.target_masks[0])
 
 
 def test_training_dataset_keeps_integer_instance_identity(tmp_path: Path) -> None:

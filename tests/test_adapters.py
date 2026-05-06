@@ -70,6 +70,11 @@ class FakeSam2WithVisionAlias(FakeSam2BackboneAware):
         return backbone_out
 
 
+class FakeFixedGridSam2(FakeSam2BackboneAware):
+    image_size = 1024
+    backbone_stride = 16
+
+
 def test_sam2_adapter_injects_merged_features_into_backbone_fpn() -> None:
     adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
     model = FakeSam2BackboneAware()
@@ -118,6 +123,14 @@ def test_sam2_adapter_rejects_non_window_aligned_image_size() -> None:
 
     with pytest.raises(ExternalDependencyError, match="divisible by 32"):
         adapter.encode_sam_features(torch.randn(1, 3, 844, 1024))
+
+
+def test_sam2_adapter_rejects_non_letterboxed_fixed_grid_image_size() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
+    adapter.model = FakeFixedGridSam2()
+
+    with pytest.raises(ExternalDependencyError, match="letterbox/crop to 1024"):
+        adapter.encode_sam_features(torch.randn(1, 3, 768, 768))
 
 
 class FakeOfficialSam2Modules(nn.Module):

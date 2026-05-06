@@ -63,6 +63,198 @@ class Prompt:
 
 
 @dataclass(frozen=True)
+class LetterboxTransform:
+    source_width: int
+    source_height: int
+    content_width: int
+    content_height: int
+    canvas_width: int
+    canvas_height: int
+    crop_left: int = 0
+    crop_top: int = 0
+    pad_left: int = 0
+    pad_top: int = 0
+
+    @property
+    def scale_x(self) -> float:
+        return float(self.content_width) / float(self.source_width)
+
+    @property
+    def scale_y(self) -> float:
+        return float(self.content_height) / float(self.source_height)
+
+    @property
+    def crop_width(self) -> int:
+        return min(self.content_width, self.canvas_width)
+
+    @property
+    def crop_height(self) -> int:
+        return min(self.content_height, self.canvas_height)
+
+    @property
+    def pad_width(self) -> int:
+        return max(0, self.canvas_width - self.crop_width)
+
+    @property
+    def pad_height(self) -> int:
+        return max(0, self.canvas_height - self.crop_height)
+
+    def with_crop(self, *, crop_left: int, crop_top: int) -> "LetterboxTransform":
+        return replace(self, crop_left=max(0, int(crop_left)), crop_top=max(0, int(crop_top)))
+
+    def resize_content_image(self, image: torch.Tensor) -> torch.Tensor:
+        if image.ndim != 3:
+            raise ValueError(f"letterbox image must be CHW, got {tuple(image.shape)}")
+        return F.interpolate(
+            image[None].float(),
+            size=(self.content_height, self.content_width),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+
+    def resize_content_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        if mask.ndim != 2:
+            raise ValueError(f"letterbox mask must be HW, got {tuple(mask.shape)}")
+        return F.interpolate(mask[None, None].float(), size=(self.content_height, self.content_width), mode="nearest")[0, 0]
+
+    def _place_content(self, content: torch.Tensor) -> torch.Tensor:
+        if content.ndim == 2:
+            content = content[None, ...]
+            squeeze = True
+        elif content.ndim == 3:
+            squeeze = False
+        else:
+            raise ValueError(f"letterbox content must be CHW or HW, got {tuple(content.shape)}")
+        crop_left = min(self.crop_left, max(0, self.content_width - self.crop_width))
+        crop_top = min(self.crop_top, max(0, self.content_height - self.crop_height))
+        cropped = content[:, crop_top : crop_top + self.crop_height, crop_left : crop_left + self.crop_width]
+        canvas = torch.full(
+            (content.shape[0], self.canvas_height, self.canvas_width),
+            0.0,
+            dtype=cropped.dtype,
+            device=cropped.device,
+        )
+        pad_left = self.pad_left
+        pad_top = self.pad_top
+        canvas[:, pad_top : pad_top + cropped.shape[-2], pad_left : pad_left + cropped.shape[-1]] = cropped
+        return canvas[0] if squeeze else canvas
+
+    def resize_point(self, x: float, y: float) -> tuple[float, float]:
+        return (
+            x * self.scale_x - self.crop_left + self.pad_left,
+            y * self.scale_y - self.crop_top + self.pad_top,
+        )
+
+    def resize_mask(self, mask: torch.Tensor, *, fill_value: float = 0.0) -> torch.Tensor:
+        resized = self.resize_content_mask(mask)
+        canvas = torch.full((self.canvas_height, self.canvas_width), float(fill_value), dtype=resized.dtype, device=resized.device)
+        canvas[...] = self._place_content(resized)
+        return canvas
+
+    def resize_image(self, image: torch.Tensor, *, fill_value: float = 0.0) -> torch.Tensor:
+        resized = self.resize_content_image(image)
+        canvas = torch.full(
+            (image.shape[0], self.canvas_height, self.canvas_width),
+            float(fill_value),
+            dtype=resized.dtype,
+            device=resized.device,
+        )
+        canvas[...] = self._place_content(resized)
+        return canvas
+
+
+def _letterbox_transform(
+    *,
+    source_width: int,
+    source_height: int,
+    target_size: int,
+) -> LetterboxTransform:
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("source dimensions must be positive")
+    if target_size <= 0:
+        raise ValueError("target_size must be positive")
+    scale = min(target_size / float(source_width), target_size / float(source_height))
+    content_width = max(1, min(target_size, int(round(source_width * scale))))
+    content_height = max(1, min(target_size, int(round(source_height * scale))))
+    pad_left = max(0, (target_size - content_width) // 2)
+    pad_top = max(0, (target_size - content_height) // 2)
+    return LetterboxTransform(
+        source_width=source_width,
+        source_height=source_height,
+        content_width=content_width,
+        content_height=content_height,
+        canvas_width=target_size,
+        canvas_height=target_size,
+        crop_left=0,
+        crop_top=0,
+        pad_left=pad_left,
+        pad_top=pad_top,
+    )
+
+
+def _resolve_content_size(
+    requested_size: int | tuple[int, int] | None,
+    *,
+    source_shape: tuple[int, int],
+    multiple: int = 1,
+    preserve_aspect_if_scalar: bool = False,
+) -> tuple[int, int]:
+    source_height, source_width = int(source_shape[0]), int(source_shape[1])
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError("source_shape must be positive")
+    if requested_size is None:
+        width, height = source_width, source_height
+    elif isinstance(requested_size, int):
+        if preserve_aspect_if_scalar:
+            short_side = max(1, min(source_width, source_height))
+            scale = float(requested_size) / float(short_side)
+            width = max(1, int(round(source_width * scale)))
+            height = max(1, int(round(source_height * scale)))
+        else:
+            width = int(requested_size)
+            height = int(requested_size)
+    else:
+        width = int(requested_size[0])
+        height = int(requested_size[1])
+    snap = max(1, int(multiple))
+    width = max(1, int(round(width / snap)) * snap)
+    height = max(1, int(round(height / snap)) * snap)
+    return width, height
+
+
+def build_letterbox_transform(
+    *,
+    source_shape: tuple[int, int],
+    requested_size: int | tuple[int, int] | None,
+    canvas_size: int,
+    multiple: int = 1,
+    preserve_aspect_if_scalar: bool = False,
+) -> LetterboxTransform:
+    content_width, content_height = _resolve_content_size(
+        requested_size,
+        source_shape=source_shape,
+        multiple=multiple,
+        preserve_aspect_if_scalar=preserve_aspect_if_scalar,
+    )
+    crop_left = max(0, (content_width - canvas_size) // 2)
+    crop_top = max(0, (content_height - canvas_size) // 2)
+    pad_left = max(0, (canvas_size - content_width) // 2)
+    pad_top = max(0, (canvas_size - content_height) // 2)
+    return LetterboxTransform(
+        source_width=int(source_shape[1]),
+        source_height=int(source_shape[0]),
+        content_width=content_width,
+        content_height=content_height,
+        canvas_width=canvas_size,
+        canvas_height=canvas_size,
+        crop_left=crop_left,
+        crop_top=crop_top,
+        pad_left=pad_left,
+        pad_top=pad_top,
+    )
+
+
+@dataclass(frozen=True)
 class TrainingBatch:
     images: torch.Tensor
     target_masks: torch.Tensor
@@ -452,6 +644,41 @@ def _bbox_from_mask(mask: torch.Tensor) -> torch.Tensor:
     y_max = foreground[:, 0].max().float()
     x_max = foreground[:, 1].max().float()
     return torch.stack([x_min, y_min, x_max, y_max])
+
+
+def _crop_window_for_mask(
+    mask: torch.Tensor,
+    *,
+    crop_width: int,
+    crop_height: int,
+    rng: RandomLike,
+    attempts: int = 24,
+) -> tuple[int, int]:
+    if crop_width <= 0 or crop_height <= 0:
+        raise ValueError("crop dimensions must be positive")
+    mask = mask > 0.5
+    height, width = int(mask.shape[0]), int(mask.shape[1])
+    crop_width = min(crop_width, width)
+    crop_height = min(crop_height, height)
+    foreground = torch.nonzero(mask, as_tuple=False)
+    if foreground.numel() == 0:
+        return max(0, (width - crop_width) // 2), max(0, (height - crop_height) // 2)
+    y_min = int(foreground[:, 0].min().item())
+    y_max = int(foreground[:, 0].max().item())
+    x_min = int(foreground[:, 1].min().item())
+    x_max = int(foreground[:, 1].max().item())
+    left_min = max(0, x_max - crop_width + 1)
+    left_max = min(x_min, width - crop_width)
+    top_min = max(0, y_max - crop_height + 1)
+    top_max = min(y_min, height - crop_height)
+    for _ in range(max(1, attempts)):
+        left = _random_int(rng, left_min, left_max) if left_max >= left_min else max(0, min(x_min, width - crop_width))
+        top = _random_int(rng, top_min, top_max) if top_max >= top_min else max(0, min(y_min, height - crop_height))
+        if bool(mask[top : top + crop_height, left : left + crop_width].any()):
+            return left, top
+    left = max(0, min(int(round((x_min + x_max + 1) / 2.0 - crop_width / 2.0)), width - crop_width))
+    top = max(0, min(int(round((y_min + y_max + 1) / 2.0 - crop_height / 2.0)), height - crop_height))
+    return left, top
 
 
 def _point_prompt_from_mask(mask: torch.Tensor, rng: RandomLike) -> tuple[torch.Tensor, torch.Tensor]:
@@ -877,15 +1104,41 @@ class ThreeAMTrainingDataset:
             selected_indices = choose_indices(len(frames), sampling_config, overlap)
         selected_frames = [frames[index] for index in selected_indices]
         image_size = self._image_size(scene, selected_frames)
-        images = [load_image_tensor(frame.image_path, image_size) for frame in selected_frames]
-        image_shape = tuple(images[0].shape[-2:])
-        if any(tuple(image.shape[-2:]) != image_shape for image in images):
-            raise ValueError(f"Scene {scene.scene_id} produced variable image sizes in one training sample")
         ignore_values = _mask_ignore_values(self.config, scene.dataset)
-        mask_arrays = [load_mask_array(frame.mask_path, image_shape, ignore_values=ignore_values) for frame in selected_frames]
+        raw_images = [load_image_tensor(frame.image_path, None) for frame in selected_frames]
+        if not raw_images:
+            raise RuntimeError(f"Scene {scene.scene_id} produced no images")
+        source_shape = tuple(raw_images[0].shape[-2:])
+        if any(tuple(image.shape[-2:]) != source_shape for image in raw_images):
+            raise ValueError(f"Scene {scene.scene_id} produced variable source image sizes in one training sample")
+        canvas_size = int(self.sam_image_size or max(_resolve_content_size(image_size, source_shape=source_shape)))
+        letterbox = build_letterbox_transform(
+            source_shape=source_shape,
+            requested_size=image_size,
+            canvas_size=canvas_size,
+        )
+        content_images = [letterbox.resize_content_image(image) for image in raw_images]
+        content_masks = [
+            letterbox.resize_content_mask(
+                torch.from_numpy(load_mask_array(frame.mask_path, source_shape, ignore_values=ignore_values).astype(np.float32))
+            )
+            for frame in selected_frames
+        ]
+        mask_arrays = [mask.numpy().astype(np.int64) for mask in content_masks]
         _validate_scannetpp_source_masks(self.config, scene, selected_frames, mask_arrays)
         reference_index, instance_id, binary_mode = _select_reference(mask_arrays, self.rng)
-        target_masks = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
+        target_masks_content = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
+        if letterbox.content_width > letterbox.canvas_width or letterbox.content_height > letterbox.canvas_height:
+            crop_left, crop_top = _crop_window_for_mask(
+                target_masks_content[reference_index],
+                crop_width=letterbox.crop_width,
+                crop_height=letterbox.crop_height,
+                rng=self.rng,
+                attempts=max(1, int(self.config.get("training", {}).get("sample_resample_attempts", 24))),
+            )
+            letterbox = letterbox.with_crop(crop_left=crop_left, crop_top=crop_top)
+        images = [letterbox._place_content(image) for image in content_images]
+        target_masks = torch.stack([letterbox._place_content(mask) for mask in target_masks_content], dim=0)
         max_ratio = _mask_max_foreground_ratio(self.config, scene.dataset)
         for frame, target in zip(selected_frames, target_masks, strict=True):
             _validate_mask_foreground_ratio(
@@ -896,6 +1149,8 @@ class ThreeAMTrainingDataset:
                 max_ratio=max_ratio,
             )
         prompt = build_prompt(scene.dataset, target_masks[reference_index], reference_index, self.rng, self.config)
+        if prompt.mask is not None:
+            prompt = replace(prompt, mask=prompt.mask.to(dtype=torch.float32))
         has_object = target_masks.flatten(1).any(dim=1)
         must3r_features = None
         if self.load_feature_cache:
@@ -962,10 +1217,39 @@ class ThreeAMTrainingDataset:
             instance_id, binary_mode = self._select_instance_from_mask(reference_mask)
             sampling_mode = "continuous"
         selected_frames = [frames[index] for index in selected_indices]
-        images = [load_image_tensor(frame.image_path, self.sam_image_size) for frame in selected_frames]
-        image_shape = tuple(images[0].shape[-2:])
-        mask_arrays = [load_mask_array(frame.mask_path, image_shape, ignore_values=ignore_values) for frame in selected_frames]
-        target_masks = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
+        image_size = self._image_size(scene, selected_frames)
+        raw_images = [load_image_tensor(frame.image_path, None) for frame in selected_frames]
+        if not raw_images:
+            raise RuntimeError("Strict paper scene sampling produced no frames")
+        source_shape = tuple(raw_images[0].shape[-2:])
+        if any(tuple(image.shape[-2:]) != source_shape for image in raw_images):
+            raise ValueError(f"Scene {scene.scene_id} produced variable source image sizes in one training sample")
+        canvas_size = int(self.sam_image_size or max(_resolve_content_size(image_size, source_shape=source_shape)))
+        letterbox = build_letterbox_transform(
+            source_shape=source_shape,
+            requested_size=image_size,
+            canvas_size=canvas_size,
+        )
+        content_images = [letterbox.resize_content_image(image) for image in raw_images]
+        content_masks = [
+            letterbox.resize_content_mask(
+                torch.from_numpy(load_mask_array(frame.mask_path, source_shape, ignore_values=ignore_values).astype(np.float32))
+            )
+            for frame in selected_frames
+        ]
+        mask_arrays = [mask.numpy().astype(np.int64) for mask in content_masks]
+        target_masks_content = torch.stack([_target_mask(mask, instance_id, binary_mode) for mask in mask_arrays], dim=0)
+        if letterbox.content_width > letterbox.canvas_width or letterbox.content_height > letterbox.canvas_height:
+            crop_left, crop_top = _crop_window_for_mask(
+                target_masks_content[0],
+                crop_width=letterbox.crop_width,
+                crop_height=letterbox.crop_height,
+                rng=self.rng,
+                attempts=max(1, int(self.config.get("training", {}).get("sample_resample_attempts", 24))),
+            )
+            letterbox = letterbox.with_crop(crop_left=crop_left, crop_top=crop_top)
+        images = [letterbox._place_content(image) for image in content_images]
+        target_masks = torch.stack([letterbox._place_content(mask) for mask in target_masks_content], dim=0)
         max_ratio = _mask_max_foreground_ratio(self.config, scene.dataset)
         for frame, target in zip(selected_frames, target_masks, strict=True):
             _validate_mask_foreground_ratio(
@@ -1039,8 +1323,6 @@ class ThreeAMTrainingDataset:
         multiple = max(1, int(size_config.get("multiple", 32)))
         sampled = _random_int(self.rng, min_size, max_size)
         sampled = max(multiple, int(round(sampled / multiple)) * multiple)
-        if self.sam_image_size is not None:
-            sampled = min(sampled, self.sam_image_size)
         if bool(size_config.get("keep_aspect", False)):
             if not frames:
                 return sampled

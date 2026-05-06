@@ -17,7 +17,7 @@ from PIL import Image
 
 from three_am.models.adapters import Must3rFeatureAdapter, Sam2TrainingAdapter
 from three_am.models.feature_merger import Must3rFeatureBundle
-from three_am.training.dataset import Prompt, TrainingBatch, load_image_tensor, load_mask_array
+from three_am.training.dataset import Prompt, TrainingBatch, _letterbox_transform, load_image_tensor, load_mask_array
 from three_am.utils.config import load_yaml
 
 
@@ -70,14 +70,32 @@ def _extract_video_frames(path: Path) -> list[Path]:
     return frames
 
 
-def _load_images(paths: Sequence[Path], image_size: int) -> torch.Tensor:
-    return torch.stack([load_image_tensor(path, image_size) for path in paths], dim=0)
+def _load_images(paths: Sequence[Path], image_size: int) -> tuple[torch.Tensor, tuple[int, int]]:
+    raw_images = [load_image_tensor(path, None) for path in paths]
+    if not raw_images:
+        raise ValueError("No frames to load")
+    source_shape = tuple(raw_images[0].shape[-2:])
+    if any(tuple(image.shape[-2:]) != source_shape for image in raw_images):
+        raise ValueError("All inference frames must share one source resolution for SAM2 letterbox inference")
+    transform = _letterbox_transform(
+        source_width=source_shape[1],
+        source_height=source_shape[0],
+        target_size=image_size,
+    )
+    images = torch.stack([transform.resize_image(image) for image in raw_images], dim=0)
+    return images, source_shape
 
 
-def _load_reference_mask(path: Path, shape: tuple[int, int]) -> torch.Tensor:
-    mask = torch.from_numpy((load_mask_array(path, shape) > 0).astype(np.float32))
+def _load_reference_mask(path: Path, source_shape: tuple[int, int], image_size: int) -> torch.Tensor:
+    transform = _letterbox_transform(
+        source_width=source_shape[1],
+        source_height=source_shape[0],
+        target_size=image_size,
+    )
+    mask = torch.from_numpy((load_mask_array(path, source_shape) > 0).astype(np.float32))
+    mask = transform.resize_mask(mask)
     if not bool(mask.any()):
-        raise ValueError(f"Reference mask is empty after resizing: {path}")
+        raise ValueError(f"Reference mask is empty after letterbox resizing: {path}")
     return mask
 
 
@@ -160,8 +178,9 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
     if reference_index < 0 or reference_index >= len(frame_paths):
         raise ValueError(f"--reference-index must be in [0, {len(frame_paths) - 1}]")
 
-    images = _load_images(frame_paths, image_size).to(device)
-    reference_mask = _load_reference_mask(Path(args.reference_mask).expanduser(), tuple(images.shape[-2:])).to(device)
+    images, source_shape = _load_images(frame_paths, image_size)
+    images = images.to(device)
+    reference_mask = _load_reference_mask(Path(args.reference_mask).expanduser(), source_shape, image_size).to(device)
     output_root = Path(args.output_dir).expanduser()
     mask_dir = output_root / "masks"
     prompt = Prompt(type="mask", frame_index=reference_index, mask=reference_mask)

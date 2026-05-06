@@ -157,6 +157,19 @@ class Sam2TrainingAdapter(nn.Module):
         if images.ndim != 4:
             raise ExternalDependencyError(f"SAM2 images must have shape BCHW/TCHW, got {tuple(images.shape)}")
         height, width = int(images.shape[-2]), int(images.shape[-1])
+        expected_image_size = getattr(self.model, "image_size", None) if self.model is not None else None
+        backbone_stride = getattr(self.model, "backbone_stride", None) if self.model is not None else None
+        if expected_image_size is not None:
+            expected = int(expected_image_size)
+            if height != expected or width != expected:
+                stride_suffix = ""
+                if backbone_stride is not None:
+                    stride_suffix = f" with backbone stride {int(backbone_stride)}"
+                raise ExternalDependencyError(
+                    "SAM2 expects a fixed square input grid before _track_step can run. "
+                    f"Got image size {(height, width)}, but this release expects {(expected, expected)}{stride_suffix}. "
+                    f"Align ShapeNet or inference inputs with letterbox/crop to {expected} before SAM2."
+                )
         if height % 32 != 0 or width % 32 != 0:
             raise ExternalDependencyError(
                 "SAM2 Hiera input size must be divisible by 32 so its 8x8 patch-window positional embedding "
