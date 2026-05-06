@@ -70,7 +70,7 @@ sampling:
 
 features:
   cache_root: outputs/must3r_features
-  online: false
+  online: true
   require_decoder_memory: true
   memory_window: 8
   full_scene_memory: false

@@ -1480,11 +1480,19 @@ def main() -> None:
     strict_group = parser.add_mutually_exclusive_group()
     strict_group.add_argument("--strict-paper", action="store_true", dest="strict_paper", default=None)
     strict_group.add_argument("--no-strict-paper", action="store_false", dest="strict_paper")
-    parser.add_argument(
+    online_group = parser.add_mutually_exclusive_group()
+    online_group.add_argument(
         "--online-must3r",
         action="store_true",
         default=None,
         help="compute MUSt3R features inside the training loop instead of loading feature cache files",
+    )
+    online_group.add_argument(
+        "--offline-must3r",
+        action="store_false",
+        dest="online_must3r",
+        default=None,
+        help="load MUSt3R feature cache files even when features.online=true in the config",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

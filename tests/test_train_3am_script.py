@@ -239,6 +239,46 @@ def test_training_script_can_use_online_must3r_when_cache_is_missing(tmp_path: P
     assert [path.name for path in must3r.seen_paths] == ["000.png", "001.png"]
 
 
+def test_training_script_uses_config_online_must3r_by_default(tmp_path: Path) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path, write_feature_cache=False)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["features"]["online"] = True
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    must3r = FakeMust3rAdapter()
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        sam2_adapter=FakeSam2Adapter(),
+        must3r_adapter=must3r,
+    )
+
+    assert step == 1
+    assert must3r.seen_paths is not None
+
+
+def test_training_script_can_force_offline_must3r_from_online_config(tmp_path: Path) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path, write_feature_cache=False)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["features"]["online"] = True
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(train_3am.FeatureCacheRuntimeError) as excinfo:
+        train_3am.run_training(
+            str(config_path),
+            iterations=1,
+            device_name="cpu",
+            online_must3r=False,
+            sam2_adapter=FakeSam2Adapter(),
+            must3r_adapter=FakeMust3rAdapter(),
+        )
+
+    assert "MUSt3R feature cache is missing" in str(excinfo.value)
+
+
 def test_training_replaces_full_scannetpp_masks_with_sam2_point_pseudo_masks(tmp_path: Path, capsys) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path, full_masks=True)
