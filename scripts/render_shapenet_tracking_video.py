@@ -209,7 +209,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Batch-render ShapeNetCore.v2 objects into tracking videos and matching per-frame masks. "
-            "The target object moves out of the camera view for a span, then reappears."
+            "By default the object stays fixed while the camera moves, looks away until the object leaves "
+            "the view for a span, then looks back so the object reappears."
         )
     )
     parser.add_argument("--shapenet-root", help="ShapeNetCore.v2 root, e.g. /data/ShapeNetCore.v2")
@@ -232,6 +233,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--engine", default="auto", choices=["auto", "eevee", "cycles"], help="Use cycles on headless Linux if EEVEE has no GPU/display context")
     parser.add_argument("--axis-convention", default="y-up", choices=["y-up", "z-up"])
     parser.add_argument("--object-size", type=float, default=1.35)
+    parser.add_argument("--motion", default="camera", choices=["camera", "object"], help="camera keeps the object fixed and moves/pans the camera; object keeps the old moving-object behavior")
+    parser.add_argument("--camera-radius", type=float, default=4.2)
+    parser.add_argument("--camera-height", type=float, default=1.12)
+    parser.add_argument("--camera-orbit-deg", type=float, default=28.0)
+    parser.add_argument("--lookaway-x", type=float, default=4.0, help="World-space look target x-offset used to make the fixed object leave the camera view")
+    parser.add_argument("--lookaway-transition-frames", type=int, default=10)
     parser.add_argument("--offscreen-x", type=float, default=4.2)
 
     parser.add_argument("--absent-start", type=int, help="First frame where the object is forced outside the view")
@@ -344,7 +351,7 @@ def _normalize_meshes(bpy: object, Vector: object, meshes: Sequence[object], *, 
     return root
 
 
-def _setup_scene(bpy: object, Vector: object, args: argparse.Namespace, obj_path: Path) -> tuple[object, list[object], object]:
+def _setup_scene(bpy: object, Vector: object, args: argparse.Namespace, obj_path: Path) -> tuple[object, list[object], object, object]:
     _clear_scene(bpy)
     scene = bpy.context.scene
     scene.frame_start = 0
@@ -381,7 +388,7 @@ def _setup_scene(bpy: object, Vector: object, args: argparse.Namespace, obj_path
     camera.data.angle = math.radians(args.fov_deg)
     _look_at(camera, Vector((0.0, 0.0, 0.1)))
     scene.camera = camera
-    return root, meshes, floor
+    return root, meshes, floor, camera
 
 
 def _render_still(bpy: object, path: Path) -> None:
@@ -430,12 +437,14 @@ def _render_mask(bpy: object, path: Path, *, meshes: Sequence[object], floor: ob
 def _write_video_from_frames(frame_pattern: Path, output_path: Path, *, fps: int) -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        return None
+        raise RuntimeError("ffmpeg is required to write mp4 videos. Install ffmpeg or pass --no-video to keep PNG sequences only.")
     command = [
         ffmpeg,
         "-y",
         "-framerate",
         str(fps),
+        "-start_number",
+        "0",
         "-i",
         str(frame_pattern),
         "-pix_fmt",
@@ -448,6 +457,46 @@ def _write_video_from_frames(frame_pattern: Path, output_path: Path, *, fps: int
     return str(output_path)
 
 
+def _lookaway_offset(frame_index: int, window: AbsenceWindow, *, offset: float, transition_frames: int) -> float:
+    transition = max(1, int(transition_frames))
+    ramp_in_start = max(0, window.start - transition)
+    ramp_out_end = window.end + transition
+    if frame_index < ramp_in_start:
+        return 0.0
+    if frame_index < window.start:
+        return offset * smoothstep((frame_index - ramp_in_start) / max(1, window.start - ramp_in_start))
+    if frame_index < window.end:
+        return offset
+    if frame_index < ramp_out_end:
+        return offset * (1.0 - smoothstep((frame_index - window.end) / max(1, ramp_out_end - window.end)))
+    return 0.0
+
+
+def _set_camera_for_frame(camera: object, Vector: object, frame_index: int, total_frames: int, window: AbsenceWindow, args: argparse.Namespace) -> None:
+    progress = frame_index / max(1, total_frames - 1)
+    orbit = math.radians(args.camera_orbit_deg) * math.sin(2.0 * math.pi * progress)
+    radius = float(args.camera_radius)
+    camera.location = (
+        radius * math.sin(orbit),
+        -radius * math.cos(orbit),
+        float(args.camera_height) + 0.12 * math.sin(2.0 * math.pi * progress + 0.7),
+    )
+    lookaway = _lookaway_offset(
+        frame_index,
+        window,
+        offset=float(args.lookaway_x),
+        transition_frames=int(args.lookaway_transition_frames),
+    )
+    target = Vector((lookaway, 0.0, 0.1 + 0.05 * math.sin(2.0 * math.pi * progress)))
+    _look_at(camera, target)
+
+
+def _verify_frame_sequence(directory: Path, *, expected_frames: int, label: str) -> None:
+    frame_count = len(list(directory.glob("*.png")))
+    if frame_count != expected_frames:
+        raise RuntimeError(f"Expected {expected_frames} {label} frames in {directory}, found {frame_count}")
+
+
 def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_dir: Path, args: argparse.Namespace) -> dict[str, object]:
     if output_dir.exists() and args.overwrite:
         shutil.rmtree(output_dir)
@@ -458,7 +507,7 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
     rgb_dir.mkdir(parents=True, exist_ok=True)
     mask_dir.mkdir(parents=True, exist_ok=True)
 
-    root, meshes, floor = _setup_scene(bpy, Vector, args, obj.obj_path)
+    root, meshes, floor, camera = _setup_scene(bpy, Vector, args, obj.obj_path)
     white = _material(bpy, "target_mask_white", (1.0, 1.0, 1.0, 1.0), emission=True)
     black = _material(bpy, "mask_black", (0.0, 0.0, 0.0, 1.0), emission=True)
     window = absence_window(args.frames, start=args.absent_start, length=args.absent_frames)
@@ -467,19 +516,27 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
     visible: list[bool] = []
     for frame_index in range(args.frames):
         bpy.context.scene.frame_set(frame_index)
-        root.location.x = object_x(frame_index, args.frames, window, offscreen_x=args.offscreen_x)
-        root.rotation_euler[2] = 0.28 * math.sin(frame_index * 0.12)
+        if args.motion == "camera":
+            root.location.x = 0.0
+            root.rotation_euler[2] = 0.0
+            _set_camera_for_frame(camera, Vector, frame_index, args.frames, window, args)
+        else:
+            root.location.x = object_x(frame_index, args.frames, window, offscreen_x=args.offscreen_x)
+            root.rotation_euler[2] = 0.28 * math.sin(frame_index * 0.12)
         frame_id = f"{frame_index:06d}"
         _render_still(bpy, rgb_dir / f"{frame_id}.png")
         pixels = _render_mask(bpy, mask_dir / f"{frame_id}.png", meshes=meshes, floor=floor, white=white, black=black)
         mask_pixels.append(pixels)
         visible.append(pixels >= args.min_visible_mask_pixels)
 
+    _verify_frame_sequence(rgb_dir, expected_frames=args.frames, label="RGB")
+    _verify_frame_sequence(mask_dir, expected_frames=args.frames, label="mask")
     if not has_absent_then_reappearing_visibility(visible, min_absent_frames=args.min_absent_frames):
         runs = visibility_runs(visible)
         raise RuntimeError(
             f"{obj.synset_id}/{obj.model_id} did not produce visible -> absent -> visible masks. "
-            f"Visibility runs: {runs}. Try increasing --offscreen-x or lowering --min-visible-mask-pixels."
+            f"Visibility runs: {runs}. For camera motion, try increasing --lookaway-x or lowering "
+            "--min-visible-mask-pixels. For object motion, try increasing --offscreen-x."
         )
 
     video_path = None
@@ -497,6 +554,7 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
         "fps": args.fps,
         "width": args.width,
         "height": args.height,
+        "motion": args.motion,
         "rgb_dir": str(rgb_dir),
         "mask_dir": str(mask_dir),
         "video_path": video_path,
