@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import warnings
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -406,7 +407,22 @@ class Sam2TrainingAdapter(nn.Module):
             and hasattr(self.model, "_track_step")
             and hasattr(self.model, "_encode_memory_in_output")
         ):
-            return self._forward_track_steps(batch, backbone_out)
+            try:
+                return self._forward_track_steps(batch, backbone_out)
+            except ExternalDependencyError as error:
+                if hasattr(self.model, "_forward_sam_heads"):
+                    warnings.warn(
+                        "SAM2 _track_step failed on merged 3AM features; falling back to per-frame SAM heads. "
+                        f"Underlying error: {error}",
+                        RuntimeWarning,
+                    )
+                    try:
+                        return self._forward_sam_heads_per_frame(batch, merged_features, backbone_out=backbone_out)
+                    except Exception as fallback_error:
+                        raise ExternalDependencyError(
+                            "SAM2 _track_step failed on merged 3AM features and per-frame fallback also failed"
+                        ) from fallback_error
+                raise
         if require_tracking:
             return None
         return self._forward_sam_heads_per_frame(batch, merged_features, backbone_out=backbone_out)
@@ -452,7 +468,9 @@ class Sam2TrainingAdapter(nn.Module):
                     prev_sam_mask_logits=None,
                 )
             except Exception as error:
-                raise ExternalDependencyError("SAM2 _track_step failed on merged 3AM features") from error
+                raise ExternalDependencyError(
+                    f"SAM2 _track_step failed on merged 3AM features: {type(error).__name__}: {error}"
+                ) from error
             low_res_masks, high_res_masks, iou_scores, object_score_logits = self._unpack_sam_outputs(sam_outputs)
             current_out["pred_masks"] = low_res_masks
             current_out["pred_masks_high_res"] = high_res_masks

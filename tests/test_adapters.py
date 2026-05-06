@@ -243,6 +243,41 @@ class FakeDecoratedOfficialSam2Modules(FakeOfficialSam2Modules):
         )
 
 
+class FakeTrackStepFailingOfficialSam2(FakeOfficialSam2Modules):
+    def _track_step(
+        self,
+        frame_idx,
+        is_init_cond_frame,
+        current_vision_feats,
+        current_vision_pos_embeds,
+        feat_sizes,
+        point_inputs,
+        mask_inputs,
+        output_dict,
+        num_frames,
+        track_in_reverse,
+        prev_sam_mask_logits,
+    ):
+        raise RuntimeError("track step incompatible with injected merged features")
+
+    def _forward_sam_heads(
+        self,
+        *,
+        backbone_features,
+        point_inputs,
+        mask_inputs,
+        high_res_features,
+        multimask_output,
+    ):
+        value = backbone_features.mean().reshape(1, 1, 1, 1)
+        low_res = value.expand(1, 1, 16, 16).clone()
+        high_res = value.expand(1, 1, 64, 64).clone()
+        ious = torch.full((1, 1), 0.75, device=value.device)
+        obj_ptr = torch.zeros(1, self.hidden_dim, device=value.device)
+        object_score_logits = torch.ones(1, 1, device=value.device)
+        return low_res, high_res, ious, low_res, high_res, obj_ptr, object_score_logits
+
+
 def test_sam2_adapter_falls_back_to_official_track_step_modules() -> None:
     adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
     model = FakeOfficialSam2Modules()
@@ -268,6 +303,31 @@ def test_sam2_adapter_falls_back_to_official_track_step_modules() -> None:
     assert outputs["iou_scores"].shape == (3,)
     assert outputs["occlusion_logits"].shape == (3, 2)
     assert model.steps[0] == (1, True)
+
+
+def test_sam2_adapter_falls_back_to_per_frame_heads_when_track_step_fails() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig(strict_paper=True))
+    adapter.model = FakeTrackStepFailingOfficialSam2()
+    images = torch.randn(2, 3, 64, 64)
+    target_masks = torch.zeros(2, 64, 64)
+    batch = TrainingBatch(
+        images=images,
+        target_masks=target_masks,
+        prompt=Prompt(type="mask", frame_index=0, mask=target_masks[0]),
+        must3r_features=None,
+        dataset="shapenet",
+        scene_id="scene_a",
+        frame_ids=("000000", "000001"),
+        image_paths=(),
+        has_object=torch.tensor([False, False]),
+    )
+
+    sam_features = adapter.encode_sam_features(images)
+    outputs = adapter.forward_train_sequence(batch, sam_features)
+
+    assert outputs["mask_logits"].shape == (2, 64, 64)
+    assert outputs["iou_scores"].shape == (2,)
+    assert outputs["occlusion_logits"].shape == (2, 2)
 
 
 def test_sam2_adapter_bypasses_no_grad_wrapped_official_modules() -> None:
