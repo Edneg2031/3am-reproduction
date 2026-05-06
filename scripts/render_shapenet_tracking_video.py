@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -38,6 +39,22 @@ class AbsenceWindow:
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+@dataclass(frozen=True)
+class IndexedShapeNetObject:
+    selected_index: int
+    obj: ShapeNetObject
+
+
+@dataclass(frozen=True)
+class WorkerSpec:
+    worker_id: int
+    worker_count: int
+    gpu_id: str
+    summary_path: Path
+    command: list[str]
+    env: dict[str, str]
 
 
 def _candidate_obj_paths(model_dir: Path) -> tuple[Path, ...]:
@@ -148,6 +165,66 @@ def choose_objects(args: argparse.Namespace) -> list[ShapeNetObject]:
     return objects
 
 
+def choose_indexed_objects(args: argparse.Namespace) -> list[IndexedShapeNetObject]:
+    return [IndexedShapeNetObject(index, obj) for index, obj in enumerate(choose_objects(args))]
+
+
+def shard_indexed_objects(
+    objects: Sequence[IndexedShapeNetObject],
+    *,
+    worker_id: int,
+    worker_count: int,
+) -> list[IndexedShapeNetObject]:
+    if worker_count < 1:
+        raise ValueError("--worker-count must be positive")
+    if worker_id < 0 or worker_id >= worker_count:
+        raise ValueError("--worker-id must be in [0, --worker-count)")
+    return [item for position, item in enumerate(objects) if position % worker_count == worker_id]
+
+
+def _detect_cuda_gpu_ids() -> list[str]:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is not None:
+        try:
+            result = subprocess.run(
+                [nvidia_smi, "--query-gpu=index", "--format=csv,noheader"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            gpu_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if gpu_ids:
+                return gpu_ids
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible and visible != "-1":
+        return [part.strip() for part in visible.split(",") if part.strip()]
+    return []
+
+
+def parse_parallel_gpus(value: str | None, *, detected_gpu_ids: Sequence[str] | None = None) -> list[str]:
+    if value is None or value.strip() == "":
+        return []
+    value = value.strip()
+    if value.lower() == "auto":
+        gpu_ids = list(detected_gpu_ids) if detected_gpu_ids is not None else _detect_cuda_gpu_ids()
+        if not gpu_ids:
+            raise RuntimeError("--parallel-gpus auto could not detect any CUDA GPUs")
+        return gpu_ids
+
+    gpu_ids = [part.strip() for part in value.split(",")]
+    if any(not gpu_id for gpu_id in gpu_ids):
+        raise ValueError("--parallel-gpus must be a comma-separated list like 0,1,2,3")
+    for gpu_id in gpu_ids:
+        if gpu_id.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_.:/-]+", gpu_id):
+            raise ValueError(f"Invalid GPU id in --parallel-gpus: {gpu_id!r}")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("--parallel-gpus contains duplicate GPU ids; use --workers-per-gpu for multiple workers per GPU")
+    return gpu_ids
+
+
 def absence_window(total_frames: int, *, start: int | None, length: int | None) -> AbsenceWindow:
     if total_frames < 8:
         raise ValueError("--frames must be at least 8")
@@ -227,6 +304,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--objects-file", help="Optional list of objects: synset/model, synset model, or absolute OBJ path")
     parser.add_argument("--obj-path", help="Render a single OBJ path instead of discovering the dataset")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--parallel-gpus", help="Launch one or more Blender workers on these GPUs, e.g. 0,1,2,3 or auto")
+    parser.add_argument("--workers-per-gpu", type=int, default=1, help="Number of Blender workers to launch per GPU when --parallel-gpus is set")
+    parser.add_argument("--blender-bin", default="blender", help="Blender executable used by the parallel Python launcher")
+    parser.add_argument("--worker-id", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-count", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-summary-path", help=argparse.SUPPRESS)
 
     parser.add_argument("--frames", type=int, default=96)
     parser.add_argument("--fps", type=int, default=24)
@@ -239,6 +322,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="workbench",
         choices=["auto", "workbench", "eevee", "cycles"],
         help="Use workbench for fast synthetic rendering; use eevee/cycles only when you need higher-fidelity RGB",
+    )
+    parser.add_argument(
+        "--cycles-device",
+        default="auto",
+        choices=["auto", "optix", "cuda", "cpu"],
+        help="Cycles compute device; auto prefers OptiX/CUDA GPU rendering",
     )
     parser.add_argument("--axis-convention", default="y-up", choices=["y-up", "z-up"])
     parser.add_argument("--object-size", type=float, default=1.35)
@@ -256,6 +345,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-absent-frames", type=int, default=3)
     parser.add_argument("--min-visible-mask-pixels", type=int, default=64)
     parser.add_argument("--no-video", action="store_true", help="Write PNG frames and masks only, no mp4 files")
+    parser.add_argument("--ffmpeg-codec", default="libx264", choices=["libx264", "h264_nvenc"], help="Optional video codec override for mp4 output")
     return parser.parse_args(argv)
 
 
@@ -277,12 +367,53 @@ def _clear_scene(bpy: object) -> None:
     bpy.ops.object.delete()
 
 
-def _set_render_engine(bpy: object, *, engine: str, samples: int) -> None:
+def _refresh_cycles_devices(preferences: object) -> None:
+    if hasattr(preferences, "refresh_devices"):
+        preferences.refresh_devices()
+    elif hasattr(preferences, "get_devices"):
+        preferences.get_devices()
+
+
+def _set_cycles_device(bpy: object, *, cycles_device: str) -> None:
+    scene = bpy.context.scene
+    if cycles_device == "cpu":
+        scene.cycles.device = "CPU"
+        return
+
+    scene.cycles.device = "GPU"
+    device_types = ("OPTIX", "CUDA") if cycles_device == "auto" else (cycles_device.upper(),)
+    try:
+        preferences = bpy.context.preferences.addons["cycles"].preferences
+    except Exception:
+        print("[WARN] Cycles preferences are unavailable; falling back to CPU rendering", flush=True)
+        scene.cycles.device = "CPU"
+        return
+
+    for device_type in device_types:
+        try:
+            preferences.compute_device_type = device_type
+            _refresh_cycles_devices(preferences)
+        except Exception:
+            continue
+        enabled = 0
+        for device in getattr(preferences, "devices", []):
+            is_cpu = getattr(device, "type", "") == "CPU"
+            device.use = not is_cpu
+            enabled += 0 if is_cpu else 1
+        if enabled:
+            print(f"[INFO] Cycles GPU device type: {device_type}", flush=True)
+            return
+
+    print(f"[WARN] No usable Cycles GPU device found for {cycles_device}; falling back to CPU rendering", flush=True)
+    scene.cycles.device = "CPU"
+
+
+def _set_render_engine(bpy: object, *, engine: str, samples: int, cycles_device: str) -> None:
     scene = bpy.context.scene
     engines = {item.identifier for item in scene.render.bl_rna.properties["engine"].enum_items}
     if engine == "cycles":
         scene.render.engine = "CYCLES"
-        scene.cycles.device = "CPU"
+        _set_cycles_device(bpy, cycles_device=cycles_device)
     elif engine == "workbench" and "BLENDER_WORKBENCH" in engines:
         scene.render.engine = "BLENDER_WORKBENCH"
     elif engine == "auto" and "BLENDER_WORKBENCH" in engines:
@@ -382,7 +513,7 @@ def _setup_scene(bpy: object, Vector: object, args: argparse.Namespace, obj_path
     scene.view_settings.look = "Medium High Contrast"
     scene.world = scene.world or bpy.data.worlds.new("World")
     scene.world.color = (0.035, 0.038, 0.04)
-    _set_render_engine(bpy, engine=args.engine, samples=args.samples)
+    _set_render_engine(bpy, engine=args.engine, samples=args.samples, cycles_device=args.cycles_device)
 
     meshes = _import_obj(bpy, obj_path)
     root = _normalize_meshes(bpy, Vector, meshes, object_size=args.object_size, axis_convention=args.axis_convention)
@@ -574,7 +705,7 @@ def _render_mask(bpy: object, path: Path, *, meshes: Sequence[object], floor: ob
             floor.data.materials.append(material)
 
 
-def _write_video_from_frames(frame_pattern: Path, output_path: Path, *, fps: int) -> str | None:
+def _write_video_from_frames(frame_pattern: Path, output_path: Path, *, fps: int, codec: str) -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg is required to write mp4 videos. Install ffmpeg or pass --no-video to keep PNG sequences only.")
@@ -587,12 +718,14 @@ def _write_video_from_frames(frame_pattern: Path, output_path: Path, *, fps: int
         "0",
         "-i",
         str(frame_pattern),
-        "-pix_fmt",
-        "yuv420p",
         "-vf",
         "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        str(output_path),
+        "-pix_fmt",
+        "yuv420p",
     ]
+    if codec != "libx264":
+        command.extend(["-c:v", codec])
+    command.append(str(output_path))
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return str(output_path)
 
@@ -635,6 +768,10 @@ def _verify_frame_sequence(directory: Path, *, expected_frames: int, label: str)
     frame_count = len(list(directory.glob("*.png")))
     if frame_count != expected_frames:
         raise RuntimeError(f"Expected {expected_frames} {label} frames in {directory}, found {frame_count}")
+
+
+def _object_output_dir(output_root: Path, item: IndexedShapeNetObject) -> Path:
+    return output_root / f"{item.selected_index:04d}_{item.obj.output_name}"
 
 
 def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_dir: Path, args: argparse.Namespace) -> dict[str, object]:
@@ -692,8 +829,8 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
     video_path = None
     mask_video_path = None
     if not args.no_video:
-        video_path = _write_video_from_frames(rgb_dir / "%06d.png", output_dir / "video.mp4", fps=args.fps)
-        mask_video_path = _write_video_from_frames(mask_dir / "%06d.png", output_dir / "mask.mp4", fps=args.fps)
+        video_path = _write_video_from_frames(rgb_dir / "%06d.png", output_dir / "video.mp4", fps=args.fps, codec=args.ffmpeg_codec)
+        mask_video_path = _write_video_from_frames(mask_dir / "%06d.png", output_dir / "mask.mp4", fps=args.fps, codec=args.ffmpeg_codec)
 
     metadata = {
         "schema": "shapenet_tracking_render_v1",
@@ -720,26 +857,174 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
 
 def render_batch(args: argparse.Namespace) -> list[dict[str, object]]:
     bpy, Vector = _require_blender()
-    objects = choose_objects(args)
+    indexed_objects = choose_indexed_objects(args)
+    if args.worker_id is not None or args.worker_count is not None:
+        if args.worker_id is None or args.worker_count is None:
+            raise ValueError("--worker-id and --worker-count must be provided together")
+        indexed_objects = shard_indexed_objects(indexed_objects, worker_id=args.worker_id, worker_count=args.worker_count)
+
     output_root = Path(args.output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, object]] = []
-    for index, obj in enumerate(objects):
-        output_dir = output_root / f"{index:04d}_{obj.output_name}"
-        print(f"[{index + 1}/{len(objects)}] Rendering {obj.synset_id}/{obj.model_id} -> {output_dir}", flush=True)
+    worker_label = f" worker={args.worker_id}/{args.worker_count}" if args.worker_id is not None else ""
+    for local_index, item in enumerate(indexed_objects):
+        output_dir = _object_output_dir(output_root, item)
+        obj = item.obj
+        print(f"[{local_index + 1}/{len(indexed_objects)}]{worker_label} Rendering {obj.synset_id}/{obj.model_id} -> {output_dir}", flush=True)
         metadata = render_one_object(bpy, Vector, obj, output_dir, args)
-        results.append({"output_dir": str(output_dir), **metadata})
+        results.append({"index": item.selected_index, "output_dir": str(output_dir), **metadata})
 
-    summary_path = output_root / "summary.json"
+    summary_path = Path(args.worker_summary_path).expanduser().resolve() if args.worker_summary_path else output_root / "summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps({"videos": results}, indent=2), encoding="utf-8")
     print(json.dumps({"summary_path": str(summary_path), "videos": results}, indent=2), flush=True)
     return results
 
 
+def _running_inside_blender() -> bool:
+    try:
+        import bpy  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _strip_cli_options(argv: Sequence[str], options_with_values: set[str]) -> list[str]:
+    stripped: list[str] = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in options_with_values:
+            skip_next = True
+            continue
+        if any(token.startswith(f"{option}=") for option in options_with_values):
+            continue
+        stripped.append(token)
+    return stripped
+
+
+def _worker_gpu_assignments(gpu_ids: Sequence[str], *, workers_per_gpu: int, selected_count: int) -> list[str]:
+    if workers_per_gpu < 1:
+        raise ValueError("--workers-per-gpu must be positive")
+    assignments = [gpu_id for _ in range(workers_per_gpu) for gpu_id in gpu_ids]
+    if not assignments:
+        raise ValueError("--parallel-gpus did not provide any GPU ids")
+    return assignments[: max(1, min(len(assignments), selected_count))]
+
+
+def build_worker_specs(args: argparse.Namespace, argv: Sequence[str], *, selected_count: int) -> list[WorkerSpec]:
+    gpu_ids = parse_parallel_gpus(args.parallel_gpus)
+    assignments = _worker_gpu_assignments(gpu_ids, workers_per_gpu=args.workers_per_gpu, selected_count=selected_count)
+    output_root = Path(args.output_root).expanduser().resolve()
+    summary_root = output_root / ".worker_summaries" / f"run_{os.getpid()}"
+    script_path = Path(__file__).resolve()
+    worker_base_argv = _strip_cli_options(
+        argv,
+        {
+            "--parallel-gpus",
+            "--workers-per-gpu",
+            "--blender-bin",
+            "--worker-id",
+            "--worker-count",
+            "--worker-summary-path",
+        },
+    )
+
+    specs: list[WorkerSpec] = []
+    worker_count = len(assignments)
+    for worker_id, gpu_id in enumerate(assignments):
+        summary_path = summary_root / f"worker_{worker_id:03d}.json"
+        worker_argv = [
+            *worker_base_argv,
+            "--worker-id",
+            str(worker_id),
+            "--worker-count",
+            str(worker_count),
+            "--worker-summary-path",
+            str(summary_path),
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env["PYTHONUNBUFFERED"] = "1"
+        command = [args.blender_bin, "-b", "--python", str(script_path), "--", *worker_argv]
+        specs.append(
+            WorkerSpec(
+                worker_id=worker_id,
+                worker_count=worker_count,
+                gpu_id=str(gpu_id),
+                summary_path=summary_path,
+                command=command,
+                env=env,
+            )
+        )
+    return specs
+
+
+def merge_worker_summaries(summary_paths: Sequence[Path], output_root: Path) -> list[dict[str, object]]:
+    videos: list[dict[str, object]] = []
+    for summary_path in summary_paths:
+        if not summary_path.exists():
+            raise RuntimeError(f"Worker summary was not written: {summary_path}")
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        worker_videos = payload.get("videos", [])
+        if not isinstance(worker_videos, list):
+            raise RuntimeError(f"Worker summary has invalid 'videos' payload: {summary_path}")
+        videos.extend(worker_videos)
+
+    videos.sort(key=lambda item: int(item["index"]))
+    indices = [int(item["index"]) for item in videos]
+    if len(indices) != len(set(indices)):
+        raise RuntimeError(f"Duplicate video indices found while merging worker summaries: {indices}")
+
+    summary_path = output_root / "summary.json"
+    summary_path.write_text(json.dumps({"videos": videos}, indent=2), encoding="utf-8")
+    print(json.dumps({"summary_path": str(summary_path), "videos": videos}, indent=2), flush=True)
+    return videos
+
+
+def run_parallel_launcher(args: argparse.Namespace, argv: Sequence[str]) -> list[dict[str, object]]:
+    selected_count = len(choose_indexed_objects(args))
+    output_root = Path(args.output_root).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    specs = build_worker_specs(args, argv, selected_count=selected_count)
+    for spec in specs:
+        spec.summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"[INFO] Launching {len(specs)} Blender workers for {selected_count} videos "
+        f"on GPUs {', '.join(spec.gpu_id for spec in specs)}",
+        flush=True,
+    )
+    processes: list[tuple[WorkerSpec, subprocess.Popen[bytes]]] = []
+    for spec in specs:
+        print(f"[INFO] worker {spec.worker_id}/{spec.worker_count} CUDA_VISIBLE_DEVICES={spec.gpu_id}", flush=True)
+        processes.append((spec, subprocess.Popen(spec.command, env=spec.env)))
+
+    failures: list[tuple[WorkerSpec, int]] = []
+    for spec, process in processes:
+        return_code = process.wait()
+        if return_code != 0:
+            failures.append((spec, return_code))
+    if failures:
+        failure_text = ", ".join(f"worker {spec.worker_id} on GPU {spec.gpu_id} exited {return_code}" for spec, return_code in failures)
+        raise RuntimeError(f"Parallel rendering failed; not writing final summary: {failure_text}")
+
+    return merge_worker_summaries([spec.summary_path for spec in specs], output_root)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    render_batch(args)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parse_args(raw_argv)
+    inside_blender = _running_inside_blender()
+    if args.parallel_gpus and args.worker_id is None:
+        if inside_blender:
+            raise RuntimeError("--parallel-gpus must be launched with regular Python, not an already-running Blender process")
+        run_parallel_launcher(args, raw_argv)
+    else:
+        render_batch(args)
     return 0
 
 
