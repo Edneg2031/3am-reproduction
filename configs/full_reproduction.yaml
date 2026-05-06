@@ -89,6 +89,7 @@ model:
   attention_heads: 8
 
 training:
+  datasets: [shapenet]
   strict_paper: true
   iterations: 1000000
   batch_size: 1

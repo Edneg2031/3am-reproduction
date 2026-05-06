@@ -10,7 +10,13 @@ from PIL import Image
 
 from three_am.data.io import read_manifest, write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
-from three_am.training.dataset import FeatureCacheCompatibilityError, MaskCompatibilityError, ThreeAMTrainingDataset, configured_manifest_path
+from three_am.training.dataset import (
+    FeatureCacheCompatibilityError,
+    MaskCompatibilityError,
+    ThreeAMTrainingDataset,
+    configured_manifest_path,
+    configured_training_datasets,
+)
 
 
 def _write_image(path: Path) -> None:
@@ -102,7 +108,7 @@ def test_training_dataset_resizes_sam_inputs_and_masks(tmp_path: Path) -> None:
     config = _config(tmp_path, "scannetpp", manifest)
     config["model"] = {"must3r_channels": [2], "sam_image_size": 32}
 
-    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
     batch = dataset.sample()
 
     assert batch.images.shape == (2, 3, 32, 32)
@@ -140,7 +146,7 @@ def test_shapenet_training_dataset_uses_dynamic_length_resize_and_incomplete_pro
         }
     )
 
-    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
     batch = dataset.sample()
 
     assert 3 <= len(batch.frame_ids) <= 5
@@ -300,11 +306,77 @@ def test_training_dataset_uses_absolute_manifest_and_frame_paths(tmp_path: Path)
         "model": {"must3r_channels": [2]},
     }
 
-    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
     batch = dataset.sample()
 
     assert batch.scene_id == "scene_a"
     assert batch.images.shape == (2, 3, 4, 4)
+
+
+def test_configured_training_datasets_prefers_explicit_training_list(tmp_path: Path) -> None:
+    config = {
+        "project_root": str(tmp_path),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "training": {"datasets": ["shapenet"]},
+    }
+
+    assert configured_training_datasets(config) == ("shapenet",)
+
+
+def test_training_dataset_filters_out_unlisted_manifests(tmp_path: Path) -> None:
+    shapenet_scene_dir = tmp_path / "data" / "processed" / "shapenet_tracking" / "scene_a"
+    shapenet_frames: list[FrameRecord] = []
+    for index in range(2):
+        frame_id = f"{index:06d}"
+        image_path = shapenet_scene_dir / "rgb" / f"{frame_id}.png"
+        mask_path = shapenet_scene_dir / "masks" / f"{frame_id}.png"
+        _write_image(image_path)
+        _write_mask(mask_path, np.pad(np.ones((2, 2), dtype=np.uint8) * 255, 1))
+        shapenet_frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+
+    shapenet_manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
+    write_manifest(shapenet_manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(shapenet_frames))])
+
+    scannet_scene_dir = tmp_path / "data" / "processed" / "scannetpp" / "scene_bad"
+    scannet_frames: list[FrameRecord] = []
+    for index in range(2):
+        frame_id = f"{index:03d}"
+        image_path = scannet_scene_dir / "images" / f"{frame_id}.png"
+        mask_path = scannet_scene_dir / "masks" / f"{frame_id}.png"
+        _write_image(image_path)
+        _write_mask(mask_path, np.ones((4, 4), dtype=np.uint8))
+        scannet_frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+
+    scannet_manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(scannet_manifest, [SceneRecord("scannetpp", "scene_bad", "train", tuple(scannet_frames))])
+
+    config = {
+        "project_root": str(tmp_path),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "training": {"datasets": ["shapenet"], "strict_paper": True},
+        "datasets": {
+            "shapenet": {
+                "manifest": str(shapenet_manifest.relative_to(tmp_path)),
+                "sequence_length_min": 2,
+                "sequence_length_max": 2,
+                "dynamic_resize": {"enabled": False},
+            },
+            "scannetpp": {
+                "manifest": str(scannet_manifest.relative_to(tmp_path)),
+                "require_instance_label_maps": True,
+            },
+        },
+        "sampling": {"sequence_length": 2, "fov_threshold": 0.25},
+        "features": {"cache_root": "outputs/must3r_features", "online": True},
+        "model": {"must3r_channels": [2], "geometry_channels": 4},
+    }
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.dataset == "shapenet"
+    assert batch.scene_id == "scene_a"
+    assert batch.frame_ids == ("000000", "000001")
 
 
 def test_manifest_without_feature_paths_reads_as_empty_tuple(tmp_path: Path) -> None:

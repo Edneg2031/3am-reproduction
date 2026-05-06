@@ -153,6 +153,20 @@ def configured_feature_cache_root(config: dict[str, Any], override: str | Path |
 DEFAULT_TRAINING_DATASETS = ("scannetpp", "ase", "mose", "shapenet")
 
 
+def configured_training_datasets(config: dict[str, Any]) -> tuple[str, ...]:
+    training = config.get("training", {})
+    value = training.get("datasets")
+    if value is None:
+        return DEFAULT_TRAINING_DATASETS
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        items = [str(item).strip() for item in value if str(item).strip()]
+    if not items:
+        raise ValueError("training.datasets must contain at least one dataset name when set")
+    return tuple(items)
+
+
 def load_training_scenes(config: dict[str, Any], datasets: tuple[str, ...] = DEFAULT_TRAINING_DATASETS) -> list[SceneRecord]:
     scenes: list[SceneRecord] = []
     for dataset in datasets:
@@ -191,11 +205,12 @@ def missing_training_data_message(config: dict[str, Any]) -> str:
 def manifest_statuses(
     config: dict[str, Any],
     feature_cache_root: str | Path | None = None,
-    datasets: tuple[str, ...] = DEFAULT_TRAINING_DATASETS,
+    datasets: tuple[str, ...] | None = None,
 ) -> list[ManifestStatus]:
     cache_root = configured_feature_cache_root(config, feature_cache_root)
     statuses: list[ManifestStatus] = []
-    for dataset in datasets:
+    selected_datasets = datasets or configured_training_datasets(config)
+    for dataset in selected_datasets:
         manifest = configured_manifest_path(config, dataset)
         if manifest.exists():
             scenes = read_manifest(manifest)
@@ -821,7 +836,7 @@ class ThreeAMTrainingDataset:
         rng: RandomLike | None = None,
     ) -> "ThreeAMTrainingDataset":
         return cls(
-            load_training_scenes(config),
+            load_training_scenes(config, configured_training_datasets(config)),
             config,
             feature_cache_root=configured_feature_cache_root(config, feature_cache_root),
             load_feature_cache=load_feature_cache,
