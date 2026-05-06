@@ -16,7 +16,7 @@ from three_am.data.io import write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
-ManifestFormat = Literal["auto", "normalized", "nerfstudio_3dgs"]
+ManifestFormat = Literal["auto", "normalized", "nerfstudio_3dgs", "shapenet_tracking"]
 NERFSTUDIO_TRANSFORM_NAMES = ("transforms.json", "transforms_train.json", "transforms_val.json", "transforms_test.json")
 
 
@@ -27,7 +27,7 @@ class CameraRecord:
 
 
 def _image_root(scene_dir: Path) -> Path | None:
-    for candidate in (scene_dir / "frames", scene_dir / "images"):
+    for candidate in (scene_dir / "frames", scene_dir / "images", scene_dir / "rgb"):
         if candidate.exists():
             return candidate
     return None
@@ -268,13 +268,26 @@ def discover_scene(
     )
     if not frames:
         return None
-    use_nerfstudio = manifest_format == "nerfstudio_3dgs" or (manifest_format == "auto" and bool(_nerfstudio_transform_paths(scene_dir)))
+    use_nerfstudio = (
+        manifest_format == "nerfstudio_3dgs"
+        or (
+            manifest_format == "auto"
+            and dataset != "shapenet"
+            and bool(_nerfstudio_transform_paths(scene_dir))
+        )
+    )
     if use_nerfstudio:
         if camera_sidecar_root is None:
             raise ValueError("camera_sidecar_root is required for nerfstudio_3dgs manifest generation")
         frames = _fill_nerfstudio_cameras(scene_dir, frames, camera_sidecar_root)
     if require_cameras:
         _require_complete_cameras(scene_dir, frames)
+    if dataset == "shapenet" and manifest_format == "shapenet_tracking":
+        missing_masks = [frame.frame_id for frame in frames if frame.mask_path is None or not frame.mask_path.exists()]
+        if missing_masks:
+            preview = ", ".join(missing_masks[:8])
+            suffix = "" if len(missing_masks) <= 8 else f", ... ({len(missing_masks)} total)"
+            raise ValueError(f"{scene_dir}: ShapeNet tracking scenes are missing per-frame masks: {preview}{suffix}")
     if dataset == "scannetpp":
         _validate_scannetpp_masks(
             scene_dir,
@@ -321,11 +334,16 @@ def discover_scenes(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a unified 3AM manifest from normalized dataset folders")
-    parser.add_argument("--dataset", required=True, choices=["scannetpp", "ase", "mose", "replica"])
+    parser.add_argument("--dataset", required=True, choices=["scannetpp", "ase", "mose", "replica", "shapenet"])
     parser.add_argument("--root", required=True)
     parser.add_argument("--split", default="train")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--format", default="auto", choices=["auto", "normalized", "nerfstudio_3dgs"], help="scene folder format to discover")
+    parser.add_argument(
+        "--format",
+        default="auto",
+        choices=["auto", "normalized", "nerfstudio_3dgs", "shapenet_tracking"],
+        help="scene folder format to discover",
+    )
     parser.add_argument("--require-cameras", action="store_true", help="fail if any frame is missing pose or intrinsics")
     parser.add_argument(
         "--allow-missing-instances",

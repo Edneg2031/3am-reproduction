@@ -264,6 +264,26 @@ class Sam2TrainingAdapter(nn.Module):
             backbone_out = self._encode_sam_backbone_payload(images)
             return self._track_point_masks_with_backbone(images, backbone_out, reference_index, points, labels)
 
+    def track_masks_from_mask(
+        self,
+        images: torch.Tensor,
+        *,
+        reference_index: int,
+        mask: torch.Tensor,
+        backbone_out: Any | None = None,
+    ) -> torch.Tensor:
+        """Generate detached video masks by tracking one mask prompt through the sequence."""
+        if self.model is None:
+            raise ExternalDependencyError("SAM2 model is not loaded")
+        self._validate_image_tensor(images)
+        if not (hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step")):
+            raise ExternalDependencyError("SAM2 mask-prompt tracking requires official _prepare_backbone_features and _track_step")
+        reference_index = min(max(int(reference_index), 0), int(images.shape[0]) - 1)
+        with torch.no_grad():
+            if backbone_out is None:
+                backbone_out = self._encode_sam_backbone_payload(images)
+            return self._track_mask_with_backbone(images, backbone_out, reference_index, mask)
+
     def _remember_feature_payload(
         self,
         payload: Any,
@@ -585,6 +605,73 @@ class Sam2TrainingAdapter(nn.Module):
                     current_feats,
                     feat_sizes,
                     point_inputs,
+                    True,
+                    high_res_masks,
+                    object_score_logits,
+                    current_out,
+                )
+            group = "cond_frame_outputs" if frame_index == reference_index else "non_cond_frame_outputs"
+            output_dict[group][frame_index] = current_out
+            frame_masks[frame_index] = high_res_masks[0, 0]
+        return self._resize_predicted_masks(
+            torch.stack([frame_masks[index] for index in range(num_frames)], dim=0),
+            tuple(images.shape[-2:]),
+        )
+
+    def _track_mask_with_backbone(
+        self,
+        images: torch.Tensor,
+        backbone_out: Any,
+        reference_index: int,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        try:
+            _, vision_feats, vision_pos_embeds, feat_sizes = self.model._prepare_backbone_features(backbone_out)  # type: ignore[union-attr]
+        except Exception as error:
+            raise ExternalDependencyError("SAM2 could not prepare backbone features for mask-prompt tracking") from error
+        num_frames = int(images.shape[0])
+        output_dict: dict[str, dict[int, dict[str, Any]]] = {
+            "cond_frame_outputs": {},
+            "non_cond_frame_outputs": {},
+        }
+        ordered = [reference_index]
+        ordered.extend(index for index in range(reference_index + 1, num_frames))
+        ordered.extend(index for index in range(reference_index - 1, -1, -1))
+        frame_masks: dict[int, torch.Tensor] = {}
+        for frame_index in ordered:
+            current_feats = [feature[:, frame_index : frame_index + 1, :] for feature in vision_feats]
+            current_pos = [pos[:, frame_index : frame_index + 1, :] for pos in vision_pos_embeds]
+            mask_inputs = (
+                mask.to(device=current_feats[-1].device, dtype=torch.float32)[None, None]
+                if frame_index == reference_index
+                else None
+            )
+            try:
+                current_out, sam_outputs, _, _ = self.model._track_step(  # type: ignore[union-attr]
+                    frame_idx=frame_index,
+                    is_init_cond_frame=frame_index == reference_index,
+                    current_vision_feats=current_feats,
+                    current_vision_pos_embeds=current_pos,
+                    feat_sizes=feat_sizes,
+                    point_inputs=None,
+                    mask_inputs=mask_inputs,
+                    output_dict=output_dict,
+                    num_frames=num_frames,
+                    track_in_reverse=frame_index < reference_index,
+                    prev_sam_mask_logits=None,
+                )
+            except Exception as error:
+                raise ExternalDependencyError("SAM2 _track_step failed while tracking mask-prompt masks") from error
+            low_res_masks, high_res_masks, _, object_score_logits = self._unpack_sam_outputs(sam_outputs)
+            current_out["pred_masks"] = low_res_masks
+            current_out["pred_masks_high_res"] = high_res_masks
+            current_out["obj_ptr"] = sam_outputs[5]
+            current_out["object_score_logits"] = object_score_logits
+            if hasattr(self.model, "_encode_memory_in_output"):
+                self.model._encode_memory_in_output(  # type: ignore[union-attr]
+                    current_feats,
+                    feat_sizes,
+                    None,
                     True,
                     high_res_masks,
                     object_score_logits,

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-DatasetName = Literal["scannetpp", "ase", "mose", "replica"]
+DatasetName = Literal["scannetpp", "ase", "mose", "replica", "shapenet"]
 
 
 @dataclass(frozen=True)

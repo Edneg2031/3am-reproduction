@@ -310,6 +310,10 @@ class FakePerFrameSam2(nn.Module):
         return low_res, high_res, ious, low_res, high_res, obj_ptr, object_score_logits
 
 
+class FakeMaskTrackSam2(FakeOfficialSam2Modules):
+    pass
+
+
 def test_strict_sam2_adapter_rejects_per_frame_head_fallback() -> None:
     adapter = Sam2TrainingAdapter(ExternalBackboneConfig(strict_paper=True))
     adapter.model = FakePerFrameSam2()
@@ -352,6 +356,21 @@ def test_strict_sam2_adapter_rejects_tracking_without_backbone_fpn_injection() -
 
     with pytest.raises(ExternalDependencyError, match="backbone_fpn"):
         adapter.forward_train_sequence(batch, sam_features)
+
+
+def test_sam2_adapter_tracks_masks_from_mask_prompt() -> None:
+    adapter = Sam2TrainingAdapter(ExternalBackboneConfig())
+    model = FakeMaskTrackSam2()
+    adapter.model = model
+    images = torch.randn(3, 3, 64, 64)
+    mask = torch.zeros(64, 64)
+    mask[16:20, 16:20] = 1.0
+
+    adapter.encode_sam_features(images)
+    outputs = adapter.track_masks_from_mask(images, reference_index=1, mask=mask)
+
+    assert outputs.shape == (3, 64, 64)
+    assert model.steps[0] == (1, True)
 
 
 def test_must3r_adapter_maps_paper_layers_to_decoder_indices() -> None:

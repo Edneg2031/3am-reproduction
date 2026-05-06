@@ -38,6 +38,26 @@ datasets:
     videos: 1453
     fov_sampling_probability: 0.0
     mask_ignore_values: []
+  shapenet:
+    root: data/processed/shapenet_tracking
+    processed: data/processed/shapenet_tracking
+    manifest: data/processed/shapenet_manifest.json
+    fov_sampling_probability: 0.0
+    mask_ignore_values: []
+    sequence_length_min: 16
+    sequence_length_max: 96
+    dynamic_resize:
+      enabled: true
+      min_size: 384
+      max_size: 768
+      multiple: 32
+    prompt_mask_augment:
+      enabled: true
+      probability: 1.0
+      crop_probability: 0.8
+      erase_probability: 0.35
+      min_area_ratio: 0.08
+      max_area_ratio: 0.65
   replica:
     root: data/raw/replica
     processed: data/processed/replica

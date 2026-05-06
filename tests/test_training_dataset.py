@@ -109,6 +109,103 @@ def test_training_dataset_resizes_sam_inputs_and_masks(tmp_path: Path) -> None:
     assert batch.target_masks.shape == (2, 32, 32)
 
 
+def test_shapenet_training_dataset_uses_dynamic_length_resize_and_incomplete_prompt_masks(tmp_path: Path) -> None:
+    scene_dir = tmp_path / "data" / "processed" / "shapenet_tracking" / "scene_a"
+    frames: list[FrameRecord] = []
+    for index in range(6):
+        frame_id = f"{index:06d}"
+        image_path = scene_dir / "rgb" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        _write_image(image_path)
+        mask = np.zeros((6 + index, 8 + index), dtype=np.uint8)
+        mask[1:4, 2:6] = 255
+        _write_mask(mask_path, mask)
+        frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+    manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
+    write_manifest(manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(frames))])
+    config = _config(tmp_path, "shapenet", manifest)
+    config["datasets"]["shapenet"].update(  # type: ignore[index]
+        {
+            "sequence_length_min": 3,
+            "sequence_length_max": 5,
+            "dynamic_resize": {"enabled": True, "min_size": 32, "max_size": 64, "multiple": 32},
+            "prompt_mask_augment": {
+                "enabled": True,
+                "probability": 1.0,
+                "crop_probability": 1.0,
+                "erase_probability": 1.0,
+                "min_area_ratio": 0.1,
+                "max_area_ratio": 0.5,
+            },
+        }
+    )
+
+    dataset = ThreeAMTrainingDataset.from_config(config, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert 3 <= len(batch.frame_ids) <= 5
+    assert batch.images.shape[-1] in {32, 64}
+    assert batch.images.shape[-2] in {32, 64}
+    assert batch.prompt.type == "mask"
+    assert batch.prompt.mask is not None
+    assert batch.prompt.mask.sum().item() > 0
+    assert batch.prompt.mask.sum().item() < batch.target_masks[batch.prompt.frame_index].sum().item()
+
+
+def test_strict_shapenet_training_dataset_uses_dynamic_sampling_when_feature_paths_exist(tmp_path: Path) -> None:
+    scene_dir = tmp_path / "data" / "processed" / "shapenet_tracking" / "scene_a"
+    feature_dir = tmp_path / "features"
+    frames: list[FrameRecord] = []
+    for index in range(6):
+        frame_id = f"{index:06d}"
+        image_path = scene_dir / "rgb" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        feature_path = feature_dir / f"{frame_id}_level0.pt"
+        _write_image(image_path)
+        mask = np.zeros((8, 8), dtype=np.uint8)
+        mask[1:6, 1:6] = 255
+        _write_mask(mask_path, mask)
+        feature_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(torch.ones(2, 2, 2), feature_path)
+        frames.append(
+            FrameRecord(
+                frame_id=frame_id,
+                image_path=image_path,
+                mask_path=mask_path,
+                must3r_feature_paths=(feature_path,),
+            )
+        )
+    manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
+    write_manifest(manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(frames))])
+    cache_metadata = tmp_path / "outputs" / "must3r_features" / "shapenet" / "scene_a" / "metadata.json"
+    cache_metadata.parent.mkdir(parents=True)
+    cache_metadata.write_text(
+        '{"decoder_memory": true, "feature_specs": ["encoder"], "feature_channels": [2]}',
+        encoding="utf-8",
+    )
+    config = _strict_config(tmp_path, "shapenet", manifest, fov_probability=0.0)
+    config["features"]["feature_layers"] = "encoder"  # type: ignore[index]
+    config["features"]["require_decoder_memory"] = False  # type: ignore[index]
+    config["datasets"]["shapenet"].update(  # type: ignore[index]
+        {
+            "sequence_length_min": 3,
+            "sequence_length_max": 5,
+            "dynamic_resize": {"enabled": True, "min_size": 32, "max_size": 64, "multiple": 32},
+            "prompt_mask_augment": {"enabled": True, "probability": 1.0, "crop_probability": 1.0},
+        }
+    )
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=True, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert 3 <= len(batch.frame_ids) <= 5
+    assert batch.images.shape[-1] in {32, 64}
+    assert batch.prompt.type == "mask"
+    assert batch.prompt.mask is not None
+    assert 0 < batch.prompt.mask.sum().item() <= batch.target_masks[batch.prompt.frame_index].sum().item()
+    assert batch.must3r_features is not None
+
+
 def test_training_dataset_keeps_integer_instance_identity(tmp_path: Path) -> None:
     first = np.zeros((4, 4), dtype=np.uint8)
     first[1:3, 1:3] = 5

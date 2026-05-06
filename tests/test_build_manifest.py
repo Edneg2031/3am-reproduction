@@ -10,7 +10,13 @@ import numpy as np
 from PIL import Image
 
 
-def _run_build_manifest(root: Path, output: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run_build_manifest(
+    root: Path,
+    output: Path,
+    *args: str,
+    dataset: str = "scannetpp",
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_root / "src") + os.pathsep + env.get("PYTHONPATH", "")
@@ -19,7 +25,7 @@ def _run_build_manifest(root: Path, output: Path, *args: str, check: bool = True
             sys.executable,
             str(repo_root / "scripts" / "build_manifest.py"),
             "--dataset",
-            "scannetpp",
+            dataset,
             "--root",
             str(root),
             "--split",
@@ -194,3 +200,20 @@ def test_scannetpp_manifest_allows_dense_multi_instance_masks(tmp_path: Path) ->
 
     manifest = json.loads(output.read_text(encoding="utf-8"))
     assert manifest["scenes"][0]["instances_path"] == str(scene / "instances.json")
+
+
+def test_shapenet_tracking_manifest_scans_rgb_and_masks(tmp_path: Path) -> None:
+    root = tmp_path / "processed"
+    scene = root / "0001"
+    for frame_id in ("000000", "000001"):
+        _write_image(scene / "rgb" / f"{frame_id}.png")
+        _write_mask(scene / "masks" / f"{frame_id}.png", np.array([[0, 1], [1, 0]], dtype=np.uint16))
+
+    output = tmp_path / "shapenet_manifest.json"
+    result = _run_build_manifest(root, output, "--format", "shapenet_tracking", dataset="shapenet")
+
+    assert result.returncode == 0
+    manifest = json.loads(output.read_text(encoding="utf-8"))
+    assert manifest["scenes"][0]["dataset"] == "shapenet"
+    assert manifest["scenes"][0]["frames"][0]["image_path"].endswith("rgb/000000.png")
+    assert manifest["scenes"][0]["frames"][0]["mask_path"].endswith("masks/000000.png")

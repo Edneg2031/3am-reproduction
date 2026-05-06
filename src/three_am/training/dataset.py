@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 import numpy as np
 import torch
 from PIL import Image
+from torch.nn import functional as F
 
 from three_am.data.io import read_manifest
 from three_am.data.sampling import SamplingConfig, choose_indices
@@ -149,7 +150,10 @@ def configured_feature_cache_root(config: dict[str, Any], override: str | Path |
     return resolved
 
 
-def load_training_scenes(config: dict[str, Any], datasets: tuple[str, ...] = ("scannetpp", "ase", "mose")) -> list[SceneRecord]:
+DEFAULT_TRAINING_DATASETS = ("scannetpp", "ase", "mose", "shapenet")
+
+
+def load_training_scenes(config: dict[str, Any], datasets: tuple[str, ...] = DEFAULT_TRAINING_DATASETS) -> list[SceneRecord]:
     scenes: list[SceneRecord] = []
     for dataset in datasets:
         manifest = configured_manifest_path(config, dataset)
@@ -170,6 +174,7 @@ def missing_training_data_message(config: dict[str, Any]) -> str:
             "  PYTHONPATH=src python scripts/build_manifest.py --dataset scannetpp --root data/processed/scannetpp --split train --output data/processed/scannetpp_manifest.json",
             "  PYTHONPATH=src python scripts/build_manifest.py --dataset ase --root data/processed/ase --split train --output data/processed/ase_manifest.json",
             "  PYTHONPATH=src python scripts/build_manifest.py --dataset mose --root data/processed/mose --split train --output data/processed/mose_manifest.json",
+            "  PYTHONPATH=src python scripts/build_manifest.py --dataset shapenet --root data/processed/shapenet_tracking --split train --format shapenet_tracking --output data/processed/shapenet_manifest.json",
         ]
     )
     return (
@@ -186,7 +191,7 @@ def missing_training_data_message(config: dict[str, Any]) -> str:
 def manifest_statuses(
     config: dict[str, Any],
     feature_cache_root: str | Path | None = None,
-    datasets: tuple[str, ...] = ("scannetpp", "ase", "mose"),
+    datasets: tuple[str, ...] = DEFAULT_TRAINING_DATASETS,
 ) -> list[ManifestStatus]:
     cache_root = configured_feature_cache_root(config, feature_cache_root)
     statuses: list[ManifestStatus] = []
@@ -218,11 +223,36 @@ def _configured_sam_image_size(config: dict[str, Any]) -> int | None:
     return size if size > 0 else None
 
 
-def load_image_tensor(path: Path, image_size: int | None = None) -> torch.Tensor:
+def _random_float(rng: RandomLike) -> float:
+    method = getattr(rng, "random", None)
+    return float(method()) if callable(method) else random.random()
+
+
+def _random_int(rng: RandomLike, low: int, high: int) -> int:
+    if high < low:
+        raise ValueError(f"invalid random integer range [{low}, {high}]")
+    return int(rng.randrange(low, high + 1)) if hasattr(rng, "randrange") else random.randrange(low, high + 1)
+
+
+def _random_uniform(rng: RandomLike, low: float, high: float) -> float:
+    return low + (high - low) * _random_float(rng)
+
+
+def _positive_int(value: Any, *, name: str) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive when set")
+    return parsed
+
+
+def load_image_tensor(path: Path, image_size: int | tuple[int, int] | None = None) -> torch.Tensor:
     with Image.open(path) as image:
         image = image.convert("RGB")
         if image_size is not None:
-            image = image.resize((image_size, image_size), resample=Image.Resampling.BILINEAR)
+            size = (image_size, image_size) if isinstance(image_size, int) else image_size
+            image = image.resize((int(size[0]), int(size[1])), resample=Image.Resampling.BILINEAR)
         array = np.asarray(image, dtype=np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
@@ -266,21 +296,20 @@ def _candidate_instance_ids(mask: np.ndarray) -> list[int]:
 
 def _select_reference(mask_arrays: list[np.ndarray], rng: RandomLike) -> tuple[int, int | None, bool]:
     candidates: list[tuple[int, int]] = []
-    binary_reference: int | None = None
+    binary_references: list[int] = []
     for index, mask in enumerate(mask_arrays):
         ids = _candidate_instance_ids(mask)
         if not ids:
             continue
         if _mask_is_binary(mask):
-            if binary_reference is None:
-                binary_reference = index
+            binary_references.append(index)
             continue
         candidates.extend((index, instance_id) for instance_id in ids)
     if candidates:
         frame_index, instance_id = rng.choice(candidates)
         return frame_index, instance_id, False
-    if binary_reference is not None:
-        return binary_reference, 1, True
+    if binary_references:
+        return int(rng.choice(binary_references)), 1, True
     return 0, None, True
 
 
@@ -429,12 +458,123 @@ def _point_prompt_from_mask(mask: torch.Tensor, rng: RandomLike) -> tuple[torch.
     return torch.stack(points), torch.tensor(labels, dtype=torch.int64)
 
 
-def build_prompt(dataset: str, reference_mask: torch.Tensor, frame_index: int, rng: RandomLike) -> Prompt:
-    if dataset in {"scannetpp", "ase"}:
-        return Prompt(type="mask", frame_index=frame_index, mask=reference_mask)
+def _prompt_mask_augmentation_config(config: dict[str, Any] | None, dataset: str) -> dict[str, Any]:
+    if config is None:
+        return {}
+    training_value = config.get("training", {}).get("prompt_mask_augment", {})
+    dataset_value = config.get("datasets", {}).get(dataset, {}).get("prompt_mask_augment", {})
+    merged: dict[str, Any] = {}
+    if isinstance(training_value, dict):
+        merged.update(training_value)
+    if isinstance(dataset_value, dict):
+        merged.update(dataset_value)
+    if "enabled" not in merged and dataset == "shapenet":
+        merged["enabled"] = True
+    return merged
+
+
+def _random_prompt_crop(mask: torch.Tensor, rng: RandomLike, *, min_area_ratio: float, max_area_ratio: float) -> torch.Tensor:
+    foreground = torch.nonzero(mask > 0.5, as_tuple=False)
+    if foreground.numel() == 0:
+        return mask
+    y_min = int(foreground[:, 0].min().item())
+    y_max = int(foreground[:, 0].max().item())
+    x_min = int(foreground[:, 1].min().item())
+    x_max = int(foreground[:, 1].max().item())
+    box_h = max(1, y_max - y_min + 1)
+    box_w = max(1, x_max - x_min + 1)
+    area_ratio = _random_uniform(rng, min_area_ratio, max_area_ratio)
+    side_ratio = max(0.05, min(1.0, area_ratio ** 0.5))
+    crop_h = max(1, min(mask.shape[0], int(round(box_h * _random_uniform(rng, side_ratio, 1.0)))))
+    crop_w = max(1, min(mask.shape[1], int(round(box_w * _random_uniform(rng, side_ratio, 1.0)))))
+    anchor = foreground[_random_int(rng, 0, foreground.shape[0] - 1)]
+    anchor_y = int(anchor[0].item())
+    anchor_x = int(anchor[1].item())
+    top_min = max(0, anchor_y - crop_h + 1)
+    top_max = min(anchor_y, mask.shape[0] - crop_h)
+    left_min = max(0, anchor_x - crop_w + 1)
+    left_max = min(anchor_x, mask.shape[1] - crop_w)
+    top = _random_int(rng, top_min, top_max) if top_max >= top_min else max(0, min(anchor_y, mask.shape[0] - crop_h))
+    left = _random_int(rng, left_min, left_max) if left_max >= left_min else max(0, min(anchor_x, mask.shape[1] - crop_w))
+    keep = torch.zeros_like(mask, dtype=torch.bool)
+    keep[top : top + crop_h, left : left + crop_w] = True
+    return (mask > 0.5) & keep
+
+
+def _erase_prompt_region(mask: torch.Tensor, rng: RandomLike) -> torch.Tensor:
+    foreground = torch.nonzero(mask > 0.5, as_tuple=False)
+    if foreground.shape[0] <= 1:
+        return mask
+    y_min = int(foreground[:, 0].min().item())
+    y_max = int(foreground[:, 0].max().item())
+    x_min = int(foreground[:, 1].min().item())
+    x_max = int(foreground[:, 1].max().item())
+    box_h = max(1, y_max - y_min + 1)
+    box_w = max(1, x_max - x_min + 1)
+    erase_h = max(1, int(round(box_h * _random_uniform(rng, 0.2, 0.55))))
+    erase_w = max(1, int(round(box_w * _random_uniform(rng, 0.2, 0.55))))
+    anchor = foreground[_random_int(rng, 0, foreground.shape[0] - 1)]
+    top = max(0, min(int(anchor[0].item()) - erase_h // 2, mask.shape[0] - erase_h))
+    left = max(0, min(int(anchor[1].item()) - erase_w // 2, mask.shape[1] - erase_w))
+    candidate = (mask > 0.5).clone()
+    candidate[top : top + erase_h, left : left + erase_w] = False
+    return candidate if bool(candidate.any()) else mask
+
+
+def _single_pixel_prompt_mask(mask: torch.Tensor, rng: RandomLike) -> torch.Tensor:
+    foreground = torch.nonzero(mask > 0.5, as_tuple=False)
+    if foreground.numel() == 0:
+        return mask
+    yx = foreground[_random_int(rng, 0, foreground.shape[0] - 1)]
+    candidate = torch.zeros_like(mask, dtype=torch.float32)
+    candidate[int(yx[0].item()), int(yx[1].item())] = 1.0
+    return candidate
+
+
+def _augment_prompt_mask(mask: torch.Tensor, rng: RandomLike, config: dict[str, Any]) -> torch.Tensor:
+    if not bool(config.get("enabled", False)):
+        return mask
+    original = (mask > 0.5).float()
+    original_count = int(original.sum().item())
+    if original_count == 0:
+        return original
+    if _random_float(rng) > float(config.get("probability", 1.0)):
+        return original
+    min_area_ratio = max(0.001, min(1.0, float(config.get("min_area_ratio", 0.08))))
+    max_area_ratio = max(min_area_ratio, min(1.0, float(config.get("max_area_ratio", 0.65))))
+    crop_probability = float(config.get("crop_probability", 0.8))
+    erase_probability = float(config.get("erase_probability", 0.35))
+    attempts = max(1, int(config.get("attempts", 8)))
+    for _ in range(attempts):
+        candidate = original
+        if _random_float(rng) < crop_probability:
+            candidate = _random_prompt_crop(candidate, rng, min_area_ratio=min_area_ratio, max_area_ratio=max_area_ratio).float()
+        if _random_float(rng) < erase_probability:
+            candidate = _erase_prompt_region(candidate, rng).float()
+        candidate_count = int(candidate.sum().item())
+        if 0 < candidate_count < original_count:
+            return candidate
+        if original_count == 1 and candidate_count == 1:
+            return candidate
+    if original_count > 1:
+        return _single_pixel_prompt_mask(original, rng)
+    return original
+
+
+def build_prompt(
+    dataset: str,
+    reference_mask: torch.Tensor,
+    frame_index: int,
+    rng: RandomLike,
+    config: dict[str, Any] | None = None,
+) -> Prompt:
+    if dataset in {"scannetpp", "ase", "shapenet"}:
+        prompt_mask = _augment_prompt_mask(reference_mask, rng, _prompt_mask_augmentation_config(config, dataset))
+        return Prompt(type="mask", frame_index=frame_index, mask=prompt_mask)
     prompt_type = rng.choice(("mask", "point", "box"))
     if prompt_type == "mask":
-        return Prompt(type="mask", frame_index=frame_index, mask=reference_mask)
+        prompt_mask = _augment_prompt_mask(reference_mask, rng, _prompt_mask_augmentation_config(config, dataset))
+        return Prompt(type="mask", frame_index=frame_index, mask=prompt_mask)
     if prompt_type == "point":
         points, labels = _point_prompt_from_mask(reference_mask, rng)
         return Prompt(type="point", frame_index=frame_index, points=points, point_labels=labels)
@@ -484,9 +624,12 @@ class Must3rFeatureCache:
     def load(self, scene: SceneRecord, frames: list[FrameRecord]) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
         metadata = self._metadata(scene)
         self._validate_metadata(scene, metadata)
+        stacked = self.load_levels(scene, frames)
+        return self._bundle_if_strict(scene, frames, stacked, metadata)
+
+    def load_levels(self, scene: SceneRecord, frames: list[FrameRecord]) -> tuple[torch.Tensor, ...]:
         if all(frame.must3r_feature_paths for frame in frames):
-            levels = self._load_from_manifest_paths(frames)
-            return self._bundle_if_strict(scene, frames, levels, metadata)
+            return self._load_from_manifest_paths(frames)
         scene_dir = self.scene_dir(scene)
         levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
         missing: list[Path] = []
@@ -501,8 +644,7 @@ class Must3rFeatureCache:
             preview = ", ".join(str(path) for path in missing[:3])
             suffix = "" if len(missing) <= 3 else f", ... ({len(missing)} total)"
             raise FeatureCacheMissingError(f"Missing MUSt3R feature cache files: {preview}{suffix}")
-        stacked = self._stack_and_validate(levels)
-        return self._bundle_if_strict(scene, frames, stacked, metadata)
+        return self._stack_and_validate(levels)
 
     def expected_paths(self, dataset: str, scene_id: str, frame_ids: tuple[str, ...]) -> list[Path]:
         scene_dir = self.root / dataset / scene_id
@@ -583,8 +725,27 @@ class Must3rFeatureCache:
     ) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
         if not self.strict_paper:
             return levels
+        if scene.dataset == "shapenet":
+            geometry = self._synthetic_geometry(levels[0])
+            return Must3rFeatureBundle(levels=levels, metadata=metadata, **geometry)
         geometry = self._load_geometry(scene, frames)
         return Must3rFeatureBundle(levels=levels, metadata=metadata, **geometry)
+
+    def _synthetic_geometry(self, reference: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, _, height, width = reference.shape
+        device = reference.device
+        dtype = reference.dtype
+        y, x = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype),
+            torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        pe2d = torch.stack([x, y], dim=0).expand(batch_size, -1, -1, -1).contiguous()
+        point_map = torch.zeros(batch_size, 3, height, width, device=device, dtype=dtype)
+        point_map[:, 2] = 1.0
+        ray_map = torch.cat([pe2d, torch.ones(batch_size, 1, height, width, device=device, dtype=dtype)], dim=1)
+        ray_map = F.normalize(ray_map, dim=1)
+        return {"pe2d": pe2d, "point_map": point_map, "ray_map": ray_map}
 
     def _load_geometry(self, scene: SceneRecord, frames: list[FrameRecord]) -> dict[str, torch.Tensor]:
         scene_dir = self.scene_dir(scene)
@@ -674,12 +835,34 @@ class ThreeAMTrainingDataset:
 
     def _sample_compatible(self) -> TrainingBatch:
         scene = self.rng.choice(self.scenes)
+        if scene.dataset != "shapenet":
+            return self._sample_compatible_scene(scene)
+        shapenet_scenes = [candidate for candidate in self.scenes if candidate.dataset == "shapenet"]
+        attempts = max(1, int(self.config.get("training", {}).get("sample_resample_attempts", 24)))
+        last_error: Exception | None = None
+        for _ in range(attempts):
+            scene = self.rng.choice(shapenet_scenes)
+            batch = self._sample_compatible_scene(scene)
+            if batch.prompt.mask is not None and bool((batch.prompt.mask > 0.5).any()) and bool(batch.has_object.any()):
+                return batch
+            last_error = RuntimeError(
+                f"ShapeNet sample {scene.scene_id} produced an empty prompt or empty target masks; resampling"
+            )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to sample a valid batch")
+
+    def _sample_compatible_scene(self, scene: SceneRecord, *, allow_missing_feature_cache: bool = True) -> TrainingBatch:
         frames = list(scene.frames)
         sampling_config = self._sampling_config(scene)
         overlap = self.feature_cache.overlap_matrix(scene) if sampling_config.fov_sampling_probability > 0 else None
-        selected_indices = choose_indices(len(frames), sampling_config, overlap)
+        if scene.dataset == "shapenet":
+            selected_indices = self._select_continuous_indices(len(frames), sampling_config.sequence_length)
+        else:
+            selected_indices = choose_indices(len(frames), sampling_config, overlap)
         selected_frames = [frames[index] for index in selected_indices]
-        images = [load_image_tensor(frame.image_path, self.sam_image_size) for frame in selected_frames]
+        image_size = self._image_size(scene, selected_frames)
+        images = [load_image_tensor(frame.image_path, image_size) for frame in selected_frames]
         image_shape = tuple(images[0].shape[-2:])
         if any(tuple(image.shape[-2:]) != image_shape for image in images):
             raise ValueError(f"Scene {scene.scene_id} produced variable image sizes in one training sample")
@@ -697,13 +880,15 @@ class ThreeAMTrainingDataset:
                 frame_id=frame.frame_id,
                 max_ratio=max_ratio,
             )
-        prompt = build_prompt(scene.dataset, target_masks[reference_index], reference_index, self.rng)
+        prompt = build_prompt(scene.dataset, target_masks[reference_index], reference_index, self.rng, self.config)
         has_object = target_masks.flatten(1).any(dim=1)
         must3r_features = None
         if self.load_feature_cache:
             try:
                 must3r_features = self.feature_cache.load(scene, selected_frames)
             except FeatureCacheMissingError:
+                if not allow_missing_feature_cache:
+                    raise
                 must3r_features = None
         reference_frame_id = selected_frames[reference_index].frame_id if selected_frames else ""
         return TrainingBatch(
@@ -725,6 +910,24 @@ class ThreeAMTrainingDataset:
 
     def _sample_strict_paper(self) -> TrainingBatch:
         scene = self.rng.choice(self.scenes)
+        if scene.dataset != "shapenet":
+            return self._sample_strict_paper_scene(scene)
+        shapenet_scenes = [candidate for candidate in self.scenes if candidate.dataset == "shapenet"]
+        attempts = max(1, int(self.config.get("training", {}).get("sample_resample_attempts", 24)))
+        last_error: Exception | None = None
+        for _ in range(attempts):
+            scene = self.rng.choice(shapenet_scenes)
+            batch = self._sample_compatible_scene(scene, allow_missing_feature_cache=False)
+            if batch.prompt.mask is not None and bool((batch.prompt.mask > 0.5).any()) and bool(batch.has_object.any()):
+                return batch
+            last_error = RuntimeError(
+                f"ShapeNet sample {scene.scene_id} produced an empty prompt or empty target masks; resampling"
+            )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to sample a valid strict ShapeNet batch")
+
+    def _sample_strict_paper_scene(self, scene: SceneRecord) -> TrainingBatch:
         frames = list(scene.frames)
         sampling_config = self._sampling_config(scene)
         ignore_values = _mask_ignore_values(self.config, scene.dataset)
@@ -757,7 +960,7 @@ class ThreeAMTrainingDataset:
                 frame_id=frame.frame_id,
                 max_ratio=max_ratio,
             )
-        prompt = build_prompt(scene.dataset, target_masks[0], 0, self.rng)
+        prompt = build_prompt(scene.dataset, target_masks[0], 0, self.rng, self.config)
         has_object = target_masks.flatten(1).any(dim=1)
         must3r_features = None
         if self.load_feature_cache:
@@ -786,6 +989,54 @@ class ThreeAMTrainingDataset:
         max_start = max(0, num_frames - sequence_length)
         start = self.rng.randrange(max_start + 1) if hasattr(self.rng, "randrange") else random.randrange(max_start + 1)
         return list(range(start, min(num_frames, start + sequence_length)))
+
+    def _select_continuous_indices(self, num_frames: int, sequence_length: int) -> list[int]:
+        if num_frames <= 0:
+            raise ValueError("num_frames must be positive")
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        max_start = max(0, num_frames - sequence_length)
+        start = _random_int(self.rng, 0, max_start)
+        return list(range(start, min(num_frames, start + sequence_length)))
+
+    def _image_size(self, scene: SceneRecord, frames: list[FrameRecord]) -> int | tuple[int, int] | None:
+        dataset_config = self.config.get("datasets", {}).get(scene.dataset, {})
+        size_config = dataset_config.get("dynamic_resize", self.config.get("training", {}).get("dynamic_resize", {}))
+        if not isinstance(size_config, dict) or not bool(size_config.get("enabled", scene.dataset == "shapenet")):
+            return self.sam_image_size
+        min_size = _positive_int(
+            size_config.get("min_size", size_config.get("short_side_min", dataset_config.get("resize_min"))),
+            name="dynamic_resize.min_size",
+        )
+        max_size = _positive_int(
+            size_config.get("max_size", size_config.get("short_side_max", dataset_config.get("resize_max"))),
+            name="dynamic_resize.max_size",
+        )
+        if min_size is None and max_size is None:
+            return self.sam_image_size
+        if min_size is None:
+            min_size = max_size
+        if max_size is None:
+            max_size = min_size
+        assert min_size is not None and max_size is not None
+        if max_size < min_size:
+            raise ValueError("dynamic_resize.max_size must be >= min_size")
+        multiple = max(1, int(size_config.get("multiple", 32)))
+        sampled = _random_int(self.rng, min_size, max_size)
+        sampled = max(multiple, int(round(sampled / multiple)) * multiple)
+        if self.sam_image_size is not None:
+            sampled = min(sampled, self.sam_image_size)
+        if bool(size_config.get("keep_aspect", False)):
+            if not frames:
+                return sampled
+            with Image.open(frames[0].image_path) as image:
+                width, height = image.size
+            short_side = max(1, min(width, height))
+            scale = sampled / short_side
+            new_width = max(multiple, int(round(width * scale / multiple)) * multiple)
+            new_height = max(multiple, int(round(height * scale / multiple)) * multiple)
+            return new_width, new_height
+        return sampled
 
     def _select_instance_from_mask(self, mask: np.ndarray) -> tuple[int | None, bool]:
         ids = _candidate_instance_ids(mask)
@@ -892,8 +1143,24 @@ class ThreeAMTrainingDataset:
     def _sampling_config(self, scene: SceneRecord) -> SamplingConfig:
         global_sampling = self.config.get("sampling", {})
         dataset_config = self.config.get("datasets", {}).get(scene.dataset, {})
+        sequence_length = self._sequence_length(scene)
         return SamplingConfig(
             fov_sampling_probability=float(dataset_config.get("fov_sampling_probability", 0.0)),
             fov_threshold=float(global_sampling.get("fov_threshold", 0.25)),
-            sequence_length=int(global_sampling.get("sequence_length", self.config.get("training", {}).get("memory_frames", 8))),
+            sequence_length=sequence_length,
         )
+
+    def _sequence_length(self, scene: SceneRecord) -> int:
+        global_sampling = self.config.get("sampling", {})
+        dataset_config = self.config.get("datasets", {}).get(scene.dataset, {})
+        base = int(global_sampling.get("sequence_length", self.config.get("training", {}).get("memory_frames", 8)))
+        min_value = dataset_config.get("sequence_length_min", global_sampling.get("sequence_length_min"))
+        max_value = dataset_config.get("sequence_length_max", global_sampling.get("sequence_length_max"))
+        if min_value is None and max_value is None:
+            return base
+        min_length = _positive_int(min_value if min_value is not None else base, name="sequence_length_min")
+        max_length = _positive_int(max_value if max_value is not None else base, name="sequence_length_max")
+        assert min_length is not None and max_length is not None
+        if max_length < min_length:
+            raise ValueError("sequence_length_max must be >= sequence_length_min")
+        return _random_int(self.rng, min_length, max_length)
