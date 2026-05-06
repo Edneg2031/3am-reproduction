@@ -1323,6 +1323,7 @@ def run_training(
         outputs: dict[str, torch.Tensor] | None = None
         loss = None
         batch: TrainingBatch | None = None
+        must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle | None = None
         for attempt in range(max(1, max_detached_loss_resample_attempts)):
             batch = dataset.sample().to(device)
             batch = _apply_sam2_point_pseudo_masks(batch, sam2_adapter=wrapper.sam2_adapter, config=config)
@@ -1388,6 +1389,10 @@ def run_training(
                     ]
                 )
             )
+        clear_cached_backbone_payload = getattr(wrapper.sam2_adapter, "clear_cached_backbone_payload", None)
+        if callable(clear_cached_backbone_payload):
+            clear_cached_backbone_payload()
+        del outputs, loss, batch, must3r_features
         if validation_dataset is not None and validate_every > 0 and step % validate_every == 0:
             metrics = run_validation_step(
                 wrapper=wrapper,

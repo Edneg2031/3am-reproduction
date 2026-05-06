@@ -308,6 +308,9 @@ class Sam2TrainingAdapter(nn.Module):
         self._last_feature_selector = selector
         self._last_sam_feature_shape = tuple(sam_feature.shape)
 
+    def clear_cached_backbone_payload(self) -> None:
+        self._last_feature_payload = None
+
     def _call_with_grad(self, method: Any, /, *args: Any, **kwargs: Any) -> Any:
         """Call SAM2 internals without inference/no-grad decorators when possible."""
         callable_method = method
@@ -343,6 +346,7 @@ class Sam2TrainingAdapter(nn.Module):
                 f"got {tuple(merged_features.shape)}, expected {self._last_sam_feature_shape}."
             )
         payload = self._last_feature_payload
+        self._last_feature_payload = None
         selector = self._last_feature_selector
         if payload is None or selector is None:
             return None

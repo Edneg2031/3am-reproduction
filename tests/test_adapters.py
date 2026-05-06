@@ -89,6 +89,7 @@ def test_sam2_adapter_injects_merged_features_into_backbone_fpn() -> None:
     assert torch.equal(model.seen_backbone["backbone_fpn"][-1], merged)
     assert torch.equal(model.seen_backbone["backbone_fpn"][0], torch.zeros(2, 32, 16, 16))
     assert set(outputs) == {"mask_logits", "iou_scores", "occlusion_logits"}
+    assert adapter._last_feature_payload is None
 
 
 def test_sam2_adapter_prefers_backbone_fpn_over_vision_feature_alias() -> None:
