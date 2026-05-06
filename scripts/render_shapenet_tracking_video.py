@@ -342,13 +342,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mask-mode", default="project", choices=["project", "render"], help="project rasterizes mesh triangles directly; render uses a slower Blender mask pass")
     parser.add_argument(
         "--camera-path",
-        default="human-linear",
-        choices=["human-linear", "orbit"],
-        help="human-linear uses a linear camera move with smoothed Gaussian hand-held jitter; orbit keeps the previous sinusoidal path",
+        default="stochastic-two-body",
+        choices=["stochastic-two-body", "human-linear", "orbit"],
+        help="stochastic-two-body simulates smooth random camera/look-at dynamics; human-linear and orbit are legacy paths",
     )
     parser.add_argument("--camera-radius", type=float, default=4.2)
     parser.add_argument("--camera-height", type=float, default=1.12)
     parser.add_argument("--camera-orbit-deg", type=float, default=28.0)
+    parser.add_argument("--camera-force-std", type=float, default=0.42, help="Gaussian force std for --camera-path stochastic-two-body")
+    parser.add_argument("--lookat-force-std", type=float, default=0.28, help="Gaussian look-at force std for --camera-path stochastic-two-body")
+    parser.add_argument("--camera-drag", type=float, default=0.88, help="Velocity damping for --camera-path stochastic-two-body")
+    parser.add_argument("--camera-max-speed", type=float, default=0.9, help="Per-frame camera speed cap for --camera-path stochastic-two-body")
+    parser.add_argument("--lookat-max-speed", type=float, default=0.55, help="Per-frame look-at speed cap for --camera-path stochastic-two-body")
+    parser.add_argument("--camera-radius-min", type=float, help="Minimum camera radius for --camera-path stochastic-two-body; default is 0.9 * --camera-radius")
+    parser.add_argument("--camera-radius-max", type=float, help="Maximum camera radius for --camera-path stochastic-two-body; default is 1.12 * --camera-radius")
+    parser.add_argument("--camera-elevation-min-deg", type=float, default=8.0, help="Minimum camera elevation angle for --camera-path stochastic-two-body")
+    parser.add_argument("--camera-elevation-max-deg", type=float, default=28.0, help="Maximum camera elevation angle for --camera-path stochastic-two-body")
+    parser.add_argument("--camera-resample-attempts", type=int, default=24, help="Trajectory attempts when stochastic camera motion fails visibility checks")
     parser.add_argument("--camera-linear-x", type=float, default=1.3, help="Total x travel for --camera-path human-linear")
     parser.add_argument("--camera-linear-y", type=float, default=0.18, help="Total y travel for --camera-path human-linear")
     parser.add_argument("--camera-linear-z", type=float, default=0.12, help="Total z travel for --camera-path human-linear")
@@ -789,8 +799,29 @@ def _add_scaled(vector: tuple[float, float, float], direction: tuple[float, floa
     return tuple(float(value + axis * scale) for value, axis in zip(vector, direction))
 
 
+def _add_tuple(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return tuple(float(left + right) for left, right in zip(a, b))
+
+
+def _scale_tuple(vector: tuple[float, float, float], scale: float) -> tuple[float, float, float]:
+    return tuple(float(value * scale) for value in vector)
+
+
 def _sub_tuple(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
     return tuple(float(left - right) for left, right in zip(a, b))
+
+
+def _tuple_length(vector: tuple[float, float, float]) -> float:
+    return math.sqrt(sum(value * value for value in vector))
+
+
+def _clip_tuple_length(vector: tuple[float, float, float], max_length: float) -> tuple[float, float, float]:
+    if max_length < 0.0:
+        raise ValueError("max length must be non-negative")
+    length = _tuple_length(vector)
+    if length <= max_length or length <= 1e-8:
+        return vector
+    return _scale_tuple(vector, max_length / length)
 
 
 def _cross_tuple(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -914,9 +945,213 @@ def _human_linear_camera_poses(total_frames: int, window: AbsenceWindow, args: a
     return poses
 
 
+def _camera_focus_center() -> tuple[float, float, float]:
+    return (0.0, 0.0, 0.1)
+
+
+def _camera_radius_bounds(args: argparse.Namespace) -> tuple[float, float]:
+    radius = float(args.camera_radius)
+    radius_min = float(args.camera_radius_min) if args.camera_radius_min is not None else radius * 0.9
+    radius_max = float(args.camera_radius_max) if args.camera_radius_max is not None else radius * 1.12
+    if radius_min <= 0.0:
+        raise ValueError("--camera-radius-min must be positive")
+    if radius_max < radius_min:
+        raise ValueError("--camera-radius-max must be greater than or equal to --camera-radius-min")
+    return radius_min, radius_max
+
+
+def _camera_elevation_bounds(args: argparse.Namespace) -> tuple[float, float]:
+    elevation_min = math.radians(float(args.camera_elevation_min_deg))
+    elevation_max = math.radians(float(args.camera_elevation_max_deg))
+    if elevation_max < elevation_min:
+        raise ValueError("--camera-elevation-max-deg must be greater than or equal to --camera-elevation-min-deg")
+    return elevation_min, elevation_max
+
+
+def _project_camera_position(
+    position: tuple[float, float, float],
+    *,
+    center: tuple[float, float, float],
+    radius_min: float,
+    radius_max: float,
+    elevation_min: float,
+    elevation_max: float,
+) -> tuple[float, float, float]:
+    vector = _sub_tuple(position, center)
+    radius = max(radius_min, min(radius_max, _tuple_length(vector)))
+    horizontal = math.hypot(vector[0], vector[1])
+    azimuth = math.atan2(vector[0], vector[1]) if horizontal > 1e-8 else math.pi
+    elevation = math.atan2(vector[2], horizontal)
+    elevation = max(elevation_min, min(elevation_max, elevation))
+    projected_horizontal = radius * math.cos(elevation)
+    return (
+        float(center[0] + projected_horizontal * math.sin(azimuth)),
+        float(center[1] + projected_horizontal * math.cos(azimuth)),
+        float(center[2] + radius * math.sin(elevation)),
+    )
+
+
+def _bounded_projected_step(
+    previous: tuple[float, float, float],
+    candidate: tuple[float, float, float],
+    *,
+    center: tuple[float, float, float],
+    radius_min: float,
+    radius_max: float,
+    elevation_min: float,
+    elevation_max: float,
+    max_step: float,
+) -> tuple[float, float, float]:
+    projected = _project_camera_position(
+        candidate,
+        center=center,
+        radius_min=radius_min,
+        radius_max=radius_max,
+        elevation_min=elevation_min,
+        elevation_max=elevation_max,
+    )
+    step = _sub_tuple(projected, previous)
+    if _tuple_length(step) <= max_step:
+        return projected
+
+    amount = max_step / max(1e-8, _tuple_length(step))
+    for _ in range(10):
+        limited = _add_tuple(previous, _scale_tuple(step, amount))
+        limited = _project_camera_position(
+            limited,
+            center=center,
+            radius_min=radius_min,
+            radius_max=radius_max,
+            elevation_min=elevation_min,
+            elevation_max=elevation_max,
+        )
+        if _tuple_length(_sub_tuple(limited, previous)) <= max_step + 1e-8:
+            return limited
+        amount *= 0.75
+    return previous
+
+
+def _sample_front_shell_position(
+    rng: np.random.Generator,
+    *,
+    center: tuple[float, float, float],
+    radius_min: float,
+    radius_max: float,
+    elevation_min: float,
+    elevation_max: float,
+) -> tuple[float, float, float]:
+    radius = float(rng.uniform(radius_min, radius_max))
+    elevation = float(rng.uniform(elevation_min, elevation_max))
+    azimuth = math.pi + float(rng.uniform(-math.radians(55.0), math.radians(55.0)))
+    horizontal = radius * math.cos(elevation)
+    return (
+        float(center[0] + horizontal * math.sin(azimuth)),
+        float(center[1] + horizontal * math.cos(azimuth)),
+        float(center[2] + radius * math.sin(elevation)),
+    )
+
+
+def _clamp_lookat_position(position: tuple[float, float, float], attractor: tuple[float, float, float]) -> tuple[float, float, float]:
+    x_min = min(0.0, attractor[0]) - 0.65
+    x_max = max(0.0, attractor[0]) + 0.65
+    z = position[2]
+    if abs(attractor[0]) >= 1e-8:
+        z = attractor[2] + 0.25 * (z - attractor[2])
+    return (
+        float(max(x_min, min(x_max, position[0]))),
+        float(max(-0.35, min(0.35, position[1]))),
+        float(max(0.02, min(0.38, z))),
+    )
+
+
+def _stochastic_two_body_camera_poses(total_frames: int, window: AbsenceWindow, args: argparse.Namespace, *, seed: int) -> list[CameraPose]:
+    rng = np.random.default_rng(seed)
+    center = _camera_focus_center()
+    radius_min, radius_max = _camera_radius_bounds(args)
+    elevation_min, elevation_max = _camera_elevation_bounds(args)
+    camera_pos = _sample_front_shell_position(
+        rng,
+        center=center,
+        radius_min=radius_min,
+        radius_max=radius_max,
+        elevation_min=elevation_min,
+        elevation_max=elevation_max,
+    )
+    camera_vel = _clip_tuple_length(
+        tuple(float(value) for value in rng.normal(scale=0.08, size=3)),
+        float(args.camera_max_speed) * 0.25,
+    )
+    lookat_pos = center
+    lookat_vel = _clip_tuple_length(
+        tuple(float(value) for value in rng.normal(scale=0.02, size=3)),
+        float(args.lookat_max_speed) * 0.15,
+    )
+    roll = 0.0
+    roll_limit = math.radians(float(args.camera_roll_jitter_deg))
+    roll_step_std = roll_limit * 0.35
+    drag = float(args.camera_drag)
+    camera_max_speed = max(0.0, float(args.camera_max_speed))
+    lookat_max_speed = max(0.0, float(args.lookat_max_speed))
+    poses: list[CameraPose] = []
+
+    for frame_index in range(total_frames):
+        camera_pos = _project_camera_position(
+            camera_pos,
+            center=center,
+            radius_min=radius_min,
+            radius_max=radius_max,
+            elevation_min=elevation_min,
+            elevation_max=elevation_max,
+        )
+        poses.append(CameraPose(location=camera_pos, target=lookat_pos, roll_rad=roll))
+
+        lookaway = _lookaway_offset(
+            frame_index,
+            window,
+            offset=float(args.lookaway_x),
+            transition_frames=int(args.lookaway_transition_frames),
+        )
+        lookat_attractor = (lookaway, 0.0, center[2])
+
+        camera_force = tuple(float(value) for value in rng.normal(scale=float(args.camera_force_std), size=3))
+        camera_force = (camera_force[0], camera_force[1], camera_force[2] * 0.45)
+        camera_vel = _add_tuple(_scale_tuple(camera_vel, drag), camera_force)
+        camera_vel = _clip_tuple_length(camera_vel, camera_max_speed)
+        camera_candidate = _add_tuple(camera_pos, camera_vel)
+        next_camera_pos = _bounded_projected_step(
+            camera_pos,
+            camera_candidate,
+            center=center,
+            radius_min=radius_min,
+            radius_max=radius_max,
+            elevation_min=elevation_min,
+            elevation_max=elevation_max,
+            max_step=camera_max_speed,
+        )
+        camera_vel = _sub_tuple(next_camera_pos, camera_pos)
+        camera_pos = next_camera_pos
+
+        lookat_spring = _scale_tuple(_sub_tuple(lookat_attractor, lookat_pos), 0.35)
+        lookat_force = tuple(float(value) for value in rng.normal(scale=float(args.lookat_force_std), size=3))
+        lookat_force = (lookat_force[0], lookat_force[1] * 0.35, lookat_force[2] * 0.2)
+        lookat_vel = _add_tuple(_scale_tuple(lookat_vel, drag), _add_tuple(lookat_spring, lookat_force))
+        lookat_vel = _clip_tuple_length(lookat_vel, lookat_max_speed)
+        lookat_pos = _clamp_lookat_position(_add_tuple(lookat_pos, lookat_vel), lookat_attractor)
+        lookat_vel = _sub_tuple(lookat_pos, poses[-1].target)
+
+        if roll_limit > 0.0:
+            roll = max(-roll_limit, min(roll_limit, drag * roll + float(rng.normal(scale=roll_step_std))))
+        else:
+            roll = 0.0
+
+    return poses
+
+
 def build_camera_poses(total_frames: int, window: AbsenceWindow, args: argparse.Namespace, *, seed: int) -> list[CameraPose]:
     if args.camera_path == "orbit":
         return [_orbit_camera_pose(frame_index, total_frames, window, args) for frame_index in range(total_frames)]
+    if args.camera_path == "stochastic-two-body":
+        return _stochastic_two_body_camera_poses(total_frames, window, args, seed=seed)
     return _human_linear_camera_poses(total_frames, window, args, seed=seed)
 
 
@@ -951,51 +1186,98 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
     white = _material(bpy, "target_mask_white", (1.0, 1.0, 1.0, 1.0), emission=True)
     black = _material(bpy, "mask_black", (0.0, 0.0, 0.0, 1.0), emission=True)
     window = absence_window(args.frames, start=args.absent_start, length=args.absent_frames)
-    camera_seed = _camera_seed(args, obj)
-    camera_poses = build_camera_poses(args.frames, window, args, seed=camera_seed) if args.motion == "camera" else []
-
+    base_camera_seed = _camera_seed(args, obj)
+    attempts = (
+        max(1, int(args.camera_resample_attempts))
+        if args.motion == "camera" and args.camera_path == "stochastic-two-body"
+        else 1
+    )
+    selected_camera_seed = base_camera_seed
+    selected_attempt = 0
     mask_pixels: list[int] = []
     visible: list[bool] = []
-    for frame_index in range(args.frames):
-        bpy.context.scene.frame_set(frame_index)
-        if args.motion == "camera":
-            root.location.x = 0.0
-            root.rotation_euler[2] = 0.0
-            _set_camera_pose(camera, Vector, camera_poses[frame_index])
-        else:
-            root.location.x = object_x(frame_index, args.frames, window, offscreen_x=args.offscreen_x)
-            root.rotation_euler[2] = 0.28 * math.sin(frame_index * 0.12)
-        frame_id = f"{frame_index:06d}"
-        _render_still(bpy, rgb_dir / f"{frame_id}.png")
-        if args.mask_mode == "project":
-            pixels = _write_projected_mask(
-                mask_dir / f"{frame_id}.png",
-                meshes=meshes,
-                camera=camera,
-                Vector=Vector,
-                width=args.width,
-                height=args.height,
-            )
-        else:
-            pixels = _render_mask(bpy, mask_dir / f"{frame_id}.png", meshes=meshes, floor=floor, white=white, black=black)
-        mask_pixels.append(pixels)
-        visible.append(pixels >= args.min_visible_mask_pixels)
+    last_runs: list[dict[str, int | bool]] = []
 
-    _verify_frame_sequence(rgb_dir, expected_frames=args.frames, label="RGB")
-    _verify_frame_sequence(mask_dir, expected_frames=args.frames, label="mask")
-    if not has_absent_then_reappearing_visibility(visible, min_absent_frames=args.min_absent_frames):
-        runs = visibility_runs(visible)
+    for attempt_index in range(attempts):
+        selected_attempt = attempt_index
+        selected_camera_seed = (base_camera_seed + attempt_index * 0x9E3779B1) & 0xFFFFFFFF
+        camera_poses = (
+            build_camera_poses(args.frames, window, args, seed=selected_camera_seed)
+            if args.motion == "camera"
+            else []
+        )
+        mask_pixels = []
+        visible = []
+        for frame_index in range(args.frames):
+            bpy.context.scene.frame_set(frame_index)
+            if args.motion == "camera":
+                root.location.x = 0.0
+                root.rotation_euler[2] = 0.0
+                _set_camera_pose(camera, Vector, camera_poses[frame_index])
+            else:
+                root.location.x = object_x(frame_index, args.frames, window, offscreen_x=args.offscreen_x)
+                root.rotation_euler[2] = 0.28 * math.sin(frame_index * 0.12)
+            frame_id = f"{frame_index:06d}"
+            _render_still(bpy, rgb_dir / f"{frame_id}.png")
+            if args.mask_mode == "project":
+                pixels = _write_projected_mask(
+                    mask_dir / f"{frame_id}.png",
+                    meshes=meshes,
+                    camera=camera,
+                    Vector=Vector,
+                    width=args.width,
+                    height=args.height,
+                )
+            else:
+                pixels = _render_mask(
+                    bpy,
+                    mask_dir / f"{frame_id}.png",
+                    meshes=meshes,
+                    floor=floor,
+                    white=white,
+                    black=black,
+                )
+            mask_pixels.append(pixels)
+            visible.append(pixels >= args.min_visible_mask_pixels)
+
+        _verify_frame_sequence(rgb_dir, expected_frames=args.frames, label="RGB")
+        _verify_frame_sequence(mask_dir, expected_frames=args.frames, label="mask")
+        if has_absent_then_reappearing_visibility(visible, min_absent_frames=args.min_absent_frames):
+            break
+        last_runs = visibility_runs(visible)
+        if attempt_index + 1 < attempts:
+            print(
+                f"[WARN] Camera trajectory attempt {attempt_index + 1}/{attempts} failed visibility for "
+                f"{obj.synset_id}/{obj.model_id}: {last_runs}. Resampling.",
+                flush=True,
+            )
+    else:
         raise RuntimeError(
-            f"{obj.synset_id}/{obj.model_id} did not produce visible -> absent -> visible masks. "
-            f"Visibility runs: {runs}. For camera motion, try increasing --lookaway-x or lowering "
-            "--min-visible-mask-pixels. For object motion, try increasing --offscreen-x."
+            f"{obj.synset_id}/{obj.model_id} did not produce visible -> absent -> visible masks after {attempts} "
+            f"camera trajectory attempts. Last visibility runs: {last_runs}. For camera motion, try increasing "
+            "--lookaway-x or lowering --min-visible-mask-pixels. For object motion, try increasing --offscreen-x."
         )
 
     video_path = None
     mask_video_path = None
     if not args.no_video:
-        video_path = _write_video_from_frames(rgb_dir / "%06d.png", output_dir / "video.mp4", fps=args.fps, codec=args.ffmpeg_codec)
-        mask_video_path = _write_video_from_frames(mask_dir / "%06d.png", output_dir / "mask.mp4", fps=args.fps, codec=args.ffmpeg_codec)
+        video_path = _write_video_from_frames(
+            rgb_dir / "%06d.png",
+            output_dir / "video.mp4",
+            fps=args.fps,
+            codec=args.ffmpeg_codec,
+        )
+        mask_video_path = _write_video_from_frames(
+            mask_dir / "%06d.png",
+            output_dir / "mask.mp4",
+            fps=args.fps,
+            codec=args.ffmpeg_codec,
+        )
+
+    if args.camera_path == "stochastic-two-body":
+        stochastic_radius_min, stochastic_radius_max = _camera_radius_bounds(args)
+    else:
+        stochastic_radius_min, stochastic_radius_max = args.camera_radius_min, args.camera_radius_max
 
     metadata = {
         "schema": "shapenet_tracking_render_v1",
@@ -1009,7 +1291,20 @@ def render_one_object(bpy: object, Vector: object, obj: ShapeNetObject, output_d
         "motion": args.motion,
         "mask_mode": args.mask_mode,
         "camera_path": args.camera_path,
-        "camera_seed": camera_seed if args.motion == "camera" else None,
+        "camera_seed": selected_camera_seed if args.motion == "camera" else None,
+        "camera_resample_attempt": selected_attempt if args.motion == "camera" else None,
+        "camera_stochastic": {
+            "force_std": args.camera_force_std,
+            "lookat_force_std": args.lookat_force_std,
+            "drag": args.camera_drag,
+            "camera_max_speed": args.camera_max_speed,
+            "lookat_max_speed": args.lookat_max_speed,
+            "radius_min": stochastic_radius_min,
+            "radius_max": stochastic_radius_max,
+            "elevation_min_deg": args.camera_elevation_min_deg,
+            "elevation_max_deg": args.camera_elevation_max_deg,
+            "resample_attempts": args.camera_resample_attempts,
+        },
         "camera_linear": {
             "x": args.camera_linear_x,
             "y": args.camera_linear_y,
