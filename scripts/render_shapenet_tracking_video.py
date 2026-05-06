@@ -229,8 +229,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=768)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--fov-deg", type=float, default=50.0)
-    parser.add_argument("--samples", type=int, default=32)
-    parser.add_argument("--engine", default="auto", choices=["auto", "eevee", "cycles"], help="Use cycles on headless Linux if EEVEE has no GPU/display context")
+    parser.add_argument("--samples", type=int, default=1)
+    parser.add_argument(
+        "--engine",
+        default="workbench",
+        choices=["auto", "workbench", "eevee", "cycles"],
+        help="Use workbench for fast synthetic rendering; use eevee/cycles only when you need higher-fidelity RGB",
+    )
     parser.add_argument("--axis-convention", default="y-up", choices=["y-up", "z-up"])
     parser.add_argument("--object-size", type=float, default=1.35)
     parser.add_argument("--motion", default="camera", choices=["camera", "object"], help="camera keeps the object fixed and moves/pans the camera; object keeps the old moving-object behavior")
@@ -273,10 +278,17 @@ def _set_render_engine(bpy: object, *, engine: str, samples: int) -> None:
     if engine == "cycles":
         scene.render.engine = "CYCLES"
         scene.cycles.device = "CPU"
+    elif engine == "workbench" and "BLENDER_WORKBENCH" in engines:
+        scene.render.engine = "BLENDER_WORKBENCH"
+    elif engine == "auto" and "BLENDER_WORKBENCH" in engines:
+        scene.render.engine = "BLENDER_WORKBENCH"
     elif "BLENDER_EEVEE_NEXT" in engines:
         scene.render.engine = "BLENDER_EEVEE_NEXT"
     elif engine != "cycles" and "BLENDER_EEVEE" in engines:
         scene.render.engine = "BLENDER_EEVEE"
+    if getattr(scene.render, "engine", "") == "BLENDER_WORKBENCH":
+        scene.display.shading.light = "STUDIO"
+        scene.display.shading.color_type = "MATERIAL"
     if hasattr(scene, "eevee"):
         scene.eevee.taa_render_samples = max(1, samples)
     if scene.render.engine == "CYCLES":
@@ -285,6 +297,7 @@ def _set_render_engine(bpy: object, *, engine: str, samples: int) -> None:
 
 def _material(bpy: object, name: str, color: tuple[float, float, float, float], *, emission: bool = False) -> object:
     material = bpy.data.materials.new(name)
+    material.diffuse_color = color
     material.use_nodes = True
     if emission:
         nodes = material.node_tree.nodes
@@ -397,6 +410,29 @@ def _render_still(bpy: object, path: Path) -> None:
     bpy.ops.render.render(write_still=True)
 
 
+def _switch_to_fast_mask_render(bpy: object) -> tuple[str, str | None, str | None]:
+    scene = bpy.context.scene
+    old_engine = scene.render.engine
+    old_light = getattr(scene.display.shading, "light", None)
+    old_color_type = getattr(scene.display.shading, "color_type", None)
+    engines = {item.identifier for item in scene.render.bl_rna.properties["engine"].enum_items}
+    if "BLENDER_WORKBENCH" in engines:
+        scene.render.engine = "BLENDER_WORKBENCH"
+        scene.display.shading.light = "FLAT"
+        scene.display.shading.color_type = "MATERIAL"
+    return old_engine, old_light, old_color_type
+
+
+def _restore_render_state(bpy: object, state: tuple[str, str | None, str | None]) -> None:
+    engine, light, color_type = state
+    scene = bpy.context.scene
+    scene.render.engine = engine
+    if light is not None:
+        scene.display.shading.light = light
+    if color_type is not None:
+        scene.display.shading.color_type = color_type
+
+
 def _mask_pixel_count(bpy: object, path: Path) -> int:
     image = bpy.data.images.load(str(path), check_existing=False)
     try:
@@ -414,7 +450,9 @@ def _render_mask(bpy: object, path: Path, *, meshes: Sequence[object], floor: ob
     mesh_materials = {mesh.name: [slot.material for slot in mesh.material_slots] for mesh in meshes}
     floor_materials = [slot.material for slot in floor.material_slots]
     old_world = bpy.context.scene.world.color[:]
+    old_render_state = (bpy.context.scene.render.engine, None, None)
     try:
+        old_render_state = _switch_to_fast_mask_render(bpy)
         for mesh in meshes:
             mesh.data.materials.clear()
             mesh.data.materials.append(white)
@@ -424,6 +462,7 @@ def _render_mask(bpy: object, path: Path, *, meshes: Sequence[object], floor: ob
         _render_still(bpy, path)
         return _mask_pixel_count(bpy, path)
     finally:
+        _restore_render_state(bpy, old_render_state)
         bpy.context.scene.world.color = old_world
         for mesh in meshes:
             mesh.data.materials.clear()
