@@ -859,7 +859,8 @@ def run_validation_step(
             online_must3r=online_must3r,
             float_dtype=float_dtype,
         )
-        outputs = wrapper(batch, must3r_features)
+        with _autocast(device, amp_enabled):
+            outputs = wrapper(batch, must3r_features)
         metrics = _tracking_metrics(outputs, batch)
     if was_training:
         wrapper.train()

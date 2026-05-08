@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import warnings
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -180,16 +181,24 @@ class Sam2TrainingAdapter(nn.Module):
     def _encode_sam_backbone_payload(self, images: torch.Tensor) -> Any:
         if self.model is None:
             raise ExternalDependencyError("SAM2 model is not loaded")
-        if hasattr(self.model, "encode_sam_features"):
-            return self.model.encode_sam_features(images)  # type: ignore[attr-defined]
-        if hasattr(self.model, "forward_image"):
-            return self.model.forward_image(images)  # type: ignore[attr-defined]
-        if hasattr(self.model, "image_encoder"):
-            return self.model.image_encoder(images)  # type: ignore[attr-defined]
+        with self._sam_autocast(images):
+            if hasattr(self.model, "encode_sam_features"):
+                return self.model.encode_sam_features(images)  # type: ignore[attr-defined]
+            if hasattr(self.model, "forward_image"):
+                return self.model.forward_image(images)  # type: ignore[attr-defined]
+            if hasattr(self.model, "image_encoder"):
+                return self.model.image_encoder(images)  # type: ignore[attr-defined]
         raise ExternalDependencyError(
             "SAM2 adapter could not obtain image features. Install official SAM2 training internals "
             "or subclass Sam2TrainingAdapter for the selected SAM2 release."
         )
+
+    def _sam_autocast(self, images: torch.Tensor):
+        if images.device.type == "cuda" and images.dtype in {torch.float16, torch.bfloat16}:
+            if hasattr(torch, "amp"):
+                return torch.amp.autocast(device_type="cuda", dtype=images.dtype)
+            return torch.cuda.amp.autocast(dtype=images.dtype)  # pragma: no cover - older torch
+        return nullcontext()
 
     def forward_train_sequence(self, batch: Any, merged_features: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.model is None:
@@ -249,12 +258,13 @@ class Sam2TrainingAdapter(nn.Module):
         if len(points_by_frame) != int(images.shape[0]) or len(labels_by_frame) != int(images.shape[0]):
             raise ValueError("points_by_frame and labels_by_frame must have one entry per image frame")
         with torch.no_grad():
-            backbone_out = self._encode_sam_backbone_payload(images)
-            feature, _ = self._select_sam_feature(backbone_out)
-            if hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step"):
-                return self._predict_point_masks_with_tracking(images, backbone_out, points_by_frame, labels_by_frame)
-            if hasattr(self.model, "_forward_sam_heads"):
-                return self._predict_point_masks_per_frame(images, feature, backbone_out, points_by_frame, labels_by_frame)
+            with self._sam_autocast(images):
+                backbone_out = self._encode_sam_backbone_payload(images)
+                feature, _ = self._select_sam_feature(backbone_out)
+                if hasattr(self.model, "_prepare_backbone_features") and hasattr(self.model, "_track_step"):
+                    return self._predict_point_masks_with_tracking(images, backbone_out, points_by_frame, labels_by_frame)
+                if hasattr(self.model, "_forward_sam_heads"):
+                    return self._predict_point_masks_per_frame(images, feature, backbone_out, points_by_frame, labels_by_frame)
         raise ExternalDependencyError(
             "SAM2 point-prompt mask generation requires official _track_step or _forward_sam_heads internals."
         )
@@ -275,8 +285,9 @@ class Sam2TrainingAdapter(nn.Module):
             raise ExternalDependencyError("SAM2 point-prompt tracking requires official _prepare_backbone_features and _track_step")
         reference_index = min(max(int(reference_index), 0), int(images.shape[0]) - 1)
         with torch.no_grad():
-            backbone_out = self._encode_sam_backbone_payload(images)
-            return self._track_point_masks_with_backbone(images, backbone_out, reference_index, points, labels)
+            with self._sam_autocast(images):
+                backbone_out = self._encode_sam_backbone_payload(images)
+                return self._track_point_masks_with_backbone(images, backbone_out, reference_index, points, labels)
 
     def track_masks_from_mask(
         self,
@@ -294,9 +305,10 @@ class Sam2TrainingAdapter(nn.Module):
             raise ExternalDependencyError("SAM2 mask-prompt tracking requires official _prepare_backbone_features and _track_step")
         reference_index = min(max(int(reference_index), 0), int(images.shape[0]) - 1)
         with torch.no_grad():
-            if backbone_out is None:
-                backbone_out = self._encode_sam_backbone_payload(images)
-            return self._track_mask_with_backbone(images, backbone_out, reference_index, mask)
+            with self._sam_autocast(images):
+                if backbone_out is None:
+                    backbone_out = self._encode_sam_backbone_payload(images)
+                return self._track_mask_with_backbone(images, backbone_out, reference_index, mask)
 
     def _remember_feature_payload(
         self,
