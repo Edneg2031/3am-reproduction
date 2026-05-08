@@ -32,11 +32,14 @@ from three_am.models.adapters import (
 from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.models.three_am import ThreeAMConfig, ThreeAMCore
 from three_am.training.dataset import (
+    LetterboxTransform,
     Prompt,
     TrainingBatch,
     ThreeAMTrainingDataset,
     configured_feature_cache_root,
     configured_training_datasets,
+    load_image_tensor,
+    load_mask_array,
     manifest_statuses,
     resolve_project_path,
 )
@@ -308,6 +311,7 @@ def dry_run(
             "visualization_dir": str(
                 _resolve_visualization_dir(config, config.get("training", {}).get("visualization_dir"))
             ),
+            "visualization_full_video": bool(config.get("training", {}).get("visualization_full_video", False)),
             "visualization_max_frames": int(config.get("training", {}).get("visualization_max_frames", 4)),
             "visualization_max_side": int(config.get("training", {}).get("visualization_max_side", 384)),
             "visualization_fps": int(config.get("training", {}).get("visualization_fps", 6)),
@@ -1318,6 +1322,92 @@ def _write_training_visualization_video(frames: Sequence[Image.Image], output_pa
     return output_path
 
 
+def _clone_prompt_to_cpu(prompt: Prompt, *, frame_index: int) -> Prompt:
+    return Prompt(
+        type=prompt.type,
+        frame_index=int(frame_index),
+        mask=prompt.mask.detach().cpu().clone() if prompt.mask is not None else None,
+        points=prompt.points.detach().cpu().clone() if prompt.points is not None else None,
+        point_labels=prompt.point_labels.detach().cpu().clone() if prompt.point_labels is not None else None,
+        box=prompt.box.detach().cpu().clone() if prompt.box is not None else None,
+    )
+
+
+def _target_mask_for_visualization(mask: np.ndarray, *, instance_id: int | None, binary_mode: bool) -> torch.Tensor:
+    if binary_mode:
+        return torch.from_numpy((mask > 0).astype(np.float32))
+    if instance_id is None:
+        raise ValueError("Full-scene visualization requires instance_id for non-binary masks")
+    return torch.from_numpy((mask == int(instance_id)).astype(np.float32))
+
+
+def _scene_for_visualization(dataset: ThreeAMTrainingDataset, batch: TrainingBatch):
+    for scene in dataset.scenes:
+        if scene.dataset == batch.dataset and scene.scene_id == batch.scene_id:
+            return scene
+    raise ValueError(f"Could not find scene record for {batch.dataset}/{batch.scene_id}")
+
+
+def _build_full_scene_visualization_batch(dataset: ThreeAMTrainingDataset, batch: TrainingBatch) -> TrainingBatch:
+    scene = _scene_for_visualization(dataset, batch)
+    letterbox = batch.letterbox_transform
+    if letterbox is None:
+        raise ValueError("Training batch is missing letterbox_transform for full-scene visualization")
+    if not isinstance(letterbox, LetterboxTransform):
+        raise TypeError(f"Unexpected letterbox transform payload: {type(letterbox)!r}")
+    frames = list(scene.frames)
+    if not frames:
+        raise ValueError(f"Scene {scene.scene_id} has no frames for full-scene visualization")
+    reference_frame_id = batch.reference_frame_id or (
+        batch.frame_ids[min(max(int(batch.prompt.frame_index), 0), max(len(batch.frame_ids) - 1, 0))]
+        if batch.frame_ids
+        else ""
+    )
+    reference_index = next((index for index, frame in enumerate(frames) if frame.frame_id == reference_frame_id), -1)
+    if reference_index < 0:
+        raise ValueError(
+            f"Reference frame {reference_frame_id!r} is not present in scene {scene.dataset}/{scene.scene_id}"
+        )
+    ignore_values = tuple(int(value) for value in dataset.config.get("datasets", {}).get(scene.dataset, {}).get("mask_ignore_values", ()))
+    raw_images = [load_image_tensor(frame.image_path, None) for frame in frames]
+    source_shape = tuple(raw_images[0].shape[-2:])
+    if (letterbox.source_height, letterbox.source_width) != source_shape:
+        raise ValueError(
+            "Full-scene visualization source resolution does not match the sampled batch transform: "
+            f"scene has {source_shape}, transform expects {(letterbox.source_height, letterbox.source_width)}"
+        )
+    images = torch.stack([letterbox.resize_image(image) for image in raw_images], dim=0)
+    raw_masks = [load_mask_array(frame.mask_path, source_shape, ignore_values=ignore_values) for frame in frames]
+    binary_mode = bool(batch.binary_mode) if batch.binary_mode is not None else scene.dataset == "shapenet"
+    instance_id = 1 if binary_mode else batch.instance_id
+    target_masks = torch.stack(
+        [letterbox.resize_mask(_target_mask_for_visualization(mask, instance_id=instance_id, binary_mode=binary_mode)) for mask in raw_masks],
+        dim=0,
+    )
+    has_object = target_masks.flatten(1).any(dim=1)
+    prompt = _clone_prompt_to_cpu(batch.prompt, frame_index=reference_index)
+    must3r_features = dataset.feature_cache.load(scene, frames) if dataset.load_feature_cache else None
+    return TrainingBatch(
+        images=images,
+        target_masks=target_masks,
+        prompt=prompt,
+        must3r_features=must3r_features,
+        dataset=scene.dataset,
+        scene_id=scene.scene_id,
+        frame_ids=tuple(frame.frame_id for frame in frames),
+        image_paths=tuple(frame.image_path for frame in frames),
+        has_object=has_object,
+        sampling_mode="full_scene",
+        reference_frame_id=reference_frame_id,
+        instance_id=batch.instance_id,
+        binary_mode=binary_mode,
+        object_visibility=has_object,
+        must3r_geometry=must3r_features if isinstance(must3r_features, Must3rFeatureBundle) else None,
+        target_source=batch.target_source,
+        letterbox_transform=letterbox,
+    )
+
+
 def save_training_visualization(
     *,
     batch: TrainingBatch,
@@ -1327,6 +1417,8 @@ def save_training_visualization(
     max_frames: int = 4,
     max_side: int = 384,
     fps: int = 6,
+    name_suffix: str = "",
+    video_frame_indices: Sequence[int] | None = None,
 ) -> TrainingVisualizationArtifact:
     output_dir.mkdir(parents=True, exist_ok=True)
     images = batch.images.detach()
@@ -1336,7 +1428,13 @@ def save_training_visualization(
     num_frames = int(images.shape[0])
     reference_index = min(max(int(batch.prompt.frame_index), 0), max(num_frames - 1, 0))
     summary_order = _visualization_frame_order(num_frames, reference_index, max_frames)
-    video_order = _visualization_video_frame_order(num_frames, reference_index, max_frames)
+    video_order = (
+        [int(index) for index in video_frame_indices if 0 <= int(index) < num_frames]
+        if video_frame_indices is not None
+        else _visualization_video_frame_order(num_frames, reference_index, max_frames)
+    )
+    if not video_order:
+        video_order = _visualization_video_frame_order(num_frames, reference_index, max_frames)
     diagnostics = _visualization_diagnostics(
         probabilities,
         target_masks,
@@ -1382,16 +1480,63 @@ def save_training_visualization(
         sampling_mode=batch.sampling_mode,
         target_source=batch.target_source,
     )
-    summary_path = output_dir / f"{_visualization_stem(batch=batch, step=step)}.png"
+    stem = f"{_visualization_stem(batch=batch, step=step)}{name_suffix}"
+    summary_path = output_dir / f"{stem}.png"
     summary_canvas = _render_training_visualization_canvas(header_lines, [rows[index] for index in summary_order])
     summary_canvas.save(summary_path)
     video_frames = [_render_training_visualization_canvas(header_lines, [rows[index]]) for index in video_order]
     video_path = _write_training_visualization_video(
         video_frames,
-        output_dir / f"{_visualization_stem(batch=batch, step=step)}.mp4",
+        output_dir / f"{stem}.mp4",
         fps=max(1, fps),
     )
     return TrainingVisualizationArtifact(summary_path=summary_path, video_path=video_path)
+
+
+def save_full_scene_training_visualization(
+    *,
+    dataset: ThreeAMTrainingDataset,
+    batch: TrainingBatch,
+    wrapper: ThreeAMTrainingWrapper,
+    must3r_adapter: Must3rFeatureAdapter | None,
+    config: dict[str, Any],
+    device: torch.device,
+    online_must3r: bool,
+    float_dtype: torch.dtype,
+    amp_enabled: bool,
+    step: int,
+    output_dir: Path,
+    max_frames: int = 4,
+    max_side: int = 384,
+    fps: int = 6,
+) -> TrainingVisualizationArtifact:
+    scene_batch = _build_full_scene_visualization_batch(dataset, batch).to(device, float_dtype=float_dtype)
+    must3r_features = _load_missing_must3r_features(
+        scene_batch,
+        must3r_adapter,
+        config,
+        device,
+        online_must3r=online_must3r,
+        float_dtype=float_dtype,
+    )
+    was_training = wrapper.training
+    wrapper.eval()
+    with torch.no_grad():
+        with _autocast(device, amp_enabled):
+            outputs = wrapper(scene_batch, must3r_features)
+    if was_training:
+        wrapper.train()
+    return save_training_visualization(
+        batch=scene_batch,
+        outputs=outputs,
+        step=step,
+        output_dir=output_dir,
+        max_frames=max_frames,
+        max_side=max_side,
+        fps=fps,
+        name_suffix="_full_scene",
+        video_frame_indices=list(range(int(scene_batch.images.shape[0]))),
+    )
 
 
 def run_training(
@@ -1438,6 +1583,7 @@ def run_training(
     visualize_every = int(
         visualize_every if visualize_every is not None else training_config.get("visualize_every", 0)
     )
+    visualization_full_video = bool(training_config.get("visualization_full_video", False))
     validate_every = int(training_config.get("validate_every", 0))
     resolved_visualization_dir = _resolve_visualization_dir(config, visualization_dir)
     visualization_max_frames = int(training_config.get("visualization_max_frames", 4))
@@ -1580,6 +1726,26 @@ def run_training(
             parts.append(f"visualization_summary={visualization.summary_path}")
             if visualization.video_path is not None:
                 parts.append(f"visualization_video={visualization.video_path}")
+            if visualization_full_video and batch.dataset == "shapenet":
+                full_scene_visualization = save_full_scene_training_visualization(
+                    dataset=dataset,
+                    batch=batch,
+                    wrapper=wrapper,
+                    must3r_adapter=must3r_adapter,
+                    config=config,
+                    device=device,
+                    online_must3r=online_enabled,
+                    float_dtype=training_float_dtype,
+                    amp_enabled=amp_enabled,
+                    step=step,
+                    output_dir=resolved_visualization_dir,
+                    max_frames=visualization_max_frames,
+                    max_side=visualization_max_side,
+                    fps=resolved_visualization_fps,
+                )
+                parts.append(f"visualization_full_scene_summary={full_scene_visualization.summary_path}")
+                if full_scene_visualization.video_path is not None:
+                    parts.append(f"visualization_full_scene_video={full_scene_visualization.video_path}")
             print(" ".join(parts))
         should_log = cuda_memory_debugger.enabled or (log_every > 0 and (step == 1 or step % log_every == 0))
         if should_log:

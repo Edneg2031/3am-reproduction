@@ -268,9 +268,11 @@ class TrainingBatch:
     sampling_mode: SamplingMode = "continuous"
     reference_frame_id: str = ""
     instance_id: int | None = None
+    binary_mode: bool | None = None
     object_visibility: torch.Tensor | None = None
     must3r_geometry: Must3rFeatureBundle | None = None
     target_source: str = "dataset_mask"
+    letterbox_transform: LetterboxTransform | None = None
 
     def to(self, device: torch.device | str, *, float_dtype: torch.dtype | None = None) -> "TrainingBatch":
         def move_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -1180,8 +1182,10 @@ class ThreeAMTrainingDataset:
             sampling_mode="fov" if overlap is not None and len(selected_indices) > 1 else "continuous",
             reference_frame_id=reference_frame_id,
             instance_id=instance_id,
+            binary_mode=binary_mode,
             object_visibility=has_object,
             must3r_geometry=must3r_features if isinstance(must3r_features, Must3rFeatureBundle) else None,
+            letterbox_transform=letterbox,
         )
 
     def _sample_strict_paper(self) -> TrainingBatch:
@@ -1284,8 +1288,10 @@ class ThreeAMTrainingDataset:
             sampling_mode=sampling_mode,
             reference_frame_id=reference_frame_id,
             instance_id=instance_id,
+            binary_mode=binary_mode,
             object_visibility=has_object,
             must3r_geometry=must3r_features if isinstance(must3r_features, Must3rFeatureBundle) else None,
+            letterbox_transform=letterbox,
         )
 
     def _select_strict_continuous_indices(self, num_frames: int, sequence_length: int) -> list[int]:

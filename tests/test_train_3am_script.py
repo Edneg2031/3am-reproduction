@@ -174,6 +174,83 @@ def _write_strict_training_fixture(tmp_path: Path) -> Path:
     return config_path
 
 
+def _write_shapenet_training_fixture(tmp_path: Path, *, num_frames: int = 5) -> Path:
+    scene_dir = tmp_path / "data" / "processed" / "shapenet_tracking" / "scene_a"
+    frames: list[FrameRecord] = []
+    for index in range(num_frames):
+        frame_id = f"{index:06d}"
+        image_path = scene_dir / "rgb" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        _write_image(image_path)
+        _write_mask(mask_path, full=False)
+        frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+    manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
+    write_manifest(manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(frames))])
+    feature_dir = tmp_path / "outputs" / "must3r_features" / "shapenet" / "scene_a"
+    feature_dir.mkdir(parents=True)
+    for frame in frames:
+        torch.save(torch.randn(2, 4, 4), feature_dir / f"{frame.frame_id}_level0.pt")
+    (feature_dir / "metadata.json").write_text(
+        '{"decoder_memory": false, "feature_specs": ["encoder"], "feature_channels": [2]}',
+        encoding="utf-8",
+    )
+    config = {
+        "project_root": str(tmp_path),
+        "paths": {"data_processed": "data/processed", "checkpoints": "outputs/checkpoints", "outputs": "outputs"},
+        "external": {
+            "sam2_checkpoint": "outputs/checkpoints/sam2.pt",
+            "sam2_config": "external/sam2.yaml",
+            "must3r_checkpoint": "outputs/checkpoints/must3r.pt",
+        },
+        "training": {
+            "datasets": ["shapenet"],
+            "strict_paper": True,
+            "iterations": 1,
+            "batch_size": 1,
+            "learning_rates": {"memory_attention": 1e-3, "mask_decoder": 1e-3, "feature_merger": 1e-3},
+            "memory_frames": 8,
+            "log_every": 1,
+            "checkpoint_every": 0,
+            "save_model_every": 0,
+            "amp": False,
+            "checkpoint_out": "outputs/checkpoints/final.pt",
+            "visualize_every": 1,
+            "visualization_full_video": True,
+            "visualization_max_frames": 4,
+            "visualization_max_side": 64,
+            "visualization_fps": 6,
+        },
+        "datasets": {
+            "shapenet": {
+                "manifest": "data/processed/shapenet_manifest.json",
+                "fov_sampling_probability": 0.0,
+                "sequence_length_min": 2,
+                "sequence_length_max": 2,
+                "dynamic_resize": {"enabled": False},
+                "prompt_mask_augment": {"enabled": False},
+            }
+        },
+        "sampling": {"sequence_length": 2, "fov_threshold": 0.25},
+        "features": {
+            "cache_root": "outputs/must3r_features",
+            "online": False,
+            "require_decoder_memory": False,
+            "feature_layers": "encoder",
+        },
+        "model": {
+            "sam_image_size": 32,
+            "sam_channels": 4,
+            "must3r_channels": [2],
+            "hidden_channels": 4,
+            "geometry_channels": 4,
+            "attention_heads": 2,
+        },
+    }
+    config_path = tmp_path / "shapenet_config.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    return config_path
+
+
 def test_training_script_runs_with_fake_adapter_and_resumes(tmp_path: Path) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path)
@@ -411,6 +488,43 @@ def test_training_script_writes_visualization_png_and_mp4(tmp_path: Path, monkey
     with Image.open(png_files[0]) as image:
         assert image.size[0] >= 720
         assert image.size[1] > 58
+
+
+def test_training_script_writes_full_scene_visualization_video_for_shapenet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_shapenet_training_fixture(tmp_path, num_frames=5)
+    visualization_dir = tmp_path / "outputs" / "visualizations" / "train"
+    monkeypatch.setattr(train_3am.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    video_frame_counts: dict[str, int] = {}
+
+    def _fake_run(command, check):
+        pattern = Path(command[command.index("-i") + 1])
+        video_frame_counts[Path(command[-1]).name] = len(list(pattern.parent.glob("*.png")))
+        Path(command[-1]).write_bytes(b"fake mp4")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(train_3am.subprocess, "run", _fake_run)
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        sam2_adapter=FakeSam2Adapter(),
+    )
+    captured = capsys.readouterr()
+
+    batch_mp4 = visualization_dir / "step_0000001_shapenet_scene_a.mp4"
+    full_scene_mp4 = visualization_dir / "step_0000001_shapenet_scene_a_full_scene.mp4"
+    full_scene_png = visualization_dir / "step_0000001_shapenet_scene_a_full_scene.png"
+    assert step == 1
+    assert batch_mp4.exists()
+    assert full_scene_mp4.exists()
+    assert full_scene_png.exists()
+    assert video_frame_counts[batch_mp4.name] == 2
+    assert video_frame_counts[full_scene_mp4.name] == 5
+    assert "visualization_full_scene_video=" in captured.out
 
 
 def test_training_visualization_header_lines_include_tracking_context() -> None:
