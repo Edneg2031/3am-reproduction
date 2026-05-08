@@ -5,12 +5,15 @@ import argparse
 import importlib.util
 import json
 import random
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -60,6 +63,11 @@ class ThreeAMTrainingWrapper(nn.Module):
             raise ValueError(f"SAM2 features must have shape TCHW, got {tuple(sam_features.shape)}")
         merged_features = self.core.forward_features(sam_features, must3r_features)
         return self.sam2_adapter.forward_train_sequence(batch, merged_features)
+
+
+class TrainingVisualizationArtifact(NamedTuple):
+    summary_path: Path
+    video_path: Path | None = None
 
 
 def build_core(config: dict[str, Any]) -> ThreeAMCore:
@@ -235,6 +243,7 @@ def dry_run(
             ),
             "visualization_max_frames": int(config.get("training", {}).get("visualization_max_frames", 4)),
             "visualization_max_side": int(config.get("training", {}).get("visualization_max_side", 384)),
+            "visualization_fps": int(config.get("training", {}).get("visualization_fps", 6)),
         },
         "checkpoints": {
             "checkpoint_out": str(resolve_project_path(config, training.get("checkpoint_out"))),
@@ -1058,6 +1067,18 @@ def _visualization_frame_order(num_frames: int, reference_index: int, max_frames
     return order[:limit]
 
 
+def _visualization_video_frame_order(num_frames: int, reference_index: int, max_frames: int) -> list[int]:
+    if num_frames <= 0:
+        return []
+    reference_index = min(max(reference_index, 0), num_frames - 1)
+    limit = min(num_frames, max(1, max_frames))
+    if limit >= num_frames:
+        return list(range(num_frames))
+    start = reference_index - limit // 2
+    start = max(0, min(start, num_frames - limit))
+    return list(range(start, start + limit))
+
+
 def _resize_for_visualization(image: Image.Image, max_side: int) -> Image.Image:
     if max_side <= 0:
         return image
@@ -1075,6 +1096,139 @@ def _bbox_text(mask: np.ndarray) -> str:
     return f"bbox=({bbox[0]},{bbox[1]})-({bbox[2]},{bbox[3]})"
 
 
+def _visualization_stem(*, batch: TrainingBatch, step: int) -> str:
+    safe_scene = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in batch.scene_id)
+    return f"step_{step:07d}_{batch.dataset}_{safe_scene}"
+
+
+def _build_training_visualization_row(
+    *,
+    batch: TrainingBatch,
+    images: torch.Tensor,
+    probabilities: torch.Tensor,
+    target_masks: torch.Tensor,
+    ious: torch.Tensor,
+    has_object: torch.Tensor,
+    frame_index: int,
+    reference_index: int,
+    max_side: int,
+) -> Image.Image:
+    base = _tensor_image_to_uint8(images[frame_index])
+    target_bool = _mask_bool(target_masks[frame_index], threshold=0.5)
+    pred_bool = _mask_bool(probabilities[frame_index], threshold=0.5)
+    image_panel = _draw_mask_contour(Image.fromarray(base), target_bool, (0, 255, 80))
+    image_panel = _draw_mask_contour(image_panel, pred_bool, (255, 60, 40))
+    image_panel = _draw_prompt_points(image_panel, batch.prompt, frame_index)
+    gt_panel = _binary_mask_panel(target_bool, color=(0, 220, 80))
+    pred_panel = _binary_mask_panel(pred_bool, color=(255, 60, 40))
+    compare_panel = _comparison_panel(base, target_bool, pred_bool)
+    error_panel = _error_panel(target_bool, pred_bool)
+    heatmap_panel = _heatmap_panel(probabilities[frame_index])
+    panels = [
+        _resize_for_visualization(image_panel, max_side),
+        _resize_for_visualization(gt_panel, max_side),
+        _resize_for_visualization(pred_panel, max_side),
+        _resize_for_visualization(compare_panel, max_side),
+        _resize_for_visualization(error_panel, max_side),
+        _resize_for_visualization(heatmap_panel, max_side),
+    ]
+    row_width = sum(panel.width for panel in panels)
+    row_height = max(panel.height for panel in panels)
+    label_height = 54
+    row = Image.new("RGB", (row_width, row_height + label_height), (24, 24, 24))
+    draw = ImageDraw.Draw(row)
+    frame_id = batch.frame_ids[frame_index]
+    is_reference = frame_index == reference_index
+    visibility = "visible GT" if bool(has_object[frame_index]) else "absent GT"
+    frame_label = f"image | frame {frame_id}"
+    if is_reference:
+        frame_label = f"image | REF/PROMPT {batch.prompt.type} {frame_id}"
+    gt_area = _mask_area(target_bool)
+    pred_area = _mask_area(pred_bool)
+    overlap_area = _mask_area(target_bool & pred_bool)
+    fp_area = _mask_area(~target_bool & pred_bool)
+    fn_area = _mask_area(target_bool & ~pred_bool)
+    labels = [
+        frame_label,
+        "GT binary",
+        "SAM2/3AM prediction",
+        "GT green + Pred red",
+        "error map",
+        "prediction confidence",
+    ]
+    sublabels = [
+        f"IoU={ious[frame_index].item():.3f} | {visibility}",
+        f"GT area={gt_area} | {_bbox_text(target_bool)}",
+        f"Pred area={pred_area} | {_bbox_text(pred_bool)}",
+        f"overlap={overlap_area} fp={fp_area} fn={fn_area}",
+        f"yellow=ok green=missed red=extra",
+        f"red=high blue=low",
+    ]
+    x = 0
+    for panel, label, sublabel in zip(panels, labels, sublabels, strict=True):
+        row.paste(panel, (x, label_height))
+        fill = (255, 236, 120) if is_reference and "REF/PROMPT" in label else (235, 235, 235)
+        draw.text((x + 4, 4), label, fill=fill)
+        draw.text((x + 4, 20), sublabel[:56], fill=(205, 205, 205))
+        if label.startswith("image"):
+            prompt_note = " prompt point=blue" if batch.prompt.type == "point" and is_reference else ""
+            draw.text((x + 4, 36), f"contours: GT=green Pred=red{prompt_note}"[:64], fill=(170, 210, 170))
+        x += panel.width
+    return row
+
+
+def _render_training_visualization_canvas(header_lines: Sequence[str], rows: Sequence[Image.Image]) -> Image.Image:
+    if not rows:
+        raise ValueError("training visualization requires at least one row")
+    canvas_width = max(720, *(row.width for row in rows))
+    header_height = max(58, 10 + len(header_lines) * 16)
+    canvas_height = header_height + sum(row.height for row in rows)
+    canvas = Image.new("RGB", (canvas_width, canvas_height), (24, 24, 24))
+    draw = ImageDraw.Draw(canvas)
+    for line_index, line in enumerate(header_lines):
+        fill = (255, 105, 80) if line.startswith("[WARN]") else (235, 235, 235)
+        draw.text((8, 6 + line_index * 16), line[:180], fill=fill)
+    y = 0
+    for row in rows:
+        canvas.paste(row, (0, header_height + y))
+        y += row.height
+    return canvas
+
+
+def _write_training_visualization_video(frames: Sequence[Image.Image], output_path: Path, *, fps: int) -> Path | None:
+    if not frames:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print("[WARN] ffmpeg is unavailable; skipping training visualization video export", flush=True)
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="three_am_viz_") as temp_dir:
+        temp_root = Path(temp_dir)
+        for frame_index, frame in enumerate(frames):
+            frame.save(temp_root / f"{frame_index:06d}.png")
+        command = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(max(1, fps)),
+            "-i",
+            str(temp_root / "%06d.png"),
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError as error:
+            print(f"[WARN] ffmpeg failed to write training visualization video {output_path}: {error}", flush=True)
+            return None
+    return output_path
+
+
 def save_training_visualization(
     *,
     batch: TrainingBatch,
@@ -1083,7 +1237,8 @@ def save_training_visualization(
     output_dir: Path,
     max_frames: int = 4,
     max_side: int = 384,
-) -> Path:
+    fps: int = 6,
+) -> TrainingVisualizationArtifact:
     output_dir.mkdir(parents=True, exist_ok=True)
     images = batch.images.detach()
     target_masks = batch.target_masks.detach()
@@ -1091,7 +1246,8 @@ def save_training_visualization(
     probabilities = logits.sigmoid()
     num_frames = int(images.shape[0])
     reference_index = min(max(int(batch.prompt.frame_index), 0), max(num_frames - 1, 0))
-    frame_order = _visualization_frame_order(num_frames, reference_index, max_frames)
+    summary_order = _visualization_frame_order(num_frames, reference_index, max_frames)
+    video_order = _visualization_video_frame_order(num_frames, reference_index, max_frames)
     diagnostics = _visualization_diagnostics(
         probabilities,
         target_masks,
@@ -1100,71 +1256,21 @@ def save_training_visualization(
     )
     ious = diagnostics["ious"]
     has_object = batch.has_object.detach().cpu().bool()
-    rows: list[Image.Image] = []
-    for frame_index in frame_order:
-        base = _tensor_image_to_uint8(images[frame_index])
-        target_bool = _mask_bool(target_masks[frame_index], threshold=0.5)
-        pred_bool = _mask_bool(probabilities[frame_index], threshold=0.5)
-        image_panel = _draw_mask_contour(Image.fromarray(base), target_bool, (0, 255, 80))
-        image_panel = _draw_mask_contour(image_panel, pred_bool, (255, 60, 40))
-        image_panel = _draw_prompt_points(image_panel, batch.prompt, frame_index)
-        gt_panel = _binary_mask_panel(target_bool, color=(0, 220, 80))
-        pred_panel = _binary_mask_panel(pred_bool, color=(255, 60, 40))
-        compare_panel = _comparison_panel(base, target_bool, pred_bool)
-        error_panel = _error_panel(target_bool, pred_bool)
-        heatmap_panel = _heatmap_panel(probabilities[frame_index])
-        panels = [
-            _resize_for_visualization(image_panel, max_side),
-            _resize_for_visualization(gt_panel, max_side),
-            _resize_for_visualization(pred_panel, max_side),
-            _resize_for_visualization(compare_panel, max_side),
-            _resize_for_visualization(error_panel, max_side),
-            _resize_for_visualization(heatmap_panel, max_side),
-        ]
-        row_width = sum(panel.width for panel in panels)
-        row_height = max(panel.height for panel in panels)
-        label_height = 54
-        row = Image.new("RGB", (row_width, row_height + label_height), (24, 24, 24))
-        draw = ImageDraw.Draw(row)
-        frame_id = batch.frame_ids[frame_index]
-        is_reference = frame_index == reference_index
-        visibility = "visible GT" if bool(has_object[frame_index]) else "absent GT"
-        frame_label = f"image | frame {frame_id}"
-        if is_reference:
-            frame_label = f"image | REF/PROMPT {batch.prompt.type} {frame_id}"
-        gt_area = _mask_area(target_bool)
-        pred_area = _mask_area(pred_bool)
-        overlap_area = _mask_area(target_bool & pred_bool)
-        fp_area = _mask_area(~target_bool & pred_bool)
-        fn_area = _mask_area(target_bool & ~pred_bool)
-        labels = [
-            frame_label,
-            "GT binary",
-            "SAM2/3AM prediction",
-            "GT green + Pred red",
-            "error map",
-            "prediction confidence",
-        ]
-        sublabels = [
-            f"IoU={ious[frame_index].item():.3f} | {visibility}",
-            f"GT area={gt_area} | {_bbox_text(target_bool)}",
-            f"Pred area={pred_area} | {_bbox_text(pred_bool)}",
-            f"overlap={overlap_area} fp={fp_area} fn={fn_area}",
-            f"yellow=ok green=missed red=extra",
-            f"red=high blue=low",
-        ]
-        x = 0
-        for panel, label, sublabel in zip(panels, labels, sublabels, strict=True):
-            row.paste(panel, (x, label_height))
-            fill = (255, 236, 120) if is_reference and "REF/PROMPT" in label else (235, 235, 235)
-            draw.text((x + 4, 4), label, fill=fill)
-            draw.text((x + 4, 20), sublabel[:56], fill=(205, 205, 205))
-            if label.startswith("image"):
-                prompt_note = " prompt point=blue" if batch.prompt.type == "point" and is_reference else ""
-                draw.text((x + 4, 36), f"contours: GT=green Pred=red{prompt_note}"[:64], fill=(170, 210, 170))
-            x += panel.width
-        rows.append(row)
-    canvas_width = max(720, *(row.width for row in rows))
+    selected_indices = sorted(set(summary_order) | set(video_order))
+    rows = {
+        frame_index: _build_training_visualization_row(
+            batch=batch,
+            images=images,
+            probabilities=probabilities,
+            target_masks=target_masks,
+            ious=ious,
+            has_object=has_object,
+            frame_index=frame_index,
+            reference_index=reference_index,
+            max_side=max_side,
+        )
+        for frame_index in selected_indices
+    }
     reference_frame = batch.frame_ids[reference_index] if 0 <= reference_index < len(batch.frame_ids) else str(reference_index)
     header_lines = _training_visualization_header_lines(
         step=step,
@@ -1187,21 +1293,16 @@ def save_training_visualization(
         sampling_mode=batch.sampling_mode,
         target_source=batch.target_source,
     )
-    header_height = max(58, 10 + len(header_lines) * 16)
-    canvas_height = header_height + sum(row.height for row in rows)
-    canvas = Image.new("RGB", (canvas_width, canvas_height), (24, 24, 24))
-    draw = ImageDraw.Draw(canvas)
-    for line_index, line in enumerate(header_lines):
-        fill = (255, 105, 80) if line.startswith("[WARN]") else (235, 235, 235)
-        draw.text((8, 6 + line_index * 16), line[:180], fill=fill)
-    y = 0
-    for row in rows:
-        canvas.paste(row, (0, header_height + y))
-        y += row.height
-    safe_scene = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in batch.scene_id)
-    path = output_dir / f"step_{step:07d}_{batch.dataset}_{safe_scene}.png"
-    canvas.save(path)
-    return path
+    summary_path = output_dir / f"{_visualization_stem(batch=batch, step=step)}.png"
+    summary_canvas = _render_training_visualization_canvas(header_lines, [rows[index] for index in summary_order])
+    summary_canvas.save(summary_path)
+    video_frames = [_render_training_visualization_canvas(header_lines, [rows[index]]) for index in video_order]
+    video_path = _write_training_visualization_video(
+        video_frames,
+        output_dir / f"{_visualization_stem(batch=batch, step=step)}.mp4",
+        fps=max(1, fps),
+    )
+    return TrainingVisualizationArtifact(summary_path=summary_path, video_path=video_path)
 
 
 def run_training(
@@ -1215,6 +1316,7 @@ def run_training(
     checkpoint_every: int | None = None,
     visualize_every: int | None = None,
     visualization_dir: str | Path | None = None,
+    visualization_fps: int | None = None,
     save_model_every: int | None = None,
     model_out: str | Path | None = None,
     auto_resume: bool = False,
@@ -1251,6 +1353,9 @@ def run_training(
     resolved_visualization_dir = _resolve_visualization_dir(config, visualization_dir)
     visualization_max_frames = int(training_config.get("visualization_max_frames", 4))
     visualization_max_side = int(training_config.get("visualization_max_side", 384))
+    resolved_visualization_fps = int(
+        visualization_fps if visualization_fps is not None else training_config.get("visualization_fps", 6)
+    )
     device = _device(device_name)
     dataset = ThreeAMTrainingDataset.from_config(
         config,
@@ -1365,15 +1470,20 @@ def run_training(
         scaler.update()
         last_step = step
         if visualize_every > 0 and (step == 1 or step % visualize_every == 0):
-            visualization_path = save_training_visualization(
+            visualization = save_training_visualization(
                 batch=batch,
                 outputs=outputs,
                 step=step,
                 output_dir=resolved_visualization_dir,
                 max_frames=visualization_max_frames,
                 max_side=visualization_max_side,
+                fps=resolved_visualization_fps,
             )
-            print(f"visualization={visualization_path}")
+            parts = [f"visualization={visualization.video_path or visualization.summary_path}"]
+            parts.append(f"visualization_summary={visualization.summary_path}")
+            if visualization.video_path is not None:
+                parts.append(f"visualization_video={visualization.video_path}")
+            print(" ".join(parts))
         if log_every > 0 and (step == 1 or step % log_every == 0):
             items = loss.detached_items()
             elapsed = max(time.time() - started, 1e-6)
@@ -1482,6 +1592,7 @@ def main() -> None:
     parser.add_argument("--auto-resume", action="store_true")
     parser.add_argument("--visualize-every", type=int, default=None)
     parser.add_argument("--visualization-dir", default=None)
+    parser.add_argument("--visualization-fps", type=int, default=None)
     strict_group = parser.add_mutually_exclusive_group()
     strict_group.add_argument("--strict-paper", action="store_true", dest="strict_paper", default=None)
     strict_group.add_argument("--no-strict-paper", action="store_false", dest="strict_paper")
@@ -1517,6 +1628,7 @@ def main() -> None:
         auto_resume=args.auto_resume,
         visualize_every=args.visualize_every,
         visualization_dir=args.visualization_dir,
+        visualization_fps=args.visualization_fps,
         dry_run_only=args.dry_run,
         online_must3r=args.online_must3r,
         strict_paper=args.strict_paper,

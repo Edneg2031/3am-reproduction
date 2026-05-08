@@ -110,6 +110,7 @@ training:
   visualization_dir: outputs/visualizations/train
   visualization_max_frames: 4
   visualization_max_side: 384
+  visualization_fps: 6
   sam2_point_pseudo_masks:
     mode: off
     datasets: [scannetpp]

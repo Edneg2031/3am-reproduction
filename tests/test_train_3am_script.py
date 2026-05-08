@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -379,10 +380,17 @@ def test_strict_training_script_runs_with_bundle_and_validation(tmp_path: Path, 
     assert "validation_step=1" in captured.out
 
 
-def test_training_script_writes_visualization_png(tmp_path: Path) -> None:
+def test_training_script_writes_visualization_png_and_mp4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path)
     visualization_dir = tmp_path / "outputs" / "visualizations" / "train"
+    monkeypatch.setattr(train_3am.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+
+    def _fake_run(command, check):
+        Path(command[-1]).write_bytes(b"fake mp4")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(train_3am.subprocess, "run", _fake_run)
 
     step = train_3am.run_training(
         str(config_path),
@@ -390,13 +398,17 @@ def test_training_script_writes_visualization_png(tmp_path: Path) -> None:
         device_name="cpu",
         visualize_every=1,
         visualization_dir=visualization_dir,
+        visualization_fps=6,
         sam2_adapter=FakeSam2Adapter(),
     )
 
-    files = sorted(visualization_dir.glob("step_*.png"))
+    png_files = sorted(visualization_dir.glob("step_*.png"))
+    mp4_files = sorted(visualization_dir.glob("step_*.mp4"))
     assert step == 1
-    assert len(files) == 1
-    with Image.open(files[0]) as image:
+    assert len(png_files) == 1
+    assert len(mp4_files) == 1
+    assert mp4_files[0].read_bytes() == b"fake mp4"
+    with Image.open(png_files[0]) as image:
         assert image.size[0] >= 720
         assert image.size[1] > 58
 
@@ -480,6 +492,14 @@ def test_training_visualization_frame_order_starts_from_reference() -> None:
 
     assert train_3am._visualization_frame_order(5, 2, 4) == [2, 3, 4, 1]
     assert train_3am._visualization_frame_order(3, 99, 3) == [2, 1, 0]
+
+
+def test_training_visualization_video_frame_order_is_contiguous() -> None:
+    train_3am = _load_train_module()
+
+    assert train_3am._visualization_video_frame_order(5, 2, 4) == [0, 1, 2, 3]
+    assert train_3am._visualization_video_frame_order(8, 6, 4) == [4, 5, 6, 7]
+    assert train_3am._visualization_video_frame_order(3, 99, 8) == [0, 1, 2]
 
 
 def test_training_loss_differentiability_check_reports_batch_context() -> None:
