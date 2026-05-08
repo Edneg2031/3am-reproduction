@@ -312,6 +312,7 @@ def dry_run(
                 _resolve_visualization_dir(config, config.get("training", {}).get("visualization_dir"))
             ),
             "visualization_full_video": bool(config.get("training", {}).get("visualization_full_video", False)),
+            "visualization_chunk_size": int(config.get("training", {}).get("visualization_chunk_size", 32)),
             "visualization_max_frames": int(config.get("training", {}).get("visualization_max_frames", 4)),
             "visualization_max_side": int(config.get("training", {}).get("visualization_max_side", 384)),
             "visualization_fps": int(config.get("training", {}).get("visualization_fps", 6)),
@@ -1323,6 +1324,48 @@ def _write_training_visualization_video(frames: Sequence[Image.Image], output_pa
     return output_path
 
 
+def _write_training_visualization_video_from_rows(
+    header_lines: Sequence[str],
+    row_paths: Sequence[Path],
+    output_path: Path,
+    *,
+    fps: int,
+) -> Path | None:
+    if not row_paths:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print("[WARN] ffmpeg is unavailable; skipping training visualization video export", flush=True)
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="three_am_viz_") as temp_dir:
+        temp_root = Path(temp_dir)
+        for frame_index, row_path in enumerate(row_paths):
+            with Image.open(row_path) as row_image:
+                canvas = _render_training_visualization_canvas(header_lines, [row_image.copy()])
+            canvas.save(temp_root / f"{frame_index:06d}.png")
+        command = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(max(1, fps)),
+            "-i",
+            str(temp_root / "%06d.png"),
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
+        ]
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError as error:
+            print(f"[WARN] ffmpeg failed to write training visualization video {output_path}: {error}", flush=True)
+            return None
+    return output_path
+
+
 def _clone_prompt_to_cpu(prompt: Prompt, *, frame_index: int) -> Prompt:
     return Prompt(
         type=prompt.type,
@@ -1349,7 +1392,10 @@ def _scene_for_visualization(dataset: ThreeAMTrainingDataset, batch: TrainingBat
     raise ValueError(f"Could not find scene record for {batch.dataset}/{batch.scene_id}")
 
 
-def _build_full_scene_visualization_batch(dataset: ThreeAMTrainingDataset, batch: TrainingBatch) -> TrainingBatch:
+def _visualization_scene_components(
+    dataset: ThreeAMTrainingDataset,
+    batch: TrainingBatch,
+) -> tuple[Any, LetterboxTransform, list[Any], tuple[int, ...], bool, int | None, int]:
     scene = _scene_for_visualization(dataset, batch)
     letterbox = batch.letterbox_transform
     if letterbox is None:
@@ -1370,7 +1416,27 @@ def _build_full_scene_visualization_batch(dataset: ThreeAMTrainingDataset, batch
             f"Reference frame {reference_frame_id!r} is not present in scene {scene.dataset}/{scene.scene_id}"
         )
     ignore_values = tuple(int(value) for value in dataset.config.get("datasets", {}).get(scene.dataset, {}).get("mask_ignore_values", ()))
-    raw_images = [load_image_tensor(frame.image_path, None) for frame in frames]
+    binary_mode = bool(batch.binary_mode) if batch.binary_mode is not None else scene.dataset == "shapenet"
+    instance_id = 1 if binary_mode else batch.instance_id
+    return scene, letterbox, frames, ignore_values, binary_mode, instance_id, reference_index
+
+
+def _build_visualization_scene_batch(
+    *,
+    scene: Any,
+    frames: Sequence[Any],
+    selected_indices: Sequence[int],
+    letterbox: LetterboxTransform,
+    ignore_values: Sequence[int],
+    instance_id: int | None,
+    binary_mode: bool,
+    prompt: Prompt,
+    target_source: str,
+) -> TrainingBatch:
+    selected_frames = [frames[index] for index in selected_indices]
+    if not selected_frames:
+        raise ValueError("Visualization chunk requires at least one frame")
+    raw_images = [load_image_tensor(frame.image_path, None) for frame in selected_frames]
     source_shape = tuple(raw_images[0].shape[-2:])
     if (letterbox.source_height, letterbox.source_width) != source_shape:
         raise ValueError(
@@ -1378,33 +1444,29 @@ def _build_full_scene_visualization_batch(dataset: ThreeAMTrainingDataset, batch
             f"scene has {source_shape}, transform expects {(letterbox.source_height, letterbox.source_width)}"
         )
     images = torch.stack([letterbox.resize_image(image) for image in raw_images], dim=0)
-    raw_masks = [load_mask_array(frame.mask_path, source_shape, ignore_values=ignore_values) for frame in frames]
-    binary_mode = bool(batch.binary_mode) if batch.binary_mode is not None else scene.dataset == "shapenet"
-    instance_id = 1 if binary_mode else batch.instance_id
+    raw_masks = [load_mask_array(frame.mask_path, source_shape, ignore_values=tuple(ignore_values)) for frame in selected_frames]
     target_masks = torch.stack(
         [letterbox.resize_mask(_target_mask_for_visualization(mask, instance_id=instance_id, binary_mode=binary_mode)) for mask in raw_masks],
         dim=0,
     )
     has_object = target_masks.flatten(1).any(dim=1)
-    prompt = _clone_prompt_to_cpu(batch.prompt, frame_index=reference_index)
-    must3r_features = dataset.feature_cache.load(scene, frames) if dataset.load_feature_cache else None
     return TrainingBatch(
         images=images,
         target_masks=target_masks,
         prompt=prompt,
-        must3r_features=must3r_features,
+        must3r_features=None,
         dataset=scene.dataset,
         scene_id=scene.scene_id,
-        frame_ids=tuple(frame.frame_id for frame in frames),
-        image_paths=tuple(frame.image_path for frame in frames),
+        frame_ids=tuple(frame.frame_id for frame in selected_frames),
+        image_paths=tuple(frame.image_path for frame in selected_frames),
         has_object=has_object,
         sampling_mode="full_scene",
-        reference_frame_id=reference_frame_id,
-        instance_id=batch.instance_id,
+        reference_frame_id=selected_frames[min(max(int(prompt.frame_index), 0), len(selected_frames) - 1)].frame_id,
+        instance_id=None if binary_mode else instance_id,
         binary_mode=binary_mode,
         object_visibility=has_object,
-        must3r_geometry=must3r_features if isinstance(must3r_features, Must3rFeatureBundle) else None,
-        target_source=batch.target_source,
+        must3r_geometry=None,
+        target_source=target_source,
         letterbox_transform=letterbox,
     )
 
@@ -1494,6 +1556,77 @@ def save_training_visualization(
     return TrainingVisualizationArtifact(summary_path=summary_path, video_path=video_path)
 
 
+def _diagnostics_from_frame_statistics(
+    *,
+    ious: Sequence[float],
+    target_areas: Sequence[int],
+    prediction_areas: Sequence[int],
+    has_object_flags: Sequence[bool],
+    reference_index: int,
+) -> dict[str, Any]:
+    ious_tensor = torch.tensor(list(ious), dtype=torch.float32)
+    target_areas_tensor = torch.tensor(list(target_areas), dtype=torch.int64)
+    prediction_areas_tensor = torch.tensor(list(prediction_areas), dtype=torch.int64)
+    visible = torch.tensor(list(has_object_flags), dtype=torch.bool)
+    if visible.numel() != ious_tensor.numel():
+        raise ValueError("Frame statistics must have matching lengths")
+    non_ref = torch.ones_like(visible, dtype=torch.bool)
+    if non_ref.numel():
+        reference_index = min(max(int(reference_index), 0), non_ref.numel() - 1)
+        non_ref[reference_index] = False
+    visible_non_ref = visible & non_ref
+    empty_empty = (target_areas_tensor == 0) & (prediction_areas_tensor == 0)
+    warnings: list[str] = []
+    if int(visible.sum().item()) == 0:
+        warnings.append("[WARN] all target masks are empty; batch_iou_empty_is_one can be 1.000 without tracking signal")
+    elif not bool(visible[reference_index]):
+        warnings.append("[WARN] reference/prompt mask is empty")
+    if not bool(visible_non_ref.any()):
+        warnings.append("[WARN] no non-reference visible target frames in visualization")
+    return {
+        "ious": ious_tensor,
+        "batch_iou_empty_is_one": float(ious_tensor.mean().item()) if ious_tensor.numel() else None,
+        "visible_iou": float(ious_tensor[visible].mean().item()) if bool(visible.any()) else None,
+        "non_ref_visible_iou": float(ious_tensor[visible_non_ref].mean().item()) if bool(visible_non_ref.any()) else None,
+        "ref_iou": float(ious_tensor[reference_index].item()) if ious_tensor.numel() else None,
+        "tracking_recall": float(((ious_tensor > 0.0) & visible).float().sum().item() / visible.float().sum().item())
+        if bool(visible.any())
+        else None,
+        "visible_frames": int(visible.sum().item()),
+        "empty_empty_frames": int(empty_empty.sum().item()),
+        "target_areas": [int(value) for value in target_areas_tensor.tolist()],
+        "prediction_areas": [int(value) for value in prediction_areas_tensor.tolist()],
+        "has_object_flags": [bool(value) for value in visible.tolist()],
+        "warnings": warnings,
+    }
+
+
+def _chunk_visualization_ranges_forward(reference_index: int, num_frames: int, chunk_size: int) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    start = int(reference_index)
+    while start < num_frames:
+        end = min(num_frames, start + chunk_size)
+        ranges.append((start, end))
+        if end >= num_frames:
+            break
+        start = end - 1
+    return ranges
+
+
+def _chunk_visualization_ranges_backward(reference_index: int, chunk_size: int) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    end = int(reference_index) + 1
+    while end > 0:
+        start = max(0, end - chunk_size)
+        ranges.append((start, end))
+        if start == 0:
+            break
+        end = start + 1
+    return ranges
+
+
+def _global_row_path(temp_dir: Path, global_index: int) -> Path:
+    return temp_dir / f"row_{global_index:06d}.png"
 def save_full_scene_training_visualization(
     *,
     dataset: ThreeAMTrainingDataset,
@@ -1510,34 +1643,169 @@ def save_full_scene_training_visualization(
     max_frames: int = 4,
     max_side: int = 384,
     fps: int = 6,
+    chunk_size: int = 32,
 ) -> TrainingVisualizationArtifact:
-    scene_batch = _build_full_scene_visualization_batch(dataset, batch).to(device, float_dtype=float_dtype)
-    must3r_features = _load_missing_must3r_features(
-        scene_batch,
-        must3r_adapter,
-        config,
-        device,
-        online_must3r=online_must3r,
-        float_dtype=float_dtype,
+    scene, letterbox, frames, ignore_values, binary_mode, instance_id, reference_index = _visualization_scene_components(
+        dataset,
+        batch,
     )
+    chunk_size = max(2, int(chunk_size))
+    total_frames = len(frames)
+    summary_order = _visualization_frame_order(total_frames, reference_index, max_frames)
+    row_metrics_size = total_frames
+    ious_by_index: list[float | None] = [None] * row_metrics_size
+    target_areas_by_index: list[int | None] = [None] * row_metrics_size
+    prediction_areas_by_index: list[int | None] = [None] * row_metrics_size
+    has_object_by_index: list[bool | None] = [None] * row_metrics_size
+    original_prompt = _clone_prompt_to_cpu(batch.prompt, frame_index=reference_index)
     was_training = wrapper.training
     wrapper.eval()
-    with torch.no_grad():
-        with _autocast(device, amp_enabled):
-            outputs = wrapper(scene_batch, must3r_features)
+    with tempfile.TemporaryDirectory(prefix="three_am_full_scene_rows_") as temp_dir:
+        row_dir = Path(temp_dir)
+
+        def run_chunk(global_indices: list[int], prompt_mask: torch.Tensor, *, local_reference_index: int) -> torch.Tensor:
+            chunk_prompt = Prompt(type="mask", frame_index=local_reference_index, mask=prompt_mask.detach().cpu().clone())
+            chunk_batch_cpu = _build_visualization_scene_batch(
+                scene=scene,
+                frames=frames,
+                selected_indices=global_indices,
+                letterbox=letterbox,
+                ignore_values=ignore_values,
+                instance_id=instance_id,
+                binary_mode=binary_mode,
+                prompt=chunk_prompt,
+                target_source=batch.target_source,
+            )
+            if dataset.load_feature_cache:
+                selected_frames = [frames[index] for index in global_indices]
+                chunk_features = dataset.feature_cache.load(scene, selected_frames)
+                chunk_batch_cpu = replace(
+                    chunk_batch_cpu,
+                    must3r_features=chunk_features,
+                    must3r_geometry=chunk_features if isinstance(chunk_features, Must3rFeatureBundle) else None,
+                )
+            if global_indices[local_reference_index] == reference_index:
+                render_prompt = _clone_prompt_to_cpu(original_prompt, frame_index=local_reference_index)
+                render_reference_index = local_reference_index
+            else:
+                render_prompt = Prompt(type=chunk_prompt.type, frame_index=-1, mask=chunk_prompt.mask)
+                render_reference_index = -1
+            render_batch = replace(chunk_batch_cpu, prompt=render_prompt)
+            chunk_batch = chunk_batch_cpu.to(device, float_dtype=float_dtype)
+            must3r_features = _load_missing_must3r_features(
+                chunk_batch,
+                must3r_adapter,
+                config,
+                device,
+                online_must3r=online_must3r,
+                float_dtype=float_dtype,
+            )
+            with torch.no_grad():
+                with _autocast(device, amp_enabled):
+                    outputs = wrapper(chunk_batch, must3r_features)
+            probabilities = _mask_logits_for_visualization(
+                outputs["mask_logits"].detach(),
+                tuple(chunk_batch.target_masks.shape[-2:]),
+            ).sigmoid().cpu()
+            diagnostics = _visualization_diagnostics(
+                probabilities,
+                chunk_batch.target_masks.detach().cpu(),
+                has_object=chunk_batch.has_object.detach().cpu(),
+                reference_index=local_reference_index if render_reference_index >= 0 else 0,
+            )
+            local_ious = diagnostics["ious"].cpu()
+            local_targets = chunk_batch.target_masks.detach().cpu()
+            local_visible = chunk_batch.has_object.detach().cpu().bool()
+            thresholded = probabilities >= 0.5
+            target_areas = local_targets.flatten(1).sum(dim=1).to(dtype=torch.int64)
+            prediction_areas = thresholded.flatten(1).sum(dim=1).to(dtype=torch.int64)
+            for local_index, global_index in enumerate(global_indices):
+                row = _build_training_visualization_row(
+                    batch=render_batch,
+                    images=chunk_batch.images.detach().cpu(),
+                    probabilities=probabilities,
+                    target_masks=local_targets,
+                    ious=local_ious,
+                    has_object=local_visible,
+                    frame_index=local_index,
+                    reference_index=render_reference_index,
+                    max_side=max_side,
+                )
+                row.save(_global_row_path(row_dir, global_index))
+                ious_by_index[global_index] = float(local_ious[local_index].item())
+                target_areas_by_index[global_index] = int(target_areas[local_index].item())
+                prediction_areas_by_index[global_index] = int(prediction_areas[local_index].item())
+                has_object_by_index[global_index] = bool(local_visible[local_index].item())
+            return thresholded.float()
+
+        prompt_mask = original_prompt.mask
+        if prompt_mask is None:
+            raise ValueError("Full-scene ShapeNet visualization currently requires a mask prompt")
+        for start, end in _chunk_visualization_ranges_forward(reference_index, total_frames, chunk_size):
+            indices = list(range(start, end))
+            predicted = run_chunk(indices, prompt_mask, local_reference_index=0)
+            prompt_mask = predicted[-1]
+        prompt_mask = original_prompt.mask
+        for chunk_index, (start, end) in enumerate(_chunk_visualization_ranges_backward(reference_index, chunk_size)):
+            indices = list(range(start, end))
+            predicted = run_chunk(indices, prompt_mask, local_reference_index=len(indices) - 1)
+            prompt_mask = predicted[0]
+            if chunk_index == 0:
+                continue
+
+        if was_training:
+            wrapper.train()
+
+        if any(value is None for value in ious_by_index + target_areas_by_index + prediction_areas_by_index + has_object_by_index):
+            raise RuntimeError("Chunked full-scene visualization did not cover every frame")
+        diagnostics = _diagnostics_from_frame_statistics(
+            ious=[float(value) for value in ious_by_index if value is not None],
+            target_areas=[int(value) for value in target_areas_by_index if value is not None],
+            prediction_areas=[int(value) for value in prediction_areas_by_index if value is not None],
+            has_object_flags=[bool(value) for value in has_object_by_index if value is not None],
+            reference_index=reference_index,
+        )
+        frame_ids = tuple(frame.frame_id for frame in frames)
+        reference_frame = frame_ids[reference_index] if 0 <= reference_index < len(frame_ids) else str(reference_index)
+        header_lines = _training_visualization_header_lines(
+            step=step,
+            dataset=scene.dataset,
+            scene_id=scene.scene_id,
+            prompt_type=original_prompt.type,
+            reference_frame=reference_frame,
+            frame_ids=frame_ids,
+            batch_iou_empty_is_one=diagnostics["batch_iou_empty_is_one"],
+            visible_iou=diagnostics["visible_iou"],
+            non_ref_visible_iou=diagnostics["non_ref_visible_iou"],
+            ref_iou=diagnostics["ref_iou"],
+            tracking_recall=diagnostics["tracking_recall"],
+            visible_frames=diagnostics["visible_frames"],
+            empty_empty_frames=diagnostics["empty_empty_frames"],
+            target_areas=diagnostics["target_areas"],
+            has_object_flags=diagnostics["has_object_flags"],
+            instance_id=batch.instance_id,
+            warnings=diagnostics["warnings"],
+            sampling_mode="full_scene_chunked",
+            target_source=batch.target_source,
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{_visualization_stem(batch=batch, step=step)}_full_scene"
+        summary_path = output_dir / f"{stem}.png"
+        summary_rows: list[Image.Image] = []
+        for index in summary_order:
+            with Image.open(_global_row_path(row_dir, index)) as row_image:
+                summary_rows.append(row_image.copy())
+        summary_canvas = _render_training_visualization_canvas(header_lines, summary_rows)
+        summary_canvas.save(summary_path)
+        video_path = _write_training_visualization_video_from_rows(
+            header_lines,
+            [_global_row_path(row_dir, index) for index in range(total_frames)],
+            output_dir / f"{stem}.mp4",
+            fps=max(1, fps),
+        )
     if was_training:
         wrapper.train()
-    return save_training_visualization(
-        batch=scene_batch,
-        outputs=outputs,
-        step=step,
-        output_dir=output_dir,
-        max_frames=max_frames,
-        max_side=max_side,
-        fps=fps,
-        name_suffix="_full_scene",
-        video_frame_indices=list(range(int(scene_batch.images.shape[0]))),
-    )
+    return TrainingVisualizationArtifact(summary_path=summary_path, video_path=video_path)
 
 
 def run_training(
@@ -1585,6 +1853,7 @@ def run_training(
         visualize_every if visualize_every is not None else training_config.get("visualize_every", 0)
     )
     visualization_full_video = bool(training_config.get("visualization_full_video", False))
+    visualization_chunk_size = int(training_config.get("visualization_chunk_size", 32))
     validate_every = int(training_config.get("validate_every", 0))
     resolved_visualization_dir = _resolve_visualization_dir(config, visualization_dir)
     visualization_max_frames = int(training_config.get("visualization_max_frames", 4))
@@ -1743,6 +2012,7 @@ def run_training(
                     max_frames=visualization_max_frames,
                     max_side=visualization_max_side,
                     fps=resolved_visualization_fps,
+                    chunk_size=visualization_chunk_size,
                 )
                 parts.append(f"visualization_full_scene_summary={full_scene_visualization.summary_path}")
                 if full_scene_visualization.video_path is not None:

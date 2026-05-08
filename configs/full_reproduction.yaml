@@ -109,6 +109,7 @@ training:
   visualize_every: 0
   visualization_dir: outputs/visualizations/train
   visualization_full_video: true
+  visualization_chunk_size: 32
   visualization_max_frames: 4
   visualization_max_side: 384
   visualization_fps: 6

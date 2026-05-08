@@ -216,6 +216,7 @@ def _write_shapenet_training_fixture(tmp_path: Path, *, num_frames: int = 5) -> 
             "checkpoint_out": "outputs/checkpoints/final.pt",
             "visualize_every": 1,
             "visualization_full_video": True,
+            "visualization_chunk_size": 2,
             "visualization_max_frames": 4,
             "visualization_max_side": 64,
             "visualization_fps": 6,
