@@ -272,24 +272,28 @@ class TrainingBatch:
     must3r_geometry: Must3rFeatureBundle | None = None
     target_source: str = "dataset_mask"
 
-    def to(self, device: torch.device | str) -> "TrainingBatch":
+    def to(self, device: torch.device | str, *, float_dtype: torch.dtype | None = None) -> "TrainingBatch":
+        def move_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            if float_dtype is not None and tensor.is_floating_point():
+                return tensor.to(device=device, dtype=float_dtype)
+            return tensor.to(device=device)
+
         must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle | None
         if isinstance(self.must3r_features, Must3rFeatureBundle):
-            must3r_features = self.must3r_features.to(device)
+            must3r_features = self.must3r_features.to(device, dtype=float_dtype)
         elif self.must3r_features is not None:
-            must3r_features = tuple(feature.to(device) for feature in self.must3r_features)
+            must3r_features = tuple(move_tensor(feature) for feature in self.must3r_features)
         else:
             must3r_features = None
-        must3r_geometry = self.must3r_geometry.to(device) if self.must3r_geometry is not None else None
         return replace(
             self,
-            images=self.images.to(device),
+            images=move_tensor(self.images),
             target_masks=self.target_masks.to(device),
             prompt=self.prompt.to(device),
             must3r_features=must3r_features,
             has_object=self.has_object.to(device),
             object_visibility=self.object_visibility.to(device) if self.object_visibility is not None else None,
-            must3r_geometry=must3r_geometry,
+            must3r_geometry=self.must3r_geometry,
         )
 
 
@@ -834,7 +838,9 @@ def _load_tensor(path: Path) -> torch.Tensor:
         tensor = tensor[0]
     if tensor.ndim != 3:
         raise FeatureCacheCompatibilityError(f"{path} must contain a CHW tensor, got shape {tuple(tensor.shape)}")
-    return tensor.float()
+    if not tensor.is_floating_point():
+        raise FeatureCacheCompatibilityError(f"{path} must contain a floating-point tensor, got {tensor.dtype}")
+    return tensor.contiguous()
 
 
 class Must3rFeatureCache:

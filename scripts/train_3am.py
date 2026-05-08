@@ -36,6 +36,7 @@ from three_am.training.dataset import (
     TrainingBatch,
     ThreeAMTrainingDataset,
     configured_feature_cache_root,
+    configured_training_datasets,
     manifest_statuses,
     resolve_project_path,
 )
@@ -68,6 +69,47 @@ class ThreeAMTrainingWrapper(nn.Module):
 class TrainingVisualizationArtifact(NamedTuple):
     summary_path: Path
     video_path: Path | None = None
+
+
+class _CudaMemoryDebugger:
+    _PHASE_TO_FIELD = {
+        "after_batch_to_device": "cuda_mem_batch_mb",
+        "after_must3r_ready": "cuda_mem_must3r_mb",
+        "after_forward": "cuda_mem_forward_mb",
+        "after_backward": "cuda_mem_backward_mb",
+    }
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.enabled = True
+        self._records: dict[str, float] = {}
+
+    def start_step(self) -> None:
+        self._records = {}
+        torch.cuda.reset_peak_memory_stats(device=self.device)
+
+    def snapshot(self, phase: str) -> None:
+        field = self._PHASE_TO_FIELD.get(phase)
+        if field is None:
+            raise KeyError(f"Unknown CUDA memory debug phase: {phase}")
+        allocated_mb = torch.cuda.max_memory_allocated(device=self.device) / (1024.0 * 1024.0)
+        self._records[field] = round(float(allocated_mb), 3)
+
+    def fields(self) -> dict[str, float]:
+        return dict(self._records)
+
+
+class _NoopCudaMemoryDebugger:
+    enabled = False
+
+    def start_step(self) -> None:
+        return None
+
+    def snapshot(self, phase: str) -> None:
+        return None
+
+    def fields(self) -> dict[str, float]:
+        return {}
 
 
 def build_core(config: dict[str, Any]) -> ThreeAMCore:
@@ -190,6 +232,23 @@ def _online_must3r_enabled(config: dict[str, Any], override: bool | None = None)
     return bool(config.get("features", {}).get("online", False))
 
 
+def _configured_sequence_lengths(config: dict[str, Any]) -> dict[str, dict[str, int]]:
+    sampling = config.get("sampling", {})
+    training = config.get("training", {})
+    datasets = config.get("datasets", {})
+    base = int(sampling.get("sequence_length", training.get("memory_frames", 8)))
+    summary: dict[str, dict[str, int]] = {}
+    for dataset_name in configured_training_datasets(config):
+        dataset_config = datasets.get(dataset_name, {})
+        min_value = dataset_config.get("sequence_length_min", sampling.get("sequence_length_min", base))
+        max_value = dataset_config.get("sequence_length_max", sampling.get("sequence_length_max", base))
+        summary[dataset_name] = {
+            "min": int(min_value if min_value is not None else base),
+            "max": int(max_value if max_value is not None else base),
+        }
+    return summary
+
+
 def dry_run(
     config: dict[str, Any],
     feature_cache: str | Path | None = None,
@@ -235,6 +294,14 @@ def dry_run(
             "max_bs": int(features.get("max_bs", 1)),
             "decode_batch_size": int(features.get("decode_batch_size", 1)),
             "feature_layers": list(_parse_must3r_feature_layers(features.get("feature_layers", "encoder,4,7,11"))),
+        },
+        "training": {
+            "datasets": list(configured_training_datasets(config)),
+            "memory_frames": int(training.get("memory_frames", 8)),
+            "sequence_lengths": _configured_sequence_lengths(config),
+            "strict_paper": strict_paper,
+            "amp": bool(training.get("amp", True)),
+            "cuda_memory_debug": bool(training.get("cuda_memory_debug", False)),
         },
         "visualization": {
             "visualize_every": int(config.get("training", {}).get("visualize_every", 0)),
@@ -284,12 +351,18 @@ def _device(name: str | None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _training_float_dtype(device: torch.device, amp_enabled: bool) -> torch.dtype:
+    if amp_enabled and device.type == "cuda":
+        return torch.bfloat16
+    return torch.float32
+
+
 def _autocast(device: torch.device, enabled: bool):
     if not enabled:
         return nullcontext()
     if hasattr(torch, "amp"):
-        return torch.amp.autocast(device_type=device.type, enabled=enabled)
-    return torch.cuda.amp.autocast(enabled=enabled)  # pragma: no cover - older torch
+        return torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
+    return torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=enabled)  # pragma: no cover - older torch
 
 
 def _grad_scaler(device: torch.device, enabled: bool):
@@ -299,6 +372,12 @@ def _grad_scaler(device: torch.device, enabled: bool):
         except TypeError:  # pragma: no cover - older torch
             return torch.amp.GradScaler(enabled=enabled)
     return torch.cuda.amp.GradScaler(enabled=enabled)  # pragma: no cover - older torch
+
+
+def _build_cuda_memory_debugger(device: torch.device, enabled: bool) -> _CudaMemoryDebugger | _NoopCudaMemoryDebugger:
+    if not enabled or device.type != "cuda" or not torch.cuda.is_available():
+        return _NoopCudaMemoryDebugger()
+    return _CudaMemoryDebugger(device)
 
 
 def _load_torch(path: Path, map_location: torch.device | str) -> Any:
@@ -490,6 +569,7 @@ def _load_missing_must3r_features(
     device: torch.device,
     *,
     online_must3r: bool,
+    float_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, ...] | Must3rFeatureBundle:
     if batch.must3r_features is not None:
         return batch.must3r_features
@@ -538,8 +618,14 @@ def _load_missing_must3r_features(
             "dust3r_importable are all true."
         ) from error
     if isinstance(features, Must3rFeatureBundle):
-        return features.to(device)
-    return tuple(feature.to(device) for feature in features)
+        return features.to(device, dtype=float_dtype)
+    converted: list[torch.Tensor] = []
+    for feature in features:
+        if float_dtype is not None and feature.is_floating_point():
+            converted.append(feature.to(device=device, dtype=float_dtype))
+        else:
+            converted.append(feature.to(device=device))
+    return tuple(converted)
 
 
 def _mask_foreground_ratios(target_masks: torch.Tensor) -> torch.Tensor:
@@ -756,8 +842,10 @@ def run_validation_step(
 ) -> dict[str, float]:
     was_training = wrapper.training
     wrapper.eval()
+    amp_enabled = bool(config.get("training", {}).get("amp", True)) and device.type == "cuda"
+    float_dtype = _training_float_dtype(device, amp_enabled)
     with torch.no_grad():
-        batch = dataset.sample().to(device)
+        batch = dataset.sample().to(device, float_dtype=float_dtype)
         batch = _apply_sam2_point_pseudo_masks(batch, sam2_adapter=wrapper.sam2_adapter, config=config)
         must3r_features = _load_missing_must3r_features(
             batch,
@@ -765,6 +853,7 @@ def run_validation_step(
             config,
             device,
             online_must3r=online_must3r,
+            float_dtype=float_dtype,
         )
         outputs = wrapper(batch, must3r_features)
         metrics = _tracking_metrics(outputs, batch)
@@ -1388,7 +1477,9 @@ def run_training(
         weight_decay=float(training_config.get("weight_decay", 0.01)),
     )
     amp_enabled = bool(training_config.get("amp", True)) and device.type == "cuda"
-    scaler = _grad_scaler(device, amp_enabled)
+    training_float_dtype = _training_float_dtype(device, amp_enabled)
+    scaler = _grad_scaler(device, amp_enabled and training_float_dtype == torch.float16)
+    cuda_memory_debugger = _build_cuda_memory_debugger(device, bool(training_config.get("cuda_memory_debug", False)))
     paths = ProjectPaths.from_config(config)
     checkpoint_out = resolve_project_path(config, training_config["checkpoint_out"])
     if checkpoint_out is None:
@@ -1425,12 +1516,14 @@ def run_training(
     max_detached_loss_resample_attempts = int(training_config.get("max_detached_loss_resample_attempts", 10))
     for step_index in range(start_step, total_iterations):
         step = step_index + 1
+        cuda_memory_debugger.start_step()
         outputs: dict[str, torch.Tensor] | None = None
         loss = None
         batch: TrainingBatch | None = None
         must3r_features: tuple[torch.Tensor, ...] | Must3rFeatureBundle | None = None
         for attempt in range(max(1, max_detached_loss_resample_attempts)):
-            batch = dataset.sample().to(device)
+            batch = dataset.sample().to(device, float_dtype=training_float_dtype)
+            cuda_memory_debugger.snapshot("after_batch_to_device")
             batch = _apply_sam2_point_pseudo_masks(batch, sam2_adapter=wrapper.sam2_adapter, config=config)
             must3r_features = _load_missing_must3r_features(
                 batch,
@@ -1438,11 +1531,14 @@ def run_training(
                 config,
                 device,
                 online_must3r=online_enabled,
+                float_dtype=training_float_dtype,
             )
+            cuda_memory_debugger.snapshot("after_must3r_ready")
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, amp_enabled):
                 outputs = wrapper(batch, must3r_features)
                 loss = sam2_training_loss(outputs, batch.target_masks, batch.has_object, weights)
+            cuda_memory_debugger.snapshot("after_forward")
             if _loss_is_differentiable(loss.total):
                 break
             if attempt + 1 < max_detached_loss_resample_attempts:
@@ -1468,6 +1564,7 @@ def run_training(
         scaler.scale(loss.total).backward()
         scaler.step(optimizer)
         scaler.update()
+        cuda_memory_debugger.snapshot("after_backward")
         last_step = step
         if visualize_every > 0 and (step == 1 or step % visualize_every == 0):
             visualization = save_training_visualization(
@@ -1484,7 +1581,8 @@ def run_training(
             if visualization.video_path is not None:
                 parts.append(f"visualization_video={visualization.video_path}")
             print(" ".join(parts))
-        if log_every > 0 and (step == 1 or step % log_every == 0):
+        should_log = cuda_memory_debugger.enabled or (log_every > 0 and (step == 1 or step % log_every == 0))
+        if should_log:
             items = loss.detached_items()
             elapsed = max(time.time() - started, 1e-6)
             print(
@@ -1495,6 +1593,7 @@ def run_training(
                         f"scene={batch.scene_id}",
                         f"target_source={batch.target_source}",
                         f"fps={step / elapsed:.3f}",
+                        *(f"{key}={value:.3f}" for key, value in cuda_memory_debugger.fields().items()),
                         *(f"{key}={value:.6f}" for key, value in items.items()),
                     ]
                 )

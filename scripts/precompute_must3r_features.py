@@ -778,7 +778,7 @@ def main() -> None:
     parser.add_argument("--decode-batch-size", type=int, default=1)
     parser.add_argument("--memory-window", type=int, default=None)
     parser.add_argument("--full-scene-memory", action="store_true")
-    parser.add_argument("--cache-dtype", default="fp16", choices=["fp16", "bf16", "float32"])
+    parser.add_argument("--cache-dtype", default="bf16", choices=["fp16", "bf16", "float32"])
     parser.add_argument("--feature-layers", default="encoder,4,7,11")
     parser.add_argument("--write-manifest", default=None)
     parser.add_argument("--limit-scenes", type=int, default=None)

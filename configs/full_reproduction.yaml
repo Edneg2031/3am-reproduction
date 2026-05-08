@@ -44,8 +44,8 @@ datasets:
     manifest: data/processed/shapenet_manifest.json
     fov_sampling_probability: 0.0
     mask_ignore_values: []
-    sequence_length_min: 16
-    sequence_length_max: 96
+    sequence_length_min: 8
+    sequence_length_max: 8
     dynamic_resize:
       enabled: true
       min_size: 384
@@ -70,7 +70,7 @@ sampling:
 
 features:
   cache_root: outputs/must3r_features
-  online: true
+  online: false
   require_decoder_memory: true
   memory_window: 8
   full_scene_memory: false
@@ -111,6 +111,7 @@ training:
   visualization_max_frames: 4
   visualization_max_side: 384
   visualization_fps: 6
+  cuda_memory_debug: false
   sam2_point_pseudo_masks:
     mode: off
     datasets: [scannetpp]

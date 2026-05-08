@@ -582,3 +582,54 @@ def test_training_script_dry_run_reports_inputs(tmp_path: Path, capsys) -> None:
     assert "mast3r_importable" in captured.out
     assert "dust3r_importable" in captured.out
     assert "sam2_point_pseudo_masks" in captured.out
+    assert "\"online_must3r\": false" in captured.out
+    assert "\"sequence_lengths\"" in captured.out
+    assert "\"cuda_memory_debug\": false" in captured.out
+
+
+def test_training_script_logs_cuda_memory_debug_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_tiny_training_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["cuda_memory_debug"] = True
+    config["training"]["log_every"] = 0
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    class FakeCudaMemoryDebugger:
+        enabled = True
+
+        def __init__(self) -> None:
+            self._fields: dict[str, float] = {}
+
+        def start_step(self) -> None:
+            self._fields = {}
+
+        def snapshot(self, phase: str) -> None:
+            mapping = {
+                "after_batch_to_device": ("cuda_mem_batch_mb", 111.0),
+                "after_must3r_ready": ("cuda_mem_must3r_mb", 222.0),
+                "after_forward": ("cuda_mem_forward_mb", 333.0),
+                "after_backward": ("cuda_mem_backward_mb", 444.0),
+            }
+            field, value = mapping[phase]
+            self._fields[field] = value
+
+        def fields(self) -> dict[str, float]:
+            return dict(self._fields)
+
+    monkeypatch.setattr(train_3am, "_build_cuda_memory_debugger", lambda device, enabled: FakeCudaMemoryDebugger())
+
+    train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        checkpoint_every=0,
+        save_model_every=0,
+        sam2_adapter=FakeSam2Adapter(),
+    )
+    captured = capsys.readouterr()
+
+    assert "cuda_mem_batch_mb=111.000" in captured.out
+    assert "cuda_mem_must3r_mb=222.000" in captured.out
+    assert "cuda_mem_forward_mb=333.000" in captured.out
+    assert "cuda_mem_backward_mb=444.000" in captured.out

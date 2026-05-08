@@ -10,10 +10,14 @@ from PIL import Image
 
 from three_am.data.io import read_manifest, write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
+from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.training.dataset import (
     FeatureCacheCompatibilityError,
     MaskCompatibilityError,
+    Prompt,
+    TrainingBatch,
     ThreeAMTrainingDataset,
+    _load_tensor,
     configured_manifest_path,
     configured_training_datasets,
 )
@@ -106,6 +110,53 @@ def _dataset(tmp_path: Path, dataset: str, masks: list[np.ndarray], *, fov_proba
     )
 
 
+def test_training_batch_to_applies_float_dtype_without_moving_geometry_bundle() -> None:
+    bundle = Must3rFeatureBundle(
+        levels=(torch.ones(2, 3, 4, 4, dtype=torch.float32),),
+        pe2d=torch.zeros(2, 2, 4, 4, dtype=torch.float32),
+        point_map=torch.zeros(2, 3, 4, 4, dtype=torch.float32),
+        ray_map=torch.ones(2, 3, 4, 4, dtype=torch.float32),
+        metadata={"decoder_memory": True},
+    )
+    batch = TrainingBatch(
+        images=torch.rand(2, 3, 4, 4, dtype=torch.float32),
+        target_masks=torch.rand(2, 4, 4, dtype=torch.float32),
+        prompt=Prompt(type="mask", frame_index=0, mask=torch.ones(4, 4, dtype=torch.float32)),
+        must3r_features=bundle,
+        dataset="shapenet",
+        scene_id="scene_a",
+        frame_ids=("000000", "000001"),
+        image_paths=(),
+        has_object=torch.tensor([True, False]),
+        object_visibility=torch.tensor([True, False]),
+        must3r_geometry=bundle,
+    )
+
+    moved = batch.to("cpu", float_dtype=torch.bfloat16)
+
+    assert moved.images.dtype == torch.bfloat16
+    assert isinstance(moved.must3r_features, Must3rFeatureBundle)
+    assert moved.must3r_features.levels[0].dtype == torch.bfloat16
+    assert moved.must3r_features.pe2d is not None and moved.must3r_features.pe2d.dtype == torch.bfloat16
+    assert moved.must3r_features.point_map is not None and moved.must3r_features.point_map.dtype == torch.bfloat16
+    assert moved.must3r_features.ray_map is not None and moved.must3r_features.ray_map.dtype == torch.bfloat16
+    assert moved.target_masks.dtype == torch.float32
+    assert moved.prompt.mask is not None and moved.prompt.mask.dtype == torch.float32
+    assert moved.must3r_geometry is bundle
+    assert moved.must3r_geometry.levels[0].dtype == torch.float32
+
+
+def test_load_tensor_preserves_cached_bfloat16_dtype(tmp_path: Path) -> None:
+    tensor_path = tmp_path / "feature.pt"
+    original = torch.randn(2, 4, 4, dtype=torch.bfloat16)
+    torch.save(original, tensor_path)
+
+    loaded = _load_tensor(tensor_path)
+
+    assert loaded.dtype == torch.bfloat16
+    assert loaded.shape == (2, 4, 4)
+
+
 def test_training_dataset_builds_binary_mask_prompt(tmp_path: Path) -> None:
     mask = np.zeros((4, 4), dtype=np.uint8)
     mask[1:3, 1:3] = 255
@@ -183,6 +234,38 @@ def test_shapenet_training_dataset_uses_dynamic_length_resize_and_incomplete_pro
     assert content_width in {32, 64}
     padding = ~(batch.images[0].sum(dim=0) > 0)
     assert torch.count_nonzero(batch.target_masks[batch.prompt.frame_index][padding]).item() == 0
+
+
+def test_shapenet_sequence_length_bounds_override_global_memory_frames(tmp_path: Path) -> None:
+    scene_dir = tmp_path / "data" / "processed" / "shapenet_tracking" / "scene_a"
+    frames: list[FrameRecord] = []
+    for index in range(12):
+        frame_id = f"{index:06d}"
+        image_path = scene_dir / "rgb" / f"{frame_id}.png"
+        mask_path = scene_dir / "masks" / f"{frame_id}.png"
+        _write_image_sized(image_path, height=48, width=64)
+        mask = np.zeros((48, 64), dtype=np.uint8)
+        mask[8:28, 18:42] = 255
+        _write_mask(mask_path, mask)
+        frames.append(FrameRecord(frame_id=frame_id, image_path=image_path, mask_path=mask_path))
+    manifest = tmp_path / "data" / "processed" / "shapenet_manifest.json"
+    write_manifest(manifest, [SceneRecord("shapenet", "scene_a", "train", tuple(frames))])
+    config = _config(tmp_path, "shapenet", manifest)
+    config["sampling"]["sequence_length"] = 2  # type: ignore[index]
+    config["training"] = {"memory_frames": 4}
+    config["model"]["sam_image_size"] = 1024  # type: ignore[index]
+    config["datasets"]["shapenet"].update(  # type: ignore[index]
+        {
+            "sequence_length_min": 8,
+            "sequence_length_max": 8,
+            "dynamic_resize": {"enabled": True, "min_size": 32, "max_size": 32, "multiple": 32},
+        }
+    )
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert len(batch.frame_ids) == 8
 
 
 def test_strict_shapenet_training_dataset_uses_dynamic_sampling_when_feature_paths_exist(tmp_path: Path) -> None:
