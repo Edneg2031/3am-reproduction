@@ -1906,6 +1906,7 @@ def run_training(
     feature_cache: str | Path | None = None,
     log_every: int | None = None,
     checkpoint_every: int | None = None,
+    validate_every: int | None = None,
     visualize_every: int | None = None,
     visualization_dir: str | Path | None = None,
     visualization_fps: int | None = None,
@@ -1943,7 +1944,7 @@ def run_training(
     )
     visualization_full_video = bool(training_config.get("visualization_full_video", False))
     visualization_chunk_size = int(training_config.get("visualization_chunk_size", 32))
-    validate_every = int(training_config.get("validate_every", 0))
+    validate_every = int(validate_every if validate_every is not None else training_config.get("validate_every", 0))
     resolved_visualization_dir = _resolve_visualization_dir(config, visualization_dir)
     visualization_max_frames = int(training_config.get("visualization_max_frames", 4))
     visualization_max_side = int(training_config.get("visualization_max_side", 384))
@@ -1960,6 +1961,19 @@ def run_training(
         validation_fraction=validation_fraction,
         validation_seed=validation_seed,
         validation_scene_ids=validation_scene_ids,
+    )
+    print(
+        " ".join(
+            [
+                "training_split",
+                f"total_scenes={len(all_scenes)}",
+                f"train_scenes={len(train_scenes)}",
+                f"validation_scenes={len(validation_scenes)}",
+                f"validation_fraction={validation_fraction:.6f}",
+                f"validation_seed={validation_seed}",
+                f"validate_every={validate_every}",
+            ]
+        )
     )
     feature_cache_root = configured_feature_cache_root(config, feature_cache)
     dataset = ThreeAMTrainingDataset(
@@ -2226,6 +2240,7 @@ def main() -> None:
     parser.add_argument("--feature-cache", default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
+    parser.add_argument("--validate-every", type=int, default=None)
     parser.add_argument("--save-model-every", type=int, default=None)
     parser.add_argument("--model-out", default=None)
     parser.add_argument("--auto-resume", action="store_true")
@@ -2262,6 +2277,7 @@ def main() -> None:
         feature_cache=args.feature_cache,
         log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
+        validate_every=args.validate_every,
         save_model_every=args.save_model_every,
         model_out=args.model_out,
         auto_resume=args.auto_resume,

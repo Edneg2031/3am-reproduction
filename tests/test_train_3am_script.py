@@ -455,6 +455,31 @@ def test_strict_training_script_runs_with_bundle_and_validation(tmp_path: Path, 
     captured = capsys.readouterr()
 
     assert step == 1
+    assert "training_split" in captured.out
+    assert "validation_step=1" in captured.out
+
+
+def test_training_script_validate_every_override_enables_validation(tmp_path: Path, capsys) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_strict_training_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["validate_every"] = 0
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        validate_every=1,
+        online_must3r=True,
+        sam2_adapter=FakeSam2Adapter(),
+        must3r_adapter=FakeMust3rBundleAdapter(),
+        strict_paper=True,
+    )
+    captured = capsys.readouterr()
+
+    assert step == 1
+    assert "validate_every=1" in captured.out
     assert "validation_step=1" in captured.out
 
 
