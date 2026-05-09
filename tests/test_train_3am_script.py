@@ -539,6 +539,19 @@ def test_training_script_splits_scenes_into_train_and_validation() -> None:
     assert sorted(scene.scene_id for scene in train_scenes + validation_scenes) == [f"scene_{index}" for index in range(4)]
 
 
+def test_full_scene_visualization_sampling_keeps_reference_and_last_frame() -> None:
+    train_3am = _load_train_module()
+
+    indices = train_3am._sample_full_scene_visualization_indices(
+        num_frames=10,
+        reference_index=5,
+        source_fps=24,
+        sample_fps=6,
+    )
+
+    assert indices == [0, 4, 5, 8, 9]
+
+
 def test_training_script_writes_visualization_png_and_mp4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path)
@@ -607,6 +620,40 @@ def test_training_script_writes_full_scene_visualization_video_for_shapenet(
     assert video_frame_counts[batch_mp4.name] == 2
     assert video_frame_counts[full_scene_mp4.name] == 5
     assert "visualization_full_scene_video=" in captured.out
+
+
+def test_training_script_samples_full_scene_visualization_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_shapenet_training_fixture(tmp_path, num_frames=9)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["visualization_full_scene_source_fps"] = 24
+    config["training"]["visualization_full_scene_sample_fps"] = 6
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    visualization_dir = tmp_path / "outputs" / "visualizations" / "train"
+    monkeypatch.setattr(train_3am.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    video_frame_counts: dict[str, int] = {}
+
+    def _fake_run(command, check):
+        pattern = Path(command[command.index("-i") + 1])
+        video_frame_counts[Path(command[-1]).name] = len(list(pattern.parent.glob("*.png")))
+        Path(command[-1]).write_bytes(b"fake mp4")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(train_3am.subprocess, "run", _fake_run)
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        sam2_adapter=FakeSam2Adapter(),
+    )
+
+    full_scene_mp4 = visualization_dir / "step_0000001_shapenet_scene_a_full_scene.mp4"
+    assert step == 1
+    assert full_scene_mp4.exists()
+    assert 3 <= video_frame_counts[full_scene_mp4.name] <= 4
 
 
 def test_training_visualization_header_lines_include_tracking_context() -> None:

@@ -326,6 +326,8 @@ def dry_run(
             "visualization_max_frames": int(config.get("training", {}).get("visualization_max_frames", 4)),
             "visualization_max_side": int(config.get("training", {}).get("visualization_max_side", 384)),
             "visualization_fps": int(config.get("training", {}).get("visualization_fps", 6)),
+            "visualization_full_scene_source_fps": config.get("training", {}).get("visualization_full_scene_source_fps"),
+            "visualization_full_scene_sample_fps": config.get("training", {}).get("visualization_full_scene_sample_fps"),
         },
         "checkpoints": {
             "checkpoint_out": str(resolve_project_path(config, training.get("checkpoint_out"))),
@@ -1736,8 +1738,32 @@ def _chunk_visualization_ranges_backward(reference_index: int, chunk_size: int) 
     return ranges
 
 
+def _sample_full_scene_visualization_indices(
+    *,
+    num_frames: int,
+    reference_index: int,
+    source_fps: float | None,
+    sample_fps: float | None,
+) -> list[int]:
+    if num_frames <= 0:
+        return []
+    reference_index = min(max(int(reference_index), 0), num_frames - 1)
+    if sample_fps is None or sample_fps <= 0 or source_fps is None or source_fps <= 0 or sample_fps >= source_fps:
+        indices = set(range(num_frames))
+    else:
+        stride = max(1, int(round(float(source_fps) / float(sample_fps))))
+        indices = set(range(0, num_frames, stride))
+        indices.add(num_frames - 1)
+    indices.add(0)
+    indices.add(reference_index)
+    indices.add(num_frames - 1)
+    return sorted(index for index in indices if 0 <= index < num_frames)
+
+
 def _global_row_path(temp_dir: Path, global_index: int) -> Path:
     return temp_dir / f"row_{global_index:06d}.png"
+
+
 def save_full_scene_training_visualization(
     *,
     dataset: ThreeAMTrainingDataset,
@@ -1755,12 +1781,25 @@ def save_full_scene_training_visualization(
     max_side: int = 384,
     fps: int = 6,
     chunk_size: int = 32,
+    source_fps: float | None = None,
+    sample_fps: float | None = None,
 ) -> TrainingVisualizationArtifact:
     scene, letterbox, frames, ignore_values, binary_mode, instance_id, reference_index = _visualization_scene_components(
         dataset,
         batch,
     )
     chunk_size = max(2, int(chunk_size))
+    original_total_frames = len(frames)
+    sampled_indices = _sample_full_scene_visualization_indices(
+        num_frames=original_total_frames,
+        reference_index=reference_index,
+        source_fps=source_fps,
+        sample_fps=sample_fps,
+    )
+    if not sampled_indices:
+        raise ValueError("Full-scene visualization has no sampled frames")
+    reference_index = sampled_indices.index(reference_index)
+    frames = [frames[index] for index in sampled_indices]
     total_frames = len(frames)
     summary_order = _visualization_frame_order(total_frames, reference_index, max_frames)
     row_metrics_size = total_frames
@@ -1876,6 +1915,13 @@ def save_full_scene_training_visualization(
             has_object_flags=[bool(value) for value in has_object_by_index if value is not None],
             reference_index=reference_index,
         )
+        warnings = list(diagnostics["warnings"])
+        if total_frames < original_total_frames:
+            warnings.append(
+                "[INFO] full-scene visualization sampled "
+                f"{total_frames}/{original_total_frames} frames "
+                f"(source_fps={source_fps}, sample_fps={sample_fps})"
+            )
         frame_ids = tuple(frame.frame_id for frame in frames)
         reference_frame = frame_ids[reference_index] if 0 <= reference_index < len(frame_ids) else str(reference_index)
         header_lines = _training_visualization_header_lines(
@@ -1895,8 +1941,8 @@ def save_full_scene_training_visualization(
             target_areas=diagnostics["target_areas"],
             has_object_flags=diagnostics["has_object_flags"],
             instance_id=batch.instance_id,
-            warnings=diagnostics["warnings"],
-            sampling_mode="full_scene_chunked",
+            warnings=warnings,
+            sampling_mode="full_scene_chunked_sampled" if total_frames < original_total_frames else "full_scene_chunked",
             target_source=batch.target_source,
         )
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1933,6 +1979,8 @@ def run_training(
     visualize_every: int | None = None,
     visualization_dir: str | Path | None = None,
     visualization_fps: int | None = None,
+    visualization_full_scene_source_fps: float | None = None,
+    visualization_full_scene_sample_fps: float | None = None,
     save_model_every: int | None = None,
     model_out: str | Path | None = None,
     auto_resume: bool = False,
@@ -1967,6 +2015,22 @@ def run_training(
     )
     visualization_full_video = bool(training_config.get("visualization_full_video", False))
     visualization_chunk_size = int(training_config.get("visualization_chunk_size", 32))
+    visualization_full_scene_source_fps = (
+        visualization_full_scene_source_fps
+        if visualization_full_scene_source_fps is not None
+        else training_config.get("visualization_full_scene_source_fps")
+    )
+    visualization_full_scene_sample_fps = (
+        visualization_full_scene_sample_fps
+        if visualization_full_scene_sample_fps is not None
+        else training_config.get("visualization_full_scene_sample_fps")
+    )
+    visualization_full_scene_source_fps = (
+        None if visualization_full_scene_source_fps is None else float(visualization_full_scene_source_fps)
+    )
+    visualization_full_scene_sample_fps = (
+        None if visualization_full_scene_sample_fps is None else float(visualization_full_scene_sample_fps)
+    )
     validate_every = int(validate_every if validate_every is not None else training_config.get("validate_every", 0))
     validation_visualize_every = int(
         validation_visualize_every
@@ -2159,6 +2223,8 @@ def run_training(
                     max_side=visualization_max_side,
                     fps=resolved_visualization_fps,
                     chunk_size=visualization_chunk_size,
+                    source_fps=visualization_full_scene_source_fps,
+                    sample_fps=visualization_full_scene_sample_fps,
                 )
                 parts.append(f"visualization_full_scene_summary={full_scene_visualization.summary_path}")
                 if full_scene_visualization.video_path is not None:
@@ -2291,6 +2357,8 @@ def main() -> None:
     parser.add_argument("--visualize-every", type=int, default=None)
     parser.add_argument("--visualization-dir", default=None)
     parser.add_argument("--visualization-fps", type=int, default=None)
+    parser.add_argument("--visualization-full-scene-source-fps", type=float, default=None)
+    parser.add_argument("--visualization-full-scene-sample-fps", type=float, default=None)
     strict_group = parser.add_mutually_exclusive_group()
     strict_group.add_argument("--strict-paper", action="store_true", dest="strict_paper", default=None)
     strict_group.add_argument("--no-strict-paper", action="store_false", dest="strict_paper")
@@ -2329,6 +2397,8 @@ def main() -> None:
         visualize_every=args.visualize_every,
         visualization_dir=args.visualization_dir,
         visualization_fps=args.visualization_fps,
+        visualization_full_scene_source_fps=args.visualization_full_scene_source_fps,
+        visualization_full_scene_sample_fps=args.visualization_full_scene_sample_fps,
         dry_run_only=args.dry_run,
         online_must3r=args.online_must3r,
         strict_paper=args.strict_paper,
