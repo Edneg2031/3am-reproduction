@@ -483,6 +483,43 @@ def test_training_script_validate_every_override_enables_validation(tmp_path: Pa
     assert "validation_step=1" in captured.out
 
 
+def test_training_script_writes_validation_visualization_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    train_3am = _load_train_module()
+    config_path = _write_strict_training_fixture(tmp_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["training"]["validation_visualize_every"] = 1
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    visualization_dir = tmp_path / "outputs" / "visualizations" / "train"
+    monkeypatch.setattr(train_3am.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+
+    def _fake_run(command, check):
+        Path(command[-1]).write_bytes(b"fake validation mp4")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(train_3am.subprocess, "run", _fake_run)
+
+    step = train_3am.run_training(
+        str(config_path),
+        iterations=1,
+        device_name="cpu",
+        online_must3r=True,
+        sam2_adapter=FakeSam2Adapter(),
+        must3r_adapter=FakeMust3rBundleAdapter(),
+        strict_paper=True,
+    )
+    captured = capsys.readouterr()
+
+    validation_png = visualization_dir / "step_0000001_scannetpp_scene_a_validation.png"
+    validation_mp4 = visualization_dir / "step_0000001_scannetpp_scene_a_validation.mp4"
+    assert step == 1
+    assert validation_png.exists()
+    assert validation_mp4.read_bytes() == b"fake validation mp4"
+    assert "validation_visualization_summary=" in captured.out
+    assert "validation_visualization_video=" in captured.out
+
+
 def test_training_script_splits_scenes_into_train_and_validation() -> None:
     train_3am = _load_train_module()
     scenes = tuple(

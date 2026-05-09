@@ -76,6 +76,11 @@ class TrainingVisualizationArtifact(NamedTuple):
     video_path: Path | None = None
 
 
+class ValidationStepResult(NamedTuple):
+    metrics: dict[str, float]
+    visualization: TrainingVisualizationArtifact | None = None
+
+
 class _CudaMemoryDebugger:
     _PHASE_TO_FIELD = {
         "after_batch_to_device": "cuda_mem_batch_mb",
@@ -933,11 +938,17 @@ def run_validation_step(
     config: dict[str, Any],
     device: torch.device,
     online_must3r: bool,
-) -> dict[str, float]:
+    step: int | None = None,
+    visualization_dir: Path | None = None,
+    visualization_max_frames: int = 4,
+    visualization_max_side: int = 384,
+    visualization_fps: int = 6,
+) -> ValidationStepResult:
     was_training = wrapper.training
     wrapper.eval()
     amp_enabled = bool(config.get("training", {}).get("amp", True)) and device.type == "cuda"
     float_dtype = _training_float_dtype(device, amp_enabled)
+    visualization: TrainingVisualizationArtifact | None = None
     with torch.no_grad():
         batch = dataset.sample().to(device, float_dtype=float_dtype)
         batch = _apply_sam2_point_pseudo_masks(batch, sam2_adapter=wrapper.sam2_adapter, config=config)
@@ -952,9 +963,20 @@ def run_validation_step(
         with _autocast(device, amp_enabled):
             outputs = wrapper(batch, must3r_features)
         metrics = _tracking_metrics(outputs, batch)
+        if visualization_dir is not None and step is not None:
+            visualization = save_training_visualization(
+                batch=batch,
+                outputs=outputs,
+                step=step,
+                output_dir=visualization_dir,
+                max_frames=visualization_max_frames,
+                max_side=visualization_max_side,
+                fps=visualization_fps,
+                name_suffix="_validation",
+            )
     if was_training:
         wrapper.train()
-    return metrics
+    return ValidationStepResult(metrics=metrics, visualization=visualization)
 
 
 class FeatureCacheRuntimeError(RuntimeError):
@@ -1907,6 +1929,7 @@ def run_training(
     log_every: int | None = None,
     checkpoint_every: int | None = None,
     validate_every: int | None = None,
+    validation_visualize_every: int | None = None,
     visualize_every: int | None = None,
     visualization_dir: str | Path | None = None,
     visualization_fps: int | None = None,
@@ -1945,6 +1968,11 @@ def run_training(
     visualization_full_video = bool(training_config.get("visualization_full_video", False))
     visualization_chunk_size = int(training_config.get("visualization_chunk_size", 32))
     validate_every = int(validate_every if validate_every is not None else training_config.get("validate_every", 0))
+    validation_visualize_every = int(
+        validation_visualize_every
+        if validation_visualize_every is not None
+        else training_config.get("validation_visualize_every", 0)
+    )
     resolved_visualization_dir = _resolve_visualization_dir(config, visualization_dir)
     visualization_max_frames = int(training_config.get("visualization_max_frames", 4))
     visualization_max_side = int(training_config.get("visualization_max_side", 384))
@@ -1972,6 +2000,7 @@ def run_training(
                 f"validation_fraction={validation_fraction:.6f}",
                 f"validation_seed={validation_seed}",
                 f"validate_every={validate_every}",
+                f"validation_visualize_every={validation_visualize_every}",
             ]
         )
     )
@@ -2157,15 +2186,29 @@ def run_training(
             clear_cached_backbone_payload()
         del outputs, loss, batch, must3r_features
         if validation_dataset is not None and validate_every > 0 and step % validate_every == 0:
-            metrics = run_validation_step(
+            visualize_validation = validation_visualize_every > 0 and step % validation_visualize_every == 0
+            validation_result = run_validation_step(
                 wrapper=wrapper,
                 dataset=validation_dataset,
                 must3r_adapter=must3r_adapter,
                 config=config,
                 device=device,
                 online_must3r=online_enabled,
+                step=step if visualize_validation else None,
+                visualization_dir=resolved_visualization_dir if visualize_validation else None,
+                visualization_max_frames=visualization_max_frames,
+                visualization_max_side=visualization_max_side,
+                visualization_fps=resolved_visualization_fps,
             )
-            print(" ".join([f"validation_step={step}", *(f"{key}={value:.6f}" for key, value in metrics.items())]))
+            validation_parts = [
+                f"validation_step={step}",
+                *(f"{key}={value:.6f}" for key, value in validation_result.metrics.items()),
+            ]
+            if validation_result.visualization is not None:
+                validation_parts.append(f"validation_visualization_summary={validation_result.visualization.summary_path}")
+                if validation_result.visualization.video_path is not None:
+                    validation_parts.append(f"validation_visualization_video={validation_result.visualization.video_path}")
+            print(" ".join(validation_parts))
         if checkpoint_every > 0 and step % checkpoint_every == 0:
             save_checkpoint(
                 paths.checkpoints / f"step_{step}.pt",
@@ -2241,6 +2284,7 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--checkpoint-every", type=int, default=None)
     parser.add_argument("--validate-every", type=int, default=None)
+    parser.add_argument("--validation-visualize-every", type=int, default=None)
     parser.add_argument("--save-model-every", type=int, default=None)
     parser.add_argument("--model-out", default=None)
     parser.add_argument("--auto-resume", action="store_true")
@@ -2278,6 +2322,7 @@ def main() -> None:
         log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
         validate_every=args.validate_every,
+        validation_visualize_every=args.validation_visualize_every,
         save_model_every=args.save_model_every,
         model_out=args.model_out,
         auto_resume=args.auto_resume,

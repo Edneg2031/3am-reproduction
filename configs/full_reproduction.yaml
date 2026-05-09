@@ -103,6 +103,7 @@ training:
   checkpoint_every: 5000
   save_model_every: 5000
   validate_every: 5000
+  validation_visualize_every: 5000
   validation_scenes: []
   validation_fraction: 0.1
   validation_seed: 0
