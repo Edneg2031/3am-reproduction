@@ -458,6 +458,25 @@ def test_strict_training_script_runs_with_bundle_and_validation(tmp_path: Path, 
     assert "validation_step=1" in captured.out
 
 
+def test_training_script_splits_scenes_into_train_and_validation() -> None:
+    train_3am = _load_train_module()
+    scenes = tuple(
+        SceneRecord(dataset="shapenet", scene_id=f"scene_{index}", split="train", frames=tuple())
+        for index in range(4)
+    )
+
+    train_scenes, validation_scenes = train_3am._split_training_scenes(
+        scenes,
+        validation_fraction=0.25,
+        validation_seed=0,
+    )
+
+    assert len(train_scenes) == 3
+    assert len(validation_scenes) == 1
+    assert {scene.scene_id for scene in train_scenes}.isdisjoint({scene.scene_id for scene in validation_scenes})
+    assert sorted(scene.scene_id for scene in train_scenes + validation_scenes) == [f"scene_{index}" for index in range(4)]
+
+
 def test_training_script_writes_visualization_png_and_mp4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     train_3am = _load_train_module()
     config_path = _write_tiny_training_fixture(tmp_path)

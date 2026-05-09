@@ -104,6 +104,8 @@ training:
   save_model_every: 5000
   validate_every: 0
   validation_scenes: []
+  validation_fraction: 0.1
+  validation_seed: 0
   auto_resume: false
   model_out: outputs/checkpoints/3am_model.pt
   visualize_every: 0

@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from torch import nn
 from torch.nn import functional as F
 
+from three_am.data.schema import SceneRecord
 from three_am.models.adapters import (
     ExternalBackboneConfig,
     ExternalDependencyError,
@@ -40,6 +41,7 @@ from three_am.training.dataset import (
     configured_training_datasets,
     load_image_tensor,
     load_mask_array,
+    load_training_scenes,
     manifest_statuses,
     resolve_project_path,
 )
@@ -303,6 +305,9 @@ def dry_run(
             "memory_frames": int(training.get("memory_frames", 8)),
             "sequence_lengths": _configured_sequence_lengths(config),
             "strict_paper": strict_paper,
+            "validation_fraction": float(training.get("validation_fraction", 0.1 if bool(training.get("validate_every", 0)) else 0.0)),
+            "validation_seed": int(training.get("validation_seed", 0)),
+            "validation_scenes": [str(scene) for scene in training.get("validation_scenes", [])],
             "amp": bool(training.get("amp", True)),
             "cuda_memory_debug": bool(training.get("cuda_memory_debug", False)),
         },
@@ -348,6 +353,90 @@ def dry_run(
     }
     print(json.dumps(payload, indent=2))
     return payload
+
+
+def _scene_identity(scene: SceneRecord) -> tuple[str, str]:
+    return str(scene.dataset), scene.scene_id
+
+
+def _split_training_scenes(
+    scenes: Sequence[SceneRecord],
+    *,
+    validation_fraction: float,
+    validation_seed: int,
+    validation_scene_ids: Sequence[str] = (),
+) -> tuple[list[SceneRecord], list[SceneRecord]]:
+    ordered_scenes = sorted(scenes, key=_scene_identity)
+    if not ordered_scenes:
+        return [], []
+
+    requested_validation_ids = [str(value).strip() for value in validation_scene_ids if str(value).strip()]
+    if requested_validation_ids:
+        scene_lookup = {_scene_identity(scene): scene for scene in ordered_scenes}
+        scene_ids: dict[str, list[tuple[str, str]]] = {}
+        for scene in ordered_scenes:
+            scene_ids.setdefault(scene.scene_id, []).append(_scene_identity(scene))
+        validation_keys: set[tuple[str, str]] = set()
+        missing: list[str] = []
+        ambiguous: list[str] = []
+        for raw_value in requested_validation_ids:
+            dataset_name: str | None = None
+            scene_id = raw_value
+            for separator in ("/", ":"):
+                if separator in raw_value:
+                    dataset_name, scene_id = raw_value.split(separator, 1)
+                    dataset_name = dataset_name.strip() or None
+                    scene_id = scene_id.strip()
+                    break
+            if dataset_name is not None:
+                key = (dataset_name, scene_id)
+                if key not in scene_lookup:
+                    missing.append(raw_value)
+                else:
+                    validation_keys.add(key)
+                continue
+            matches = scene_ids.get(scene_id, [])
+            if not matches:
+                missing.append(raw_value)
+            elif len(matches) > 1:
+                ambiguous.append(raw_value)
+            else:
+                validation_keys.add(matches[0])
+        if missing:
+            preview = ", ".join(missing[:8])
+            suffix = "" if len(missing) <= 8 else f", ... ({len(missing)} total)"
+            raise ValueError(f"training.validation_scenes did not match any scenes: {preview}{suffix}")
+        if ambiguous:
+            preview = ", ".join(ambiguous[:8])
+            suffix = "" if len(ambiguous) <= 8 else f", ... ({len(ambiguous)} total)"
+            raise ValueError(f"training.validation_scenes is ambiguous; qualify these scene IDs with dataset/: {preview}{suffix}")
+        train_scenes = [scene for scene in ordered_scenes if _scene_identity(scene) not in validation_keys]
+        validation_scenes = [scene for scene in ordered_scenes if _scene_identity(scene) in validation_keys]
+        if not validation_scenes:
+            raise ValueError("training.validation_scenes resolved to no validation scenes")
+        if not train_scenes:
+            if len(ordered_scenes) == 1:
+                return list(ordered_scenes), list(ordered_scenes)
+            raise ValueError("training.validation_scenes would leave no training scenes")
+        return train_scenes, validation_scenes
+
+    fraction = float(validation_fraction)
+    if fraction < 0.0 or fraction >= 1.0:
+        raise ValueError("training.validation_fraction must be in [0, 1)")
+    if fraction <= 0.0:
+        return list(ordered_scenes), []
+    if len(ordered_scenes) == 1:
+        return list(ordered_scenes), list(ordered_scenes)
+
+    rng = random.Random(int(validation_seed))
+    shuffled = list(ordered_scenes)
+    rng.shuffle(shuffled)
+    validation_count = max(1, int(round(len(shuffled) * fraction)))
+    validation_count = min(validation_count, len(shuffled) - 1)
+    validation_keys = {_scene_identity(scene) for scene in shuffled[:validation_count]}
+    train_scenes = [scene for scene in ordered_scenes if _scene_identity(scene) not in validation_keys]
+    validation_scenes = [scene for scene in ordered_scenes if _scene_identity(scene) in validation_keys]
+    return train_scenes, validation_scenes
 
 
 def _device(name: str | None) -> torch.device:
@@ -1862,18 +1951,32 @@ def run_training(
         visualization_fps if visualization_fps is not None else training_config.get("visualization_fps", 6)
     )
     device = _device(device_name)
-    dataset = ThreeAMTrainingDataset.from_config(
+    all_scenes = load_training_scenes(config, configured_training_datasets(config))
+    validation_fraction = float(training_config.get("validation_fraction", 0.1 if validate_every > 0 else 0.0))
+    validation_seed = int(training_config.get("validation_seed", 0))
+    validation_scene_ids = tuple(str(value) for value in training_config.get("validation_scenes", ()))
+    train_scenes, validation_scenes = _split_training_scenes(
+        all_scenes,
+        validation_fraction=validation_fraction,
+        validation_seed=validation_seed,
+        validation_scene_ids=validation_scene_ids,
+    )
+    feature_cache_root = configured_feature_cache_root(config, feature_cache)
+    dataset = ThreeAMTrainingDataset(
+        train_scenes,
         config,
-        feature_cache_root=feature_cache,
+        feature_cache_root=feature_cache_root,
         load_feature_cache=not online_enabled,
     )
     validation_dataset = (
-        ThreeAMTrainingDataset.from_config(
+        ThreeAMTrainingDataset(
+            validation_scenes,
             config,
-            feature_cache_root=feature_cache,
+            feature_cache_root=feature_cache_root,
             load_feature_cache=not online_enabled,
+            rng=random.Random(validation_seed),
         )
-        if validate_every > 0
+        if validate_every > 0 and validation_scenes
         else None
     )
 
