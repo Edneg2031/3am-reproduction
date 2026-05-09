@@ -25,3 +25,8 @@ def test_infer_notebook_is_valid_nbformat() -> None:
         for cell in notebook["cells"]
         if cell.get("cell_type") == "code"
     )
+    assert any(
+        "SAMPLE_FPS" in "".join(cell.get("source", []))
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+    )

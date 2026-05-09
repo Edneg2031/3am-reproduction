@@ -53,24 +53,40 @@ mark_trainable_3am_modules = _TRAIN_3AM.mark_trainable_3am_modules
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
-def _frame_paths(path: Path) -> list[Path]:
+def _format_fps(value: float | int) -> str:
+    rate = float(value)
+    if rate <= 0:
+        raise ValueError("fps must be positive")
+    if rate.is_integer():
+        return str(int(rate))
+    return f"{rate:g}"
+
+
+def _frame_paths(path: Path, *, sample_fps: float | None = None) -> list[Path]:
     if not path.exists():
         raise FileNotFoundError(path)
     if path.is_dir():
+        if sample_fps is not None and float(sample_fps) <= 0:
+            raise ValueError("--sample-fps must be positive")
         frames = sorted(item for item in path.iterdir() if item.suffix.lower() in IMAGE_EXTENSIONS)
         if not frames:
             raise ValueError(f"{path} does not contain image frames")
         return frames
-    return _extract_video_frames(path)
+    return _extract_video_frames(path, sample_fps=sample_fps)
 
 
-def _extract_video_frames(path: Path) -> list[Path]:
+def _extract_video_frames(path: Path, *, sample_fps: float | None = None) -> list[Path]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg is required when --video points to a video file. Pass a frame directory instead.")
+    if sample_fps is not None and float(sample_fps) <= 0:
+        raise ValueError("--sample-fps must be positive")
     temp_dir = Path(tempfile.mkdtemp(prefix="three_am_infer_frames_"))
     pattern = temp_dir / "%06d.png"
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), str(pattern)]
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path)]
+    if sample_fps is not None:
+        command.extend(["-vf", f"fps={_format_fps(sample_fps)}"])
+    command.append(str(pattern))
     subprocess.run(command, check=True)
     frames = sorted(temp_dir.glob("*.png"))
     if not frames:
@@ -324,7 +340,7 @@ def _save_masks(
     return paths
 
 
-def _write_video(mask_dir: Path, output_path: Path, *, fps: int) -> None:
+def _write_video(mask_dir: Path, output_path: Path, *, fps: float | int) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg is required to write --output-video")
@@ -336,7 +352,7 @@ def _write_video(mask_dir: Path, output_path: Path, *, fps: int) -> None:
         "-loglevel",
         "error",
         "-framerate",
-        str(fps),
+        _format_fps(fps),
         "-i",
         str(mask_dir / "%06d.png"),
         "-vf",
@@ -489,8 +505,14 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
     config = load_yaml(args.config)
     device = _device(args.device)
     image_size = int(args.image_size or config.get("model", {}).get("sam_image_size", 1024))
+    configured_sample_fps = config.get("inference", {}).get("sample_fps")
+    raw_sample_fps = getattr(args, "sample_fps", None)
+    sample_fps = configured_sample_fps if raw_sample_fps is None else raw_sample_fps
+    sample_fps = None if sample_fps is None else float(sample_fps)
+    raw_output_fps = getattr(args, "fps", None)
+    output_fps = float(raw_output_fps if raw_output_fps is not None else sample_fps if sample_fps is not None else 24)
     video_path = Path(args.video).expanduser()
-    frame_paths = _frame_paths(video_path)
+    frame_paths = _frame_paths(video_path, sample_fps=sample_fps)
     if args.start_frame is not None or args.num_frames is not None:
         start = max(0, int(args.start_frame or 0))
         end = len(frame_paths) if args.num_frames is None else min(len(frame_paths), start + int(args.num_frames))
@@ -574,7 +596,7 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
             if getattr(args, "output_video", None)
             else output_root / "masks.mp4"
         )
-        _write_video(mask_dir, output_video_path, fps=int(args.fps))
+        _write_video(mask_dir, output_video_path, fps=output_fps)
     summary = {
         "frames": len(frame_paths),
         "frame_ids": [path.stem for path in frame_paths],
@@ -586,6 +608,8 @@ def run_inference(args: argparse.Namespace) -> dict[str, Any]:
         "mask_size": "letterbox" if save_letterbox_masks else "source",
         "chunk_size": chunk_size,
         "chunked": chunked,
+        "sample_fps": sample_fps,
+        "output_fps": output_fps,
         "threshold": float(args.threshold),
         "output_dir": str(output_root),
         "mask_dir": str(mask_dir),
@@ -617,7 +641,8 @@ def infer_video_masks(
     start_frame: int | None = None,
     num_frames: int | None = None,
     threshold: float = 0.5,
-    fps: int = 24,
+    fps: float | int | None = None,
+    sample_fps: float | int | None = None,
     chunk_size: int | None = None,
     save_letterbox_masks: bool = False,
 ) -> dict[str, Any]:
@@ -640,6 +665,7 @@ def infer_video_masks(
             num_frames=num_frames,
             threshold=threshold,
             fps=fps,
+            sample_fps=sample_fps,
             chunk_size=chunk_size,
             save_letterbox_masks=save_letterbox_masks,
         )
@@ -663,7 +689,13 @@ def main() -> None:
     parser.add_argument("--start-frame", type=int, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--fps", type=float, default=None, help="output video FPS; defaults to --sample-fps or 24")
+    parser.add_argument(
+        "--sample-fps",
+        type=float,
+        default=None,
+        help="sample video-file inputs at this FPS before inference; frame-directory inputs are left unchanged",
+    )
     parser.add_argument(
         "--chunk-size",
         type=int,

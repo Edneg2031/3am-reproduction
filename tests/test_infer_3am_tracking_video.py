@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -47,6 +48,29 @@ def test_infer_script_resolves_reference_frame_names_before_numeric_indices(tmp_
     assert infer._resolve_reference_index(frames, reference_index=None, reference_frame="000001") == 0
     assert infer._resolve_reference_index(frames, reference_index=None, reference_frame="000003.png") == 2
     assert infer._resolve_reference_index(frames, reference_index=None, reference_frame="1") == 1
+
+
+def test_infer_script_samples_video_frames_with_ffmpeg_fps_filter(tmp_path: Path, monkeypatch) -> None:
+    infer = _load_infer_module()
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake video")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(infer.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+
+    def _fake_run(command, check):
+        commands.append(list(command))
+        pattern = Path(command[-1])
+        for index in range(2):
+            Image.fromarray(np.full((4, 4, 3), index, dtype=np.uint8)).save(pattern.parent / f"{index + 1:06d}.png")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(infer.subprocess, "run", _fake_run)
+
+    frames = infer._frame_paths(video, sample_fps=6)
+
+    assert len(frames) == 2
+    assert "-vf" in commands[0]
+    assert commands[0][commands[0].index("-vf") + 1] == "fps=6"
 
 
 def test_infer_script_saves_masks_in_source_resolution(tmp_path: Path) -> None:
