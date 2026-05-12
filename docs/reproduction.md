@@ -24,7 +24,7 @@ The default config is `configs/full_reproduction.yaml`:
 - Iterations: `1_000_000`.
 - Batch size: `1`.
 - Memory frames: `8`.
-- Learning rates: Memory Attention `5e-6`, Mask Decoder `5e-6`, Feature Merger `1e-5`.
+- Learning rates: Memory Attention `5e-6`, Memory Encoder `5e-6`, Mask Decoder `5e-6`, Feature Merger `1e-5`.
 
 ## Quick smoke test
 

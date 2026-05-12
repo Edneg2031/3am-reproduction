@@ -96,6 +96,7 @@ training:
   optimizer: AdamW
   learning_rates:
     memory_attention: 5.0e-6
+    memory_encoder: 5.0e-6
     mask_decoder: 5.0e-6
     feature_merger: 1.0e-5
   memory_frames: 8

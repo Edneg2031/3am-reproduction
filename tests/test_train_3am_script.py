@@ -15,6 +15,7 @@ from three_am.data.io import write_manifest
 from three_am.data.schema import FrameRecord, SceneRecord
 from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.training.dataset import Prompt
+from three_am.training.optim import build_adamw, mark_trainable_3am_modules
 
 
 class FakeSam2Adapter(nn.Module):
@@ -22,6 +23,7 @@ class FakeSam2Adapter(nn.Module):
         super().__init__()
         self.image_encoder = nn.Conv2d(3, 4, kernel_size=1)
         self.memory_attention = nn.Conv2d(4, 4, kernel_size=1)
+        self.memory_encoder = nn.Conv2d(4, 4, kernel_size=1)
         self.mask_decoder = nn.Conv2d(4, 1, kernel_size=1)
 
     def freeze_image_encoder(self) -> None:
@@ -82,6 +84,43 @@ class FakeMust3rBundleAdapter(FakeMust3rAdapter):
             ray_map=torch.ones(images.shape[0], 3, images.shape[-2], images.shape[-1], device=images.device),
             metadata={"decoder_memory": True},
         )
+
+
+def test_trainable_modules_include_sam2_memory_encoder() -> None:
+    model = nn.Module()
+    model.image_encoder = nn.Conv2d(3, 4, kernel_size=1)
+    model.memory_attention = nn.Conv2d(4, 4, kernel_size=1)
+    model.memory_encoder = nn.Conv2d(4, 4, kernel_size=1)
+    model.mask_decoder = nn.Conv2d(4, 1, kernel_size=1)
+    model.feature_merger = nn.Conv2d(4, 4, kernel_size=1)
+
+    mark_trainable_3am_modules(model)
+
+    trainable_names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    assert any(name.startswith("memory_attention.") for name in trainable_names)
+    assert any(name.startswith("memory_encoder.") for name in trainable_names)
+    assert any(name.startswith("mask_decoder.") for name in trainable_names)
+    assert any(name.startswith("feature_merger.") for name in trainable_names)
+    assert all(not name.startswith("image_encoder.") for name in trainable_names)
+
+
+def test_adamw_keeps_unconfigured_trainable_parameters() -> None:
+    model = nn.Module()
+    model.memory_attention = nn.Conv2d(4, 4, kernel_size=1)
+    model.memory_encoder = nn.Conv2d(4, 4, kernel_size=1)
+    mark_trainable_3am_modules(model)
+
+    optimizer = build_adamw(
+        model,
+        {
+            "memory_attention": 1e-3,
+            "default": 5e-4,
+        },
+    )
+
+    optimized_parameter_ids = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
+    assert {id(parameter) for parameter in model.parameters() if parameter.requires_grad} == optimized_parameter_ids
+    assert any(group["lr"] == 5e-4 for group in optimizer.param_groups)
 
 
 def _load_train_module():
@@ -149,7 +188,12 @@ def _write_tiny_training_fixture(tmp_path: Path, *, write_feature_cache: bool = 
         "training": {
             "iterations": 2,
             "batch_size": 1,
-            "learning_rates": {"memory_attention": 1e-3, "mask_decoder": 1e-3, "feature_merger": 1e-3},
+            "learning_rates": {
+                "memory_attention": 1e-3,
+                "memory_encoder": 1e-3,
+                "mask_decoder": 1e-3,
+                "feature_merger": 1e-3,
+            },
             "memory_frames": 2,
             "log_every": 1,
             "checkpoint_every": 1,
@@ -207,7 +251,12 @@ def _write_shapenet_training_fixture(tmp_path: Path, *, num_frames: int = 5) -> 
             "strict_paper": True,
             "iterations": 1,
             "batch_size": 1,
-            "learning_rates": {"memory_attention": 1e-3, "mask_decoder": 1e-3, "feature_merger": 1e-3},
+            "learning_rates": {
+                "memory_attention": 1e-3,
+                "memory_encoder": 1e-3,
+                "mask_decoder": 1e-3,
+                "feature_merger": 1e-3,
+            },
             "memory_frames": 8,
             "log_every": 1,
             "checkpoint_every": 0,
