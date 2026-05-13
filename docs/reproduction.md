@@ -16,7 +16,8 @@ This repository contains a faithful, non-official reproduction scaffold for **3A
 
 The default config is `configs/full_reproduction.yaml`:
 
-- Training datasets: ScanNet++ 855 scenes, ASE 2612 scenes, MOSE 1453 videos.
+- Active first-pass training dataset: ScanNet++.
+- Dataset entries remain available for ScanNet++ 855 scenes, ASE 2612 scenes, MOSE 1453 videos, and ShapeNet tracking; set `training.datasets` to a larger mixture after the ScanNet++ smoke pipeline is validated.
 - Evaluation datasets: ScanNet++ and Replica.
 - Sampling: ScanNet++/ASE use 0.8 FoV-aware + 0.2 continuous; MOSE uses continuous only.
 - FoV threshold: `0.25`.
@@ -83,7 +84,32 @@ For ScanNet++, `masks/*.png` must be per-frame **instance-id label maps**, not a
 To prepare ScanNet++:
 
 1. Use the official ScanNet++ toolbox to rasterize semantics and run `semantic.prep.semantics_2d` with object-id GT saving enabled, producing files like `obj_ids/<scene_id>/*.pth`.
-2. Convert those object-id maps into the normalized layout:
+2. For a first smoke pass, put 1-3 scene ids in a text file such as `data/processed/scannetpp_smoke_scenes.txt`.
+3. Convert those object-id maps into the normalized layout and build the training manifest:
+
+```bash
+PYTHONPATH=src python scripts/prepare_scannetpp_training_data.py \
+  --obj-id-root /path/to/scannetpp/obj_ids \
+  --data-root data/raw/scannetpp \
+  --output-root data/processed/scannetpp \
+  --manifest-output data/processed/scannetpp_manifest.json \
+  --scene-list data/processed/scannetpp_smoke_scenes.txt
+```
+
+The preparation script writes 16-bit PNG label maps under `data/processed/scannetpp/<scene_id>/masks`, symlinks RGB images by default, creates `instances.json`, builds `data/processed/scannetpp_manifest.json`, and audits the manifest for missing or full-frame singleton masks. Add `--precompute-must3r` when the official MUSt3R dependency and checkpoint are installed:
+
+```bash
+PYTHONPATH=src python scripts/prepare_scannetpp_training_data.py \
+  --obj-id-root /path/to/scannetpp/obj_ids \
+  --data-root data/raw/scannetpp \
+  --output-root data/processed/scannetpp \
+  --manifest-output data/processed/scannetpp_manifest.json \
+  --scene-list data/processed/scannetpp_smoke_scenes.txt \
+  --precompute-must3r \
+  --feature-output-dir outputs/must3r_features
+```
+
+The lower-level scripts remain available if you want each stage separately:
 
 ```bash
 PYTHONPATH=src python scripts/preprocess_scannetpp_instance_masks.py \
@@ -92,9 +118,7 @@ PYTHONPATH=src python scripts/preprocess_scannetpp_instance_masks.py \
   --output-root data/processed/scannetpp
 ```
 
-The script writes 16-bit PNG label maps under `data/processed/scannetpp/<scene_id>/masks`, symlinks RGB images by default, and creates `instances.json`. It fails fast when an input mask has one positive id covering almost the whole frame, which usually means a valid-region/full-frame mask was supplied instead of projected instance labels.
-
-Build manifests with:
+Build manifests separately with:
 
 ```bash
 python scripts/build_manifest.py --dataset scannetpp --root data/processed/scannetpp --split train --output data/processed/scannetpp_manifest.json

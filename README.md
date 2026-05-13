@@ -16,6 +16,20 @@ PYTHONPATH=src pytest -q
 PYTHONPATH=src python scripts/train_3am.py --config configs/full_reproduction.yaml --smoke --iterations 10
 ```
 
+## ScanNet++ Smoke Data
+
+After generating ScanNet++ `obj_ids/<scene_id>/*.pth` with the official toolbox, prepare a small DSLR-based training subset with:
+
+```bash
+PYTHONPATH=src python scripts/prepare_scannetpp_training_data.py \
+  --obj-id-root /path/to/scannetpp/obj_ids \
+  --data-root data/raw/scannetpp \
+  --scene-list data/processed/scannetpp_smoke_scenes.txt \
+  --precompute-must3r
+```
+
+This writes per-frame instance-id label maps, `instances.json`, `data/processed/scannetpp_manifest.json`, and optional MUSt3R feature cache files for strict 3AM training.
+
 ## Main Files
 
 - `configs/full_reproduction.yaml` — full reproduction settings from the paper.
