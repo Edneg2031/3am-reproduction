@@ -1,0 +1,133 @@
+project_root: /home/wlh50060092/3am-reproduction
+paths:
+  data_raw: data/raw
+  data_processed: data/processed
+  checkpoints: outputs/checkpoints
+  outputs: outputs
+
+external:
+  sam2_repo: external/sam2
+  must3r_repo: external/must3r
+  sam2_checkpoint_url: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+  sam2_checkpoint: outputs/checkpoints/sam2.1_hiera_large.pt
+  sam2_config: configs/sam2.1/sam2.1_hiera_l.yaml
+  must3r_checkpoint_url: https://download.europe.naverlabs.com/ComputerVision/MUSt3R/MUSt3R_512.pth
+  must3r_checkpoint: outputs/checkpoints/must3r.pt
+
+datasets:
+  scannetpp:
+    root: data/raw/scannetpp
+    processed: data/processed/scannetpp
+    manifest: data/processed/scannetpp_manifest.json
+    scenes: 855
+    fov_sampling_probability: 0.8
+    mask_ignore_values: []
+    require_instance_label_maps: true
+  ase:
+    root: data/raw/ase
+    processed: data/processed/ase
+    manifest: data/processed/ase_manifest.json
+    scenes: 2612
+    estimated_size: 23TB
+    fov_sampling_probability: 0.8
+    mask_ignore_values: []
+  mose:
+    root: data/raw/mose
+    processed: data/processed/mose
+    manifest: data/processed/mose_manifest.json
+    videos: 1453
+    fov_sampling_probability: 0.0
+    mask_ignore_values: []
+  shapenet:
+    root: data/processed/shapenet_tracking
+    processed: data/processed/shapenet_tracking
+    manifest: data/processed/shapenet_manifest.json
+    fov_sampling_probability: 0.0
+    mask_ignore_values: []
+    sequence_length_min: 8
+    sequence_length_max: 8
+    dynamic_resize:
+      enabled: true
+      min_size: 384
+      max_size: 768
+      multiple: 32
+    prompt_mask_augment:
+      enabled: true
+      probability: 1.0
+      crop_probability: 0.8
+      erase_probability: 0.35
+      min_area_ratio: 0.08
+      max_area_ratio: 0.65
+  replica:
+    root: data/raw/replica
+    processed: data/processed/replica
+    split: eval
+
+sampling:
+  fov_threshold: 0.25
+  sequence_length: 8
+  require_reference_first: true
+
+features:
+  cache_root: outputs/must3r_features
+  online: false
+  require_decoder_memory: true
+  memory_window: 8
+  full_scene_memory: false
+  image_size: 512
+  amp: bf16
+  max_bs: 1
+  decode_batch_size: 1
+  feature_layers: encoder,4,7,11
+
+model:
+  sam_image_size: 1024
+  sam_channels: 256
+  must3r_channels: [1024, 768, 768, 768]
+  hidden_channels: 256
+  geometry_channels: 768
+  attention_heads: 8
+
+training:
+  datasets: [scannetpp]
+  strict_paper: true
+  iterations: 1000000
+  batch_size: 1
+  optimizer: AdamW
+  learning_rates:
+    memory_attention: 5.0e-6
+    memory_encoder: 5.0e-6
+    mask_decoder: 5.0e-6
+    feature_merger: 1.0e-5
+  memory_frames: 8
+  log_every: 50
+  checkpoint_every: 5000
+  save_model_every: 5000
+  validate_every: 5000
+  validation_visualize_every: 5000
+  validation_scenes: []
+  validation_fraction: 0.1
+  validation_seed: 0
+  auto_resume: false
+  model_out: outputs/checkpoints/3am_model.pt
+  visualize_every: 0
+  visualization_dir: outputs/visualizations/train
+  visualization_full_video: true
+  visualization_chunk_size: 32
+  visualization_full_scene_source_fps: 24
+  visualization_full_scene_sample_fps: 6
+  visualization_max_frames: 4
+  visualization_max_side: 384
+  visualization_fps: 6
+  cuda_memory_debug: false
+  sam2_point_pseudo_masks:
+    mode: off
+    datasets: [scannetpp]
+    auto_foreground_ratio_threshold: 0.98
+    max_attempts: 8
+    mask_threshold: 0.5
+    min_foreground_ratio: 0.001
+    max_foreground_ratio: 0.9
+    allow_out_of_range_fallback: false
+  amp: true
+  checkpoint_out: outputs/checkpoints/3am_full.pt
