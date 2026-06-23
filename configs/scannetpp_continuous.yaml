@@ -1,0 +1,104 @@
+project_root: .
+paths:
+  data_raw: data/raw
+  data_processed: processed
+  checkpoints: outputs/checkpoints
+  outputs: outputs
+
+external:
+  sam2_repo: external/sam2
+  must3r_repo: external/must3r
+  sam2_checkpoint_url: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+  sam2_checkpoint: outputs/checkpoints/sam2.1_hiera_large.pt
+  sam2_config: configs/sam2.1/sam2.1_hiera_l.yaml
+  must3r_checkpoint_url: https://download.europe.naverlabs.com/ComputerVision/MUSt3R/MUSt3R_512.pth
+  must3r_checkpoint: outputs/checkpoints/must3r.pt
+
+datasets:
+  scannetpp:
+    root: processed/scannetpp
+    processed: processed/scannetpp
+    manifest: processed/scannetpp_manifest.json
+    fov_sampling_probability: 0.0
+    mask_ignore_values: []
+    require_instance_label_maps: true
+    instance_sampling:
+      enabled: true
+      min_reference_pixels: 256
+      min_reference_area_ratio: 0.0005
+      max_reference_area_ratio: 0.10
+      min_visible_frames: 2
+      min_visible_pixels_per_frame: 64
+      excluded_categories:
+        - wall
+        - walls
+        - floor
+        - floors
+        - ceiling
+        - ceilings
+        - staircase
+        - stairs
+      excluded_instance_ids: []
+
+sampling:
+  fov_threshold: 0.25
+  sequence_length: 8
+  require_reference_first: true
+
+features:
+  cache_root: outputs/must3r_features
+  online: false
+  require_decoder_memory: true
+  memory_window: 8
+  full_scene_memory: false
+  image_size: 512
+  amp: bf16
+  max_bs: 1
+  decode_batch_size: 1
+  feature_layers: encoder,4,7,11
+
+model:
+  sam_image_size: 1024
+  sam_channels: 256
+  must3r_channels: [1024, 768, 768, 768]
+  hidden_channels: 256
+  geometry_channels: 768
+  attention_heads: 8
+
+training:
+  datasets: [scannetpp]
+  strict_paper: true
+  iterations: 1000000
+  batch_size: 1
+  optimizer: AdamW
+  learning_rates:
+    memory_attention: 5.0e-6
+    memory_encoder: 5.0e-6
+    mask_decoder: 5.0e-6
+    feature_merger: 1.0e-5
+  memory_frames: 8
+  sample_resample_attempts: 64
+  log_every: 20
+  checkpoint_every: 1000
+  save_model_every: 1000
+  validate_every: 0
+  validation_visualize_every: 0
+  validation_fraction: 0.0
+  auto_resume: false
+  model_out: outputs/checkpoints/3am_scannetpp_continuous_model.pt
+  checkpoint_out: outputs/checkpoints/3am_scannetpp_continuous.pt
+  metrics_dir: outputs/training_metrics/scannetpp_continuous
+  loss_history_every: 1
+  loss_plot_every: 100
+  loss_plot_max_points: 5000
+  visualize_every: 100
+  visualization_dir: outputs/visualizations/scannetpp_continuous
+  visualization_full_video: false
+  visualization_max_frames: 8
+  visualization_max_side: 384
+  visualization_fps: 4
+  cuda_memory_debug: false
+  sam2_point_pseudo_masks:
+    mode: off
+    datasets: [scannetpp]
+  amp: true

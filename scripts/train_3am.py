@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import json
 import random
@@ -79,6 +80,139 @@ class TrainingVisualizationArtifact(NamedTuple):
 class ValidationStepResult(NamedTuple):
     metrics: dict[str, float]
     visualization: TrainingVisualizationArtifact | None = None
+
+
+class TrainingHistoryWriter:
+    FIELDNAMES = (
+        "step",
+        "loss",
+        "focal",
+        "dice",
+        "iou",
+        "occlusion",
+        "train_iou",
+        "train_tracking_recall",
+        "train_accuracy",
+    )
+
+    def __init__(self, output_dir: Path, *, max_plot_points: int = 5000) -> None:
+        self.output_dir = output_dir
+        self.csv_path = output_dir / "training_history.csv"
+        self.plot_path = output_dir / "training_curves.png"
+        self.max_plot_points = max(100, int(max_plot_points))
+        self._plot_rows: list[dict[str, float | int]] = []
+        self._plot_warning_emitted = False
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    def prepare(self, *, start_step: int) -> None:
+        if start_step <= 0:
+            self.csv_path.unlink(missing_ok=True)
+            self.plot_path.unlink(missing_ok=True)
+            self._plot_rows = []
+            return
+        if not self.csv_path.exists():
+            return
+        with self.csv_path.open("r", newline="", encoding="utf-8") as handle:
+            rows = [
+                {
+                    key: int(row[key]) if key == "step" else float(row[key])
+                    for key in self.FIELDNAMES
+                }
+                for row in csv.DictReader(handle)
+                if int(row["step"]) <= start_step
+            ]
+        with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(rows)
+        self._plot_rows = self._compact_plot_rows(rows)
+
+    def append(
+        self,
+        *,
+        step: int,
+        losses: dict[str, float],
+        tracking_metrics: dict[str, float],
+    ) -> None:
+        row = {
+            "step": int(step),
+            **{key: float(losses[key]) for key in ("loss", "focal", "dice", "iou", "occlusion")},
+            **{
+                key: float(tracking_metrics[key])
+                for key in ("train_iou", "train_tracking_recall", "train_accuracy")
+            },
+        }
+        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=self.FIELDNAMES)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        self._plot_rows.append(row)
+        if len(self._plot_rows) > self.max_plot_points * 2:
+            self._plot_rows = self._compact_plot_rows(self._plot_rows)
+
+    def render(self) -> Path | None:
+        rows = self._plot_rows
+        if not rows:
+            return None
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg", force=True)
+            from matplotlib import pyplot as plt
+        except ImportError as error:
+            if not self._plot_warning_emitted:
+                print(f"[WARN] matplotlib is unavailable; loss CSV is still available at {self.csv_path}: {error}")
+                self._plot_warning_emitted = True
+            return None
+
+        steps = np.asarray([int(row["step"]) for row in rows], dtype=np.int64)
+        figure, axes = plt.subplots(3, 1, figsize=(11, 12), sharex=True)
+        axes[0].plot(steps, [float(row["loss"]) for row in rows], label="total", color="#d62728")
+        axes[0].set_ylabel("Weighted loss")
+        axes[0].grid(alpha=0.25)
+        axes[0].legend()
+
+        for key, label in (
+            ("focal", "focal"),
+            ("dice", "dice"),
+            ("iou", "IoU head"),
+            ("occlusion", "occlusion"),
+        ):
+            axes[1].plot(steps, [float(row[key]) for row in rows], label=label)
+        axes[1].set_ylabel("Loss component")
+        axes[1].grid(alpha=0.25)
+        axes[1].legend(ncol=2)
+
+        for key, label in (
+            ("train_iou", "batch IoU"),
+            ("train_tracking_recall", "tracking recall"),
+            ("train_accuracy", "tracking accuracy"),
+        ):
+            axes[2].plot(steps, [float(row[key]) for row in rows], label=label)
+        axes[2].set_xlabel("Training step")
+        axes[2].set_ylabel("Tracking metric")
+        axes[2].set_ylim(-0.02, 1.02)
+        axes[2].grid(alpha=0.25)
+        axes[2].legend(ncol=3)
+
+        figure.suptitle("3AM training curves")
+        figure.tight_layout()
+        temporary_path = self.plot_path.with_name(f".{self.plot_path.name}.tmp.png")
+        figure.savefig(temporary_path, dpi=160)
+        plt.close(figure)
+        temporary_path.replace(self.plot_path)
+        return self.plot_path
+
+    def _compact_plot_rows(
+        self,
+        rows: list[dict[str, float | int]],
+    ) -> list[dict[str, float | int]]:
+        if len(rows) <= self.max_plot_points:
+            return list(rows)
+        indices = np.linspace(0, len(rows) - 1, self.max_plot_points, dtype=np.int64)
+        return [rows[int(index)] for index in indices]
 
 
 class _CudaMemoryDebugger:
@@ -913,7 +1047,12 @@ def _extract_online_must3r_features(
         return adapter.extract_features(batch.images)  # type: ignore[call-arg]
 
 
-def _tracking_metrics(outputs: dict[str, torch.Tensor], batch: TrainingBatch) -> dict[str, float]:
+def _tracking_metrics(
+    outputs: dict[str, torch.Tensor],
+    batch: TrainingBatch,
+    *,
+    prefix: str = "val",
+) -> dict[str, float]:
     logits = _mask_logits_for_visualization(outputs["mask_logits"].detach(), tuple(batch.target_masks.shape[-2:]))
     predictions = logits.sigmoid() >= 0.5
     targets = batch.target_masks.detach() > 0.5
@@ -926,9 +1065,9 @@ def _tracking_metrics(outputs: dict[str, torch.Tensor], batch: TrainingBatch) ->
     successful = (iou.cpu() > 0.0) & visible
     accuracy = float(iou.cpu()[successful].mean().item()) if bool(successful.any()) else 0.0
     return {
-        "val_iou": float(iou.mean().item()),
-        "val_tracking_recall": tracking_recall,
-        "val_accuracy": accuracy,
+        f"{prefix}_iou": float(iou.mean().item()),
+        f"{prefix}_tracking_recall": tracking_recall,
+        f"{prefix}_accuracy": accuracy,
     }
 
 
@@ -1981,6 +2120,8 @@ def run_training(
     visualization_fps: int | None = None,
     visualization_full_scene_source_fps: float | None = None,
     visualization_full_scene_sample_fps: float | None = None,
+    metrics_dir: str | Path | None = None,
+    loss_plot_every: int | None = None,
     save_model_every: int | None = None,
     model_out: str | Path | None = None,
     auto_resume: bool = False,
@@ -2042,6 +2183,26 @@ def run_training(
     visualization_max_side = int(training_config.get("visualization_max_side", 384))
     resolved_visualization_fps = int(
         visualization_fps if visualization_fps is not None else training_config.get("visualization_fps", 6)
+    )
+    resolved_metrics_dir = resolve_project_path(
+        config,
+        metrics_dir if metrics_dir is not None else training_config.get("metrics_dir", "outputs/training_metrics"),
+    )
+    if resolved_metrics_dir is None:
+        raise ValueError("training metrics directory resolved to None")
+    loss_history_every = max(1, int(training_config.get("loss_history_every", 1)))
+    loss_plot_every = max(
+        1,
+        int(
+            loss_plot_every
+            if loss_plot_every is not None
+            else training_config.get("loss_plot_every", max(log_every, 1))
+        ),
+    )
+    loss_plot_max_points = int(training_config.get("loss_plot_max_points", 5000))
+    history_writer = TrainingHistoryWriter(
+        resolved_metrics_dir,
+        max_plot_points=loss_plot_max_points,
     )
     device = _device(device_name)
     all_scenes = load_training_scenes(config, configured_training_datasets(config))
@@ -2134,6 +2295,7 @@ def run_training(
             expected_strict_paper=strict_paper_enabled,
         )
         print(f"Resumed training from {resume_path} at step {start_step}")
+    history_writer.prepare(start_step=start_step)
 
     weights = Sam2LossWeights()
     wrapper.train()
@@ -2187,11 +2349,22 @@ def run_training(
         if outputs is None or loss is None or batch is None:
             raise RuntimeError("Training loop failed to produce a batch")
         _ensure_loss_is_differentiable(loss.total, wrapper=wrapper, outputs=outputs, batch=batch)
+        tracking_metrics = _tracking_metrics(outputs, batch, prefix="train")
         scaler.scale(loss.total).backward()
         scaler.step(optimizer)
         scaler.update()
         cuda_memory_debugger.snapshot("after_backward")
         last_step = step
+        if step % loss_history_every == 0:
+            history_writer.append(
+                step=step,
+                losses=loss.detached_items(),
+                tracking_metrics=tracking_metrics,
+            )
+        if step == 1 or step % loss_plot_every == 0:
+            plot_path = history_writer.render()
+            if plot_path is not None and (step == 1 or (log_every > 0 and step % log_every == 0)):
+                print(f"training_curves={plot_path}")
         if visualize_every > 0 and (step == 1 or step % visualize_every == 0):
             visualization = save_training_visualization(
                 batch=batch,
@@ -2240,10 +2413,13 @@ def run_training(
                         f"step={step}",
                         f"dataset={batch.dataset}",
                         f"scene={batch.scene_id}",
+                        f"instance_id={batch.instance_id}",
+                        f"sampling={batch.sampling_mode}",
                         f"target_source={batch.target_source}",
                         f"fps={step / elapsed:.3f}",
                         *(f"{key}={value:.3f}" for key, value in cuda_memory_debugger.fields().items()),
                         *(f"{key}={value:.6f}" for key, value in items.items()),
+                        *(f"{key}={value:.6f}" for key, value in tracking_metrics.items()),
                     ]
                 )
             )
@@ -2334,8 +2510,12 @@ def run_training(
         step=last_step,
         config=config,
     )
+    final_plot_path = history_writer.render()
     print(f"Wrote checkpoint to {checkpoint_out}")
     print(f"Wrote model weights to {model_out_path}")
+    print(f"Wrote training history to {history_writer.csv_path}")
+    if final_plot_path is not None:
+        print(f"Wrote training curves to {final_plot_path}")
     return last_step
 
 
@@ -2359,6 +2539,8 @@ def main() -> None:
     parser.add_argument("--visualization-fps", type=int, default=None)
     parser.add_argument("--visualization-full-scene-source-fps", type=float, default=None)
     parser.add_argument("--visualization-full-scene-sample-fps", type=float, default=None)
+    parser.add_argument("--metrics-dir", default=None)
+    parser.add_argument("--loss-plot-every", type=int, default=None)
     strict_group = parser.add_mutually_exclusive_group()
     strict_group.add_argument("--strict-paper", action="store_true", dest="strict_paper", default=None)
     strict_group.add_argument("--no-strict-paper", action="store_false", dest="strict_paper")
@@ -2399,6 +2581,8 @@ def main() -> None:
         visualization_fps=args.visualization_fps,
         visualization_full_scene_source_fps=args.visualization_full_scene_source_fps,
         visualization_full_scene_sample_fps=args.visualization_full_scene_sample_fps,
+        metrics_dir=args.metrics_dir,
+        loss_plot_every=args.loss_plot_every,
         dry_run_only=args.dry_run,
         online_must3r=args.online_must3r,
         strict_paper=args.strict_paper,

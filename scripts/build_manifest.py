@@ -370,8 +370,14 @@ def main() -> None:
         allow_missing_instances=args.allow_missing_instances,
         max_singleton_foreground_ratio=args.max_singleton_foreground_ratio,
     )
+    if not scenes:
+        raise RuntimeError(
+            f"No {args.dataset} scenes were found under {root}. "
+            "Expected scene directories containing images/ or frames/ plus masks/."
+        )
     write_manifest(args.output, scenes)
-    print(f"Wrote {len(scenes)} scenes to {args.output}")
+    frame_count = sum(len(scene.frames) for scene in scenes)
+    print(f"Wrote {len(scenes)} scenes ({frame_count} frames) to {args.output}")
 
 
 if __name__ == "__main__":

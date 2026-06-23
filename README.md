@@ -16,6 +16,44 @@ PYTHONPATH=src pytest -q
 PYTHONPATH=src python scripts/train_3am.py --config configs/full_reproduction.yaml --smoke --iterations 10
 ```
 
+## Single ScanNet++ Scene With Continuous Sampling
+
+For a prepared scene at `processed/scannetpp/<scene_id>` containing `images/`,
+`masks/`, and `instances.json`, use `configs/scannetpp_continuous.yaml`. This
+configuration disables FoV sampling, samples contiguous 8-frame clips, writes
+loss/tracking curves under `outputs/training_metrics/scannetpp_continuous`, and
+exports 8-frame tracking visualizations under
+`outputs/visualizations/scannetpp_continuous`.
+
+Reference objects are filtered before a clip is accepted. The default policy
+rejects tiny noisy regions, objects covering more than 10% of the reference
+image, and objects not visible in at least two frames. Structural categories
+such as wall, floor, and ceiling are excluded when `instances.json` contains
+category metadata (`category`, `label`, `class_name`, etc.). If the file only
+contains object IDs, add confirmed structural IDs to
+`datasets.scannetpp.instance_sampling.excluded_instance_ids`.
+
+Build the manifest and precompute the frozen MUSt3R features before training:
+
+```bash
+PYTHONPATH=src python scripts/build_manifest.py \
+  --dataset scannetpp \
+  --root processed/scannetpp \
+  --split train \
+  --format normalized \
+  --output processed/scannetpp_manifest.json
+
+PYTHONPATH=src python scripts/precompute_must3r_features.py \
+  --config configs/scannetpp_continuous.yaml \
+  --manifest processed/scannetpp_manifest.json \
+  --output-dir outputs/must3r_features \
+  --memory-window 8
+
+PYTHONPATH=src python scripts/train_3am.py \
+  --config configs/scannetpp_continuous.yaml \
+  --device cuda
+```
+
 ## ScanNet++ Smoke Data
 
 After generating ScanNet++ `obj_ids/<scene_id>/*.pth` with the official toolbox, prepare a small DSLR-based training subset with:

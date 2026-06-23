@@ -37,6 +37,10 @@ class MaskCompatibilityError(RuntimeError):
     pass
 
 
+class NoEligibleInstanceError(RuntimeError):
+    pass
+
+
 class RandomLike(Protocol):
     def choice(self, sequence: Any) -> Any: ...
 
@@ -60,6 +64,18 @@ class Prompt:
             point_labels=self.point_labels.to(device) if self.point_labels is not None else None,
             box=self.box.to(device) if self.box is not None else None,
         )
+
+
+@dataclass(frozen=True)
+class InstanceSamplingConfig:
+    enabled: bool = False
+    min_reference_pixels: int = 1
+    min_reference_area_ratio: float = 0.0
+    max_reference_area_ratio: float = 1.0
+    min_visible_frames: int = 1
+    min_visible_pixels_per_frame: int = 1
+    excluded_categories: tuple[str, ...] = ()
+    excluded_instance_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -505,6 +521,120 @@ def _candidate_instance_ids(mask: np.ndarray) -> list[int]:
     if _mask_is_binary(mask):
         return [1] if (mask > 0).any() else []
     return [int(value) for value in np.unique(mask) if int(value) != 0]
+
+
+def _normalize_category(value: str) -> str:
+    return " ".join(value.strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def _instance_category(item: dict[str, Any]) -> str | None:
+    for key in (
+        "category",
+        "category_name",
+        "class_name",
+        "class",
+        "label",
+        "semantic_label",
+        "semantic_class",
+        "name",
+    ):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return _normalize_category(value)
+        if isinstance(value, dict):
+            for nested_key in ("name", "label", "category"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str) and nested.strip():
+                    return _normalize_category(nested)
+    return None
+
+
+def _load_instance_categories(path: Path | None) -> dict[int, str]:
+    if path is None or not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    items = payload.get("instances", []) if isinstance(payload, dict) else []
+    categories: dict[int, str] = {}
+    for item in items:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        category = _instance_category(item)
+        if category is not None:
+            categories[int(item["id"])] = category
+    return categories
+
+
+def _instance_sampling_config(config: dict[str, Any], dataset: str) -> InstanceSamplingConfig:
+    dataset_config = config.get("datasets", {}).get(dataset, {})
+    value = dataset_config.get("instance_sampling", config.get("training", {}).get("instance_sampling", {}))
+    if not isinstance(value, dict):
+        return InstanceSamplingConfig()
+    min_ratio = max(0.0, float(value.get("min_reference_area_ratio", 0.0)))
+    max_ratio = min(1.0, float(value.get("max_reference_area_ratio", 1.0)))
+    if max_ratio <= min_ratio:
+        raise ValueError("instance_sampling.max_reference_area_ratio must be greater than min_reference_area_ratio")
+    excluded_categories = tuple(
+        _normalize_category(str(category))
+        for category in value.get("excluded_categories", ())
+        if str(category).strip()
+    )
+    return InstanceSamplingConfig(
+        enabled=bool(value.get("enabled", False)),
+        min_reference_pixels=max(1, int(value.get("min_reference_pixels", 1))),
+        min_reference_area_ratio=min_ratio,
+        max_reference_area_ratio=max_ratio,
+        min_visible_frames=max(1, int(value.get("min_visible_frames", 1))),
+        min_visible_pixels_per_frame=max(1, int(value.get("min_visible_pixels_per_frame", 1))),
+        excluded_categories=excluded_categories,
+        excluded_instance_ids=tuple(int(instance_id) for instance_id in value.get("excluded_instance_ids", ())),
+    )
+
+
+def _eligible_instance_ids(
+    reference_mask: np.ndarray,
+    clip_masks: list[np.ndarray],
+    sampling: InstanceSamplingConfig,
+    categories: dict[int, str],
+) -> list[int]:
+    ids = _candidate_instance_ids(reference_mask)
+    if not sampling.enabled:
+        return ids
+    image_area = max(1, int(reference_mask.size))
+    excluded_ids = set(sampling.excluded_instance_ids)
+    excluded_categories = set(sampling.excluded_categories)
+    eligible: list[int] = []
+    for instance_id in ids:
+        reference_pixels = int(
+            (reference_mask > 0).sum()
+            if _mask_is_binary(reference_mask)
+            else (reference_mask == instance_id).sum()
+        )
+        reference_ratio = reference_pixels / image_area
+        if reference_pixels < sampling.min_reference_pixels:
+            continue
+        if reference_ratio < sampling.min_reference_area_ratio:
+            continue
+        if reference_ratio > sampling.max_reference_area_ratio:
+            continue
+        if instance_id in excluded_ids:
+            continue
+        category = categories.get(instance_id)
+        if category is not None and category in excluded_categories:
+            continue
+        visible_frames = sum(
+            int(
+                (mask > 0).sum()
+                if _mask_is_binary(mask)
+                else (mask == instance_id).sum()
+            )
+            >= sampling.min_visible_pixels_per_frame
+            for mask in clip_masks
+        )
+        if visible_frames < sampling.min_visible_frames:
+            continue
+        eligible.append(instance_id)
+    return eligible
 
 
 def _select_reference(mask_arrays: list[np.ndarray], rng: RandomLike) -> tuple[int, int | None, bool]:
@@ -1060,6 +1190,11 @@ class ThreeAMTrainingDataset:
             else tuple(config.get("features", {}).get("feature_layers", ("encoder", 4, 7, 11))),
         )
         self.sam_image_size = _configured_sam_image_size(config)
+        self._instance_categories = {
+            (scene.dataset, scene.scene_id): _load_instance_categories(scene.instances_path)
+            for scene in scenes
+        }
+        self._warned_missing_instance_categories: set[tuple[str, str]] = set()
 
     @classmethod
     def from_config(
@@ -1189,23 +1324,26 @@ class ThreeAMTrainingDataset:
         )
 
     def _sample_strict_paper(self) -> TrainingBatch:
-        scene = self.rng.choice(self.scenes)
-        if scene.dataset != "shapenet":
-            return self._sample_strict_paper_scene(scene)
-        shapenet_scenes = [candidate for candidate in self.scenes if candidate.dataset == "shapenet"]
         attempts = max(1, int(self.config.get("training", {}).get("sample_resample_attempts", 24)))
         last_error: Exception | None = None
         for _ in range(attempts):
-            scene = self.rng.choice(shapenet_scenes)
-            batch = self._sample_compatible_scene(scene, allow_missing_feature_cache=False)
-            if batch.prompt.mask is not None and bool((batch.prompt.mask > 0.5).any()) and bool(batch.has_object.any()):
-                return batch
-            last_error = RuntimeError(
-                f"ShapeNet sample {scene.scene_id} produced an empty prompt or empty target masks; resampling"
-            )
+            scene = self.rng.choice(self.scenes)
+            try:
+                if scene.dataset != "shapenet":
+                    return self._sample_strict_paper_scene(scene)
+                batch = self._sample_compatible_scene(scene, allow_missing_feature_cache=False)
+                if batch.prompt.mask is not None and bool((batch.prompt.mask > 0.5).any()) and bool(batch.has_object.any()):
+                    return batch
+                last_error = RuntimeError(
+                    f"ShapeNet sample {scene.scene_id} produced an empty prompt or empty target masks; resampling"
+                )
+            except NoEligibleInstanceError as error:
+                last_error = error
         if last_error is not None:
-            raise last_error
-        raise RuntimeError("Failed to sample a valid strict ShapeNet batch")
+            raise NoEligibleInstanceError(
+                f"Failed to sample an eligible training instance after {attempts} attempts. {last_error}"
+            ) from last_error
+        raise RuntimeError("Failed to sample a valid strict training batch")
 
     def _sample_strict_paper_scene(self, scene: SceneRecord) -> TrainingBatch:
         frames = list(scene.frames)
@@ -1223,8 +1361,12 @@ class ThreeAMTrainingDataset:
             sampling_mode: SamplingMode = "fov"
         else:
             selected_indices = self._select_strict_continuous_indices(len(frames), sampling_config.sequence_length)
-            reference_mask = raw_masks[selected_indices[0]]
-            instance_id, binary_mode = self._select_instance_from_mask(reference_mask)
+            selected_raw_masks = [raw_masks[index] for index in selected_indices]
+            instance_id, binary_mode = self._select_instance_from_mask(
+                scene,
+                selected_raw_masks[0],
+                selected_raw_masks,
+            )
             sampling_mode = "continuous"
         selected_frames = [frames[index] for index in selected_indices]
         image_size = self._image_size(scene, selected_frames)
@@ -1347,9 +1489,30 @@ class ThreeAMTrainingDataset:
             return new_width, new_height
         return sampled
 
-    def _select_instance_from_mask(self, mask: np.ndarray) -> tuple[int | None, bool]:
-        ids = _candidate_instance_ids(mask)
+    def _select_instance_from_mask(
+        self,
+        scene: SceneRecord,
+        mask: np.ndarray,
+        clip_masks: list[np.ndarray],
+    ) -> tuple[int | None, bool]:
+        sampling = _instance_sampling_config(self.config, scene.dataset)
+        categories = self._instance_categories.get((scene.dataset, scene.scene_id), {})
+        if sampling.enabled and sampling.excluded_categories and not categories:
+            key = (scene.dataset, scene.scene_id)
+            if key not in self._warned_missing_instance_categories:
+                print(
+                    f"[WARN] {scene.dataset}/{scene.scene_id} instances.json has no category labels; "
+                    "excluded_categories cannot be applied. Area/visibility thresholds and excluded_instance_ids "
+                    "are still active."
+                )
+                self._warned_missing_instance_categories.add(key)
+        ids = _eligible_instance_ids(mask, clip_masks, sampling, categories)
         if not ids:
+            if sampling.enabled:
+                raise NoEligibleInstanceError(
+                    f"No eligible instance in reference frame for {scene.dataset}/{scene.scene_id}; "
+                    f"thresholds={sampling}"
+                )
             return None, True
         if _mask_is_binary(mask):
             return 1, True
@@ -1362,12 +1525,25 @@ class ThreeAMTrainingDataset:
         sampling_config: SamplingConfig,
     ) -> tuple[list[int], int | None, bool]:
         frames = list(scene.frames)
-        references: list[int] = [index for index, mask in enumerate(raw_masks) if _candidate_instance_ids(mask)]
+        references: list[int] = []
+        candidates_by_reference: dict[int, list[int]] = {}
+        sampling = _instance_sampling_config(self.config, scene.dataset)
+        categories = self._instance_categories.get((scene.dataset, scene.scene_id), {})
+        for index, mask in enumerate(raw_masks):
+            candidates = _eligible_instance_ids(mask, raw_masks, sampling, categories)
+            if candidates:
+                references.append(index)
+                candidates_by_reference[index] = candidates
         if not references:
+            if sampling.enabled:
+                raise NoEligibleInstanceError(
+                    f"No eligible FoV reference instance for {scene.dataset}/{scene.scene_id}"
+                )
             indices = self._select_strict_continuous_indices(len(frames), sampling_config.sequence_length)
             return indices, None, True
         reference_index = int(self.rng.choice(references))
-        instance_id, binary_mode = self._select_instance_from_mask(raw_masks[reference_index])
+        instance_id = int(self.rng.choice(candidates_by_reference[reference_index]))
+        binary_mode = _mask_is_binary(raw_masks[reference_index])
         selected = [reference_index]
         eligible: list[tuple[float, int]] = []
         for candidate_index, candidate_mask in enumerate(raw_masks):

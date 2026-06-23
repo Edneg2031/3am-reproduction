@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,6 +132,40 @@ def _load_train_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_training_history_writer_writes_plot_and_resumes(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    train_3am = _load_train_module()
+    metrics_dir = tmp_path / "metrics"
+    writer = train_3am.TrainingHistoryWriter(metrics_dir, max_plot_points=100)
+    writer.prepare(start_step=0)
+    for step in (1, 2):
+        writer.append(
+            step=step,
+            losses={
+                "loss": 2.0 / step,
+                "focal": 0.1 / step,
+                "dice": 0.2 / step,
+                "iou": 0.3 / step,
+                "occlusion": 0.4 / step,
+            },
+            tracking_metrics={
+                "train_iou": 0.2 * step,
+                "train_tracking_recall": 0.3 * step,
+                "train_accuracy": 0.4 * step,
+            },
+        )
+
+    assert writer.render() == metrics_dir / "training_curves.png"
+    assert writer.plot_path.exists()
+    with writer.csv_path.open("r", newline="", encoding="utf-8") as handle:
+        assert [int(row["step"]) for row in csv.DictReader(handle)] == [1, 2]
+
+    resumed = train_3am.TrainingHistoryWriter(metrics_dir, max_plot_points=100)
+    resumed.prepare(start_step=1)
+    with resumed.csv_path.open("r", newline="", encoding="utf-8") as handle:
+        assert [int(row["step"]) for row in csv.DictReader(handle)] == [1]
 
 
 def _write_image(path: Path) -> None:

@@ -14,6 +14,7 @@ from three_am.models.feature_merger import Must3rFeatureBundle
 from three_am.training.dataset import (
     FeatureCacheCompatibilityError,
     MaskCompatibilityError,
+    NoEligibleInstanceError,
     Prompt,
     TrainingBatch,
     ThreeAMTrainingDataset,
@@ -611,6 +612,94 @@ def test_strict_training_dataset_keeps_reference_as_prompt_frame_zero(tmp_path: 
     assert batch.sampling_mode == "fov"
     assert batch.prompt.frame_index == 0
     assert batch.reference_frame_id == batch.frame_ids[0]
+
+
+def test_strict_continuous_sampling_filters_noise_and_structural_categories(tmp_path: Path) -> None:
+    mask = np.array(
+        [
+            [1, 2, 2, 0],
+            [3, 3, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    scene = _scene(tmp_path, "scannetpp", [mask, mask, mask])
+    assert scene.instances_path is not None
+    scene.instances_path.write_text(
+        '{"schema":"three_am_scannetpp_instances_v1","instances":['
+        '{"id":1,"category":"noise"},{"id":2,"category":"wall"},{"id":3,"category":"cup"}]}',
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [scene])
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+    config["datasets"]["scannetpp"]["instance_sampling"] = {  # type: ignore[index]
+        "enabled": True,
+        "min_reference_pixels": 2,
+        "min_reference_area_ratio": 0.0,
+        "max_reference_area_ratio": 0.5,
+        "min_visible_frames": 2,
+        "min_visible_pixels_per_frame": 2,
+        "excluded_categories": ["wall", "floor"],
+    }
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.sampling_mode == "continuous"
+    assert batch.prompt.frame_index == 0
+    assert batch.instance_id == 3
+    assert batch.target_masks.sum().item() == 6
+
+
+def test_strict_continuous_sampling_filters_large_instances_without_categories(tmp_path: Path) -> None:
+    mask = np.array(
+        [
+            [2, 2, 2, 2],
+            [2, 2, 2, 2],
+            [3, 3, 0, 0],
+            [0, 0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    scene = _scene(tmp_path, "scannetpp", [mask, mask])
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [scene])
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+    config["datasets"]["scannetpp"]["instance_sampling"] = {  # type: ignore[index]
+        "enabled": True,
+        "min_reference_pixels": 2,
+        "max_reference_area_ratio": 0.25,
+        "min_visible_frames": 2,
+        "min_visible_pixels_per_frame": 2,
+        "excluded_categories": ["wall"],
+    }
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+    batch = dataset.sample()
+
+    assert batch.instance_id == 3
+
+
+def test_strict_continuous_sampling_reports_when_no_instance_passes_thresholds(tmp_path: Path) -> None:
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[0, 0] = 5
+    scene = _scene(tmp_path, "scannetpp", [mask, mask])
+    manifest = tmp_path / "data" / "processed" / "scannetpp_manifest.json"
+    write_manifest(manifest, [scene])
+    config = _strict_config(tmp_path, "scannetpp", manifest, fov_probability=0.0)
+    config["training"]["sample_resample_attempts"] = 2  # type: ignore[index]
+    config["datasets"]["scannetpp"]["instance_sampling"] = {  # type: ignore[index]
+        "enabled": True,
+        "min_reference_pixels": 4,
+        "min_visible_frames": 2,
+    }
+
+    dataset = ThreeAMTrainingDataset.from_config(config, load_feature_cache=False, rng=random.Random(0))
+
+    with pytest.raises(NoEligibleInstanceError, match="after 2 attempts"):
+        dataset.sample()
 
 
 def test_strict_fov_fallback_does_not_add_visible_low_overlap_frames(tmp_path: Path) -> None:
