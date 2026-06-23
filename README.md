@@ -75,6 +75,7 @@ This writes per-frame instance-id label maps, `instances.json`, `data/processed/
 - `scripts/` — install, download, preprocess, train, and evaluate entrypoints.
 - `notebooks/3am_reproduction_tutorial.ipynb` — step-by-step usage tutorial.
 - `docs/reproduction.md` — detailed reproduction notes.
+- `docs/training_changes.md` — current training logic, thresholds, and change history.
 
 ## Important Limitations
 
