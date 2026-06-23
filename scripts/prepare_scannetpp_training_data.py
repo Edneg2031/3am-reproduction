@@ -267,7 +267,7 @@ def main() -> None:
     parser.add_argument("--max-foreground-ratio", type=float, default=0.98)
     parser.add_argument("--require-cameras", action="store_true", help="Require pose/intrinsics in the normalized scene")
     parser.add_argument("--precompute-must3r", action="store_true", help="Run MUSt3R feature precompute after manifest creation")
-    parser.add_argument("--config", default="configs/full_reproduction.yaml")
+    parser.add_argument("--config", default="configs/wlh_test.yaml")
     parser.add_argument("--feature-output-dir", default="outputs/must3r_features")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--weights", default=None)
