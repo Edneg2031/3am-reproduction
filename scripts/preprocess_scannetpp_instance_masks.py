@@ -116,19 +116,62 @@ def _frame_stem(instance_path: Path) -> str:
 
 def _source_image_path(data_root: Path, scene_id: str, image_subdir: str, instance_path: Path) -> Path | None:
     image_name = instance_path.name
+
     for suffix in (".pth", ".pt", ".npy", ".npz"):
         if image_name.endswith(suffix):
             image_name = image_name[: -len(suffix)]
             break
-    candidate = data_root / scene_id / image_subdir / image_name
-    if candidate.exists():
-        return candidate
-    stem = Path(image_name).stem
+
     image_dir = data_root / scene_id / image_subdir
+
+    candidates: list[Path] = []
+
+    # 1. 原始名字：DSC00850.JPG
+    candidates.append(image_dir / image_name)
+
+    # 2. 官方 semantics_2d 常见情况：
+    #    DSC00850.JPG.pth -> DSC00850.JPG.jpg
+    #    DSC00850.JPG.pth -> DSC00850.JPG.png
     for extension in IMAGE_EXTENSIONS:
-        candidate = image_dir / f"{stem}{extension}"
+        candidates.append(image_dir / f"{image_name}{extension}")
+
+    # 3. 普通情况：
+    #    DSC00850.JPG.pth -> DSC00850.jpg / DSC00850.JPG / ...
+    stem = Path(image_name).stem
+    for extension in IMAGE_EXTENSIONS:
+        candidates.append(image_dir / f"{stem}{extension}")
+
+    # 4. 大小写兜底
+    lower_image_name = image_name.lower()
+    lower_stem = stem.lower()
+
+    for path in image_dir.glob("*"):
+        if not path.is_file():
+            continue
+
+        name_lower = path.name.lower()
+        stem_lower = path.stem.lower()
+
+        if name_lower == lower_image_name:
+            candidates.append(path)
+
+        if stem_lower == lower_stem:
+            candidates.append(path)
+
+        # 兼容 DSC00850.JPG.jpg 这种双后缀
+        if name_lower.startswith(lower_image_name + "."):
+            candidates.append(path)
+
+    seen = set()
+
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
         if candidate.exists():
             return candidate
+
     return None
 
 
