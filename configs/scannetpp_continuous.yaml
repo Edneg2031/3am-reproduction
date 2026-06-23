@@ -1,7 +1,7 @@
 project_root: .
 paths:
   data_raw: data/raw
-  data_processed: processed
+  data_processed: data/processed
   checkpoints: outputs/checkpoints
   outputs: outputs
 
@@ -16,9 +16,9 @@ external:
 
 datasets:
   scannetpp:
-    root: processed/scannetpp
-    processed: processed/scannetpp
-    manifest: processed/scannetpp_manifest.json
+    root: data/raw/scannetpp
+    processed: data/processed/scannetpp
+    manifest: data/processed/scannetpp_manifest.json
     fov_sampling_probability: 0.0
     mask_ignore_values: []
     require_instance_label_maps: true

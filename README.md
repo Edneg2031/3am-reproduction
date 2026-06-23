@@ -18,7 +18,7 @@ PYTHONPATH=src python scripts/train_3am.py --config configs/full_reproduction.ya
 
 ## Single ScanNet++ Scene With Continuous Sampling
 
-For a prepared scene at `processed/scannetpp/<scene_id>` containing `images/`,
+For a prepared scene at `data/processed/scannetpp/<scene_id>` containing `images/`,
 `masks/`, and `instances.json`, use `configs/scannetpp_continuous.yaml`. This
 configuration disables FoV sampling, samples contiguous 8-frame clips, writes
 loss/tracking curves under `outputs/training_metrics/scannetpp_continuous`, and
@@ -38,14 +38,14 @@ Build the manifest and precompute the frozen MUSt3R features before training:
 ```bash
 PYTHONPATH=src python scripts/build_manifest.py \
   --dataset scannetpp \
-  --root processed/scannetpp \
+  --root data/processed/scannetpp \
   --split train \
   --format normalized \
-  --output processed/scannetpp_manifest.json
+  --output data/processed/scannetpp_manifest.json
 
 PYTHONPATH=src python scripts/precompute_must3r_features.py \
   --config configs/scannetpp_continuous.yaml \
-  --manifest processed/scannetpp_manifest.json \
+  --manifest data/processed/scannetpp_manifest.json \
   --output-dir outputs/must3r_features \
   --memory-window 8
 
